@@ -37,6 +37,8 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const sha = value => createHash('sha256').update(value).digest('hex');
 const json = value => JSON.stringify(value, null, 2) + '\n';
 const finite = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+const TOOL_FILE = fileURLToPath(import.meta.url);
+const LOADED_TOOL_SHA256 = sha(await fs.readFile(TOOL_FILE));
 class Failure extends Error {
   constructor(rule, message, detail = {}) {
     super(message); this.rule = rule; this.detail = detail;
@@ -44,6 +46,54 @@ class Failure extends Error {
 }
 function need(condition, rule, message, detail) {
   if (!condition) throw new Failure(rule, message, detail);
+}
+async function sourceSnapshot() {
+  const git = args => {
+    const result = spawnSync('git', ['-C', ROOT, ...args], { maxBuffer: 8 * 1024 * 1024 });
+    need(result.status === 0, 'IDENTITY', `Git identity read failed: ${args[0]}`,
+      { exit_code: result.status, error: result.error?.message, stderr: result.stderr?.toString() });
+    return result.stdout;
+  };
+  const commit = git(['rev-parse', 'HEAD']).toString().trim();
+  const local = {}, committed = {}, build = createHash('sha256');
+  for (const name of SOURCES) {
+    const bytes = await fs.readFile(path.join(ROOT, name));
+    local[name] = sha(bytes); committed[name] = sha(git(['show', `${commit}:${name}`]));
+    build.update(name + '\0'); build.update(bytes); build.update('\0');
+  }
+  const snapshot = { commit, source_sha256: local, committed_source_sha256: committed,
+    tool_sha256: sha(await fs.readFile(TOOL_FILE)),
+    committed_tool_sha256: sha(git(['show', `${commit}:tools/browser_performance.mjs`])),
+    page_build: build.digest('hex').slice(0, 12) };
+  need(git(['rev-parse', 'HEAD']).toString().trim() === commit, 'IDENTITY',
+    'Commit changed while capturing source identity');
+  return snapshot;
+}
+const sameSources = (actual, expected) => actual && expected &&
+  Object.keys(actual).length === SOURCES.length && SOURCES.every(name =>
+    /^[a-f0-9]{64}$/.test(expected[name] ?? '') && actual[name] === expected[name]);
+function snapshotBound(snapshot, report) {
+  return snapshot?.commit === report.commit && snapshot.tool_sha256 === report.tool_sha256 &&
+    snapshot.committed_tool_sha256 === report.tool_sha256 &&
+    sameSources(snapshot.source_sha256, snapshot.committed_source_sha256) &&
+    /^[a-f0-9]{12}$/.test(snapshot.page_build ?? '');
+}
+function realSolve(result, sources) {
+  const nodes = result?.mesh?.nodes_mm, triangles = result?.mesh?.triangles;
+  const velocity = result?.fields?.velocity_m_s, repro = result?.reproducibility;
+  return result?.schema_version === 1 && result.config &&
+    Object.keys(result.config).length === Object.keys(CONFIG).length &&
+    Object.entries(CONFIG).every(([key, value]) => result.config[key] === value) &&
+    Array.isArray(nodes) && nodes.length > 10 && nodes.every(row =>
+      Array.isArray(row) && row.length === 2 && row.every(Number.isFinite)) &&
+    Array.isArray(triangles) && triangles.length > 10 && triangles.every(row =>
+      Array.isArray(row) && row.length === 3 && new Set(row).size === 3 &&
+      row.every(n => Number.isInteger(n) && n >= 0 && n < nodes.length)) &&
+    Array.isArray(velocity) && velocity.length === nodes.length && velocity.every(finite) &&
+    velocity.some(v => v > 0) && result.metrics?.max_velocity_m_s === Math.max(...velocity) &&
+    repro?.solver_sha256 === sources?.['solver.py'] &&
+    /^[a-f0-9]{64}$/.test(repro?.config_sha256 ?? '') &&
+    Number.isFinite(Date.parse(repro?.computed_at)) && sameSources(repro?.source_sha256, sources);
 }
 function safeURL(value) {
   const url = new URL(value);
@@ -136,6 +186,19 @@ function instrumentation() {
       interactionId: e.interactionId, target: e.target?.id || null,
     });
   }, { durationThreshold: 16 });
+  const rememberReady = () => {
+    if (state.ready_at_ms === undefined && document.readyState === 'complete' &&
+        document.querySelector('#case-form')?.getAttribute('aria-busy') === 'false' &&
+        document.querySelector('#export-button')?.disabled === false) state.ready_at_ms = performance.now();
+  };
+  new MutationObserver(rememberReady).observe(document, { childList: true, subtree: true, attributes: true });
+  document.addEventListener('readystatechange', rememberReady);
+  setTimeout(() => {
+    state.cold_boundary = { cutoff_ms: 8000, captured_at_ms: performance.now(),
+      ready_at_ms: state.ready_at_ms ?? null,
+      ready: state.ready_at_ms !== undefined && state.ready_at_ms <= 8000 };
+    state.stop_lcp = true;
+  }, 8000);
   for (const type of ['pointerdown', 'pointerup', 'touchstart', 'touchend', 'click']) {
     document.addEventListener(type, event => {
       if (!event.isTrusted) return;
@@ -194,6 +257,12 @@ export function evaluateSample(sample) {
     sample.content.solve_count >= 2 && sample.content.nodes > 10 &&
     sample.content.triangles > 10 && sample.content.max_velocity > 0,
   sample.content);
+  check('G5-CONTENT', 'ready-at-fixed-cold-boundary',
+    sample.raw_metrics?.cold_boundary?.cutoff_ms === BASELINE.observation_ms &&
+    sample.raw_metrics.cold_boundary.ready === true &&
+    finite(sample.raw_metrics.cold_boundary.ready_at_ms) &&
+    sample.raw_metrics.cold_boundary.ready_at_ms <= BASELINE.observation_ms,
+  sample.raw_metrics?.cold_boundary);
   const resources = sample.resources;
   const total = rows => rows.reduce((sum, r) => sum + r.transfer_bytes, 0);
   check('WEB-PERF-002', 'complete-cold-transfer-accounting', resources.every(r =>
@@ -289,7 +358,7 @@ export class Browser {
     Object.assign(this, { options, run, report });
     this.requests = new Map(); this.tasks = []; this.thirdParty = []; this.redirects = [];
     this.networkErrors = []; this.runtimeErrors = []; this.solves = []; this.bodies = new Map();
-    this.logs = []; this.phase = 'startup';
+    this.logs = []; this.phase = 'startup'; this.healths = [];
   }
   send(method, params) { return this.cdp.send(method, params, this.session); }
   async eval(fn, ...args) {
@@ -390,8 +459,18 @@ export class Browser {
           this.bodies.set(e.requestId, text);
           if (new URL(r.url).pathname === '/api/solve') {
             const result = JSON.parse(text);
-            this.solves.push({ phase: r.phase, result, request_id: e.requestId });
+            this.solves.push({ phase: r.phase, result, request_id: e.requestId,
+              response_sha256: sha(text), response_body: text });
             await fs.writeFile(path.join(this.run, `solve-${this.solves.length}.json`), json(result), { flag: 'wx' });
+          }
+          if (new URL(r.url).pathname === '/api/health') {
+            this.healths.push({ result: JSON.parse(text), request_id: e.requestId,
+              response_sha256: sha(text), response_body: text });
+            await fs.writeFile(path.join(this.run, `health-${this.healths.length}.json`), text, { flag: 'wx' });
+          }
+          if (r.type === 'Document' || ['Script', 'Stylesheet'].includes(r.type)) {
+            await fs.writeFile(path.join(this.run, `response-${e.requestId.replaceAll('.', '-')}.txt`),
+              text, { flag: 'wx' });
           }
         })(), 'response-capture');
       }
@@ -425,6 +504,21 @@ export class Browser {
   track(promise, type) {
     this.tasks.push(promise.catch(error => { this.runtimeErrors.push({
       type, message: error.message, phase: this.phase }); }));
+  }
+  async drain() {
+    let count;
+    do { count = this.tasks.length; await Promise.all(this.tasks); }
+    while (count !== this.tasks.length);
+  }
+  async health() {
+    await this.eval(async () => {
+      const response = await fetch('/api/health', { cache: 'no-store', credentials: 'omit' });
+      if (!response.ok) throw new Error(`Health identity HTTP ${response.status}`);
+      await response.json();
+    });
+    await this.drain();
+    need(this.healths.length > 0, 'IDENTITY', 'Missing actual browser health response');
+    return this.healths.at(-1).result;
   }
   async touch(selector) {
     const before = await this.eval(selector => {
@@ -481,9 +575,9 @@ export class Browser {
     const navigation = await this.send('Page.navigate', { url: this.options.url });
     need(!navigation.errorText, 'G5-NETWORK', navigation.errorText ?? 'Navigation failed');
     await this.wait('Fixed cold observation window', () => this.eval(() =>
-      document.readyState === 'complete' && window.__opensimPerf && performance.now() >= 8000));
+      window.__opensimPerf?.cold_boundary));
     await this.eval(() => { window.__opensimPerf.stop_lcp = true; });
-    await Promise.all(this.tasks);
+    await this.drain();
     const initial = [...this.requests.values()].filter(r => r.phase === 'cold-baseline').map(r => this.resource(r));
     const content = await this.content();
     this.partial = { phase: 'PARTIAL_COLD_OBSERVATION_NOT_COMPLETE', target_url: this.options.url,
@@ -491,10 +585,14 @@ export class Browser {
       redirects: this.redirects, network_errors: this.networkErrors, runtime_errors: this.runtimeErrors,
       isolation: 'BLOCK_ALL_OFF_ORIGIN_BEFORE_REQUEST' };
     need(content.ready, 'G5-CONTENT', 'Real initial solve was not ready at fixed observation boundary', content);
+    const boundary = await this.eval(() => window.__opensimPerf.cold_boundary);
+    need(boundary.ready === true, 'G5-CONTENT', 'Initial solve missed the fixed 8000ms boundary', boundary);
     const config = this.solves[0]?.result?.config;
     need(config && Object.keys(config).length === Object.keys(CONFIG).length &&
       Object.entries(CONFIG).every(([key, value]) => config[key] === value),
     'G5-CONTENT', 'Initial real computation does not use fixed representative config', { config, expected: CONFIG });
+    this.phase = 'identity-before-interactions';
+    await this.health();
     const interactions = [];
     this.phase = 'core-interactions';
     for (const selector of ['#view-mesh', '#view-field', '#solve-button']) {
@@ -502,7 +600,7 @@ export class Browser {
       this.partial.interactions = interactions;
     }
     await this.wait('Second real solve and visible result', async () => {
-      await Promise.all(this.tasks);
+      await this.drain();
       return this.solves.length >= 2 && (await this.content()).ready;
     });
     const finalContent = await this.content();
@@ -558,18 +656,9 @@ export class Browser {
     };
     this.partial = sample;
     this.phase = 'source-identity';
-    const health = await this.eval(async () => {
-      const response = await fetch('/api/health', { cache: 'no-store', credentials: 'omit' });
-      if (!response.ok) throw new Error(`Health identity HTTP ${response.status}`);
-      return response.json();
-    });
-    const local = {}, committed = {};
-    for (const name of SOURCES) {
-      local[name] = sha(await fs.readFile(path.join(ROOT, name)));
-      const blob = spawnSync('git', ['-C', ROOT, 'show', `HEAD:${name}`], { maxBuffer: 8 * 1024 * 1024 });
-      need(blob.status === 0, 'IDENTITY', `Cannot read committed ${name}`);
-      committed[name] = sha(blob.stdout);
-    }
+    const health = await this.health();
+    const local = this.report.identity_before.source_sha256;
+    const committed = this.report.identity_before.committed_source_sha256;
     const doc = [...this.requests.values()].find(r => r.type === 'Document');
     const page = this.bodies.get(doc?.id);
     const assetsBound = ['js', 'css'].every(extension => [...this.requests.values()].some(r => {
@@ -578,16 +667,16 @@ export class Browser {
         /^\/web\/app\.[a-f0-9]{64}\.(js|css)$/.test(pathname) && pathname.endsWith(`.${extension}`)) &&
         r.body_sha256 === local[`web/app.${extension}`];
     }));
-    const same = sources => sources && Object.keys(sources).length === SOURCES.length &&
-      SOURCES.every(name => sources[name] === local[name]);
-    sample.source_identity = { bound: same(health.source_sha256) &&
-      same(actual?.reproducibility?.source_sha256) && assetsBound &&
+    sample.source_identity = { bound: sameSources(health.source_sha256, local) &&
+      sameSources(actual?.reproducibility?.source_sha256, local) && assetsBound &&
       Object.keys(local).every(name => local[name] === committed[name]) &&
       typeof health.page_build === 'string' && health.page_build.length >= 12 && page?.includes(health.page_build),
     local_source_sha256: local, committed_source_sha256: committed,
     health, solve_source_sha256: actual?.reproducibility?.source_sha256, assets_bound: assetsBound,
+    health_responses: this.healths, solve_responses: this.solves,
     page_build_seen: typeof health.page_build === 'string' && page?.includes(health.page_build),
-    document_sha256: doc?.body_sha256 };
+    document_sha256: doc?.body_sha256, document_body: page,
+    response_resources: [...this.requests.values()].map(r => ({ ...this.resource(r), request_id: r.id })) };
     return sample;
   }
   async measureFixture(metric) {
@@ -623,7 +712,7 @@ export class Browser {
       timing: r.timing, body_sha256: r.body_sha256, decoded_body_bytes: r.decoded_body_bytes ?? null };
   }
   async close() {
-    await Promise.all(this.tasks);
+    await this.drain();
     if (this.chrome?.exitCode === null) {
       if (this.cdp) await this.cdp.send('Browser.close');
       else this.chrome.kill('SIGTERM');
@@ -658,10 +747,18 @@ export function validateReport(report) {
   need(sample.metrics.lcp_ms === (raw.lcp.at(-1)?.startTime ?? null) &&
     sample.metrics.lcp_count === raw.lcp.length && sample.metrics.cls === clsValue(raw.shifts),
   'REPORT', 'LCP/CLS summary differs from raw browser entries');
+  need(raw.lcp.every(e => finite(e.startTime) && e.startTime <= BASELINE.observation_ms) &&
+    sample.metrics.inp_ms === null &&
+    sample.metrics.interaction_count === sample.interactions.length &&
+    sample.metrics.cls_observed === true, 'REPORT', 'Observation cutoff or non-INP contract altered');
+  need(new Set(sample.interactions.map(row => row.selector)).size === 3,
+    'REPORT', 'Duplicate interaction path');
   for (const row of sample.interactions) {
     need(row.paints?.length > 0 && Array.isArray(row.event_timing) &&
       row.paints.every(p => p.trusted === true && finite(p.start_ms) &&
-        finite(p.end_ms) && p.bound_ms === p.end_ms - p.start_ms) &&
+        finite(p.end_ms) && finite(p.bound_ms) && p.start_ms >= BASELINE.observation_ms &&
+        p.target === row.selector.slice(1) && p.bound_ms === p.end_ms - p.start_ms) &&
+      row.event_timing.every(e => finite(e.duration)) &&
       row.click_count === row.paints.filter(p => p.type === 'click').length &&
       row.latency_ms === Math.max(...row.paints.map(p => p.bound_ms), ...row.event_timing.map(e => e.duration)),
     'REPORT', 'Interaction summary differs from trusted raw event/paint bounds');
@@ -669,6 +766,13 @@ export function validateReport(report) {
   need(sample.metrics.interaction_latency_ms === Math.max(...sample.interactions.map(r => r.latency_ms)),
     'REPORT', 'Aggregate interaction latency differs from raw samples');
   const identity = sample.source_identity;
+  const capturedResponse = (row, pathname, method) => row && typeof row.response_body === 'string' &&
+    sha(row.response_body) === row.response_sha256 &&
+    JSON.stringify(JSON.parse(row.response_body)) === JSON.stringify(row.result) &&
+    identity.response_resources?.some(resource => resource.request_id === row.request_id &&
+      new URL(resource.url).pathname === pathname && resource.method === method &&
+      resource.status === 200 && resource.finished === true &&
+      resource.body_sha256 === row.response_sha256);
   const matching = map => map && Object.keys(map).length === SOURCES.length &&
     SOURCES.every(name => /^[a-f0-9]{64}$/.test(identity.local_source_sha256?.[name] ?? '') &&
       map[name] === identity.local_source_sha256[name]);
@@ -679,10 +783,29 @@ export function validateReport(report) {
     identity.document_sha256 === sample.resources.find(r => r.type === 'Document')?.body_sha256 &&
     ['js', 'css'].every(ext => sample.resources.some(r =>
       r.body_sha256 === identity.local_source_sha256[`web/app.${ext}`] &&
-      new URL(r.url).pathname.endsWith(`.${ext}`)));
+      new URL(r.url).pathname.endsWith(`.${ext}`))) &&
+    snapshotBound(report.identity_before, report) && snapshotBound(report.identity_after, report) &&
+    report.identity_before.page_build === report.identity_after.page_build &&
+    report.identity_before.page_build === identity.health.page_build &&
+    sameSources(report.identity_before.source_sha256, identity.local_source_sha256) &&
+    sameSources(report.identity_after.source_sha256, identity.local_source_sha256) &&
+    identity.document_body?.includes(`<code>${report.identity_before.page_build}</code>`) &&
+    sha(identity.document_body ?? '') === identity.document_sha256 &&
+    identity.health_responses?.length === 2 && identity.health_responses.every(row =>
+      row.result?.status === 'ok' && row.result.schema_version === 1 &&
+      row.result.page_build === report.identity_before.page_build &&
+      matching(row.result.source_sha256) && capturedResponse(row, '/api/health', 'GET')) &&
+    identity.solve_responses?.length === 2 && sample.content.solve_count === 2 &&
+    identity.solve_responses.every(row => realSolve(row.result, identity.local_source_sha256) &&
+      capturedResponse(row, '/api/solve', 'POST'));
   const checks = evaluateSample(sample);
   checks.push({ rule: 'G5-IDENTITY', name: 'served-page-assets-health-solve-bound-to-commit',
     status: identityBound ? 'PASS' : 'FAIL', detail: identity });
+  checks.push({ rule: 'EVIDENCE', name: 'no-preserved-failure-or-incomplete-terminal',
+    status: !report.failure && !report.cleanup_failure && !report.persistence_failure &&
+      !report.fixture_io_failure && !['FAIL', 'EVIDENCE_PENDING'].includes(report.verdict) ? 'PASS' : 'FAIL',
+    detail: { failure: report.failure, cleanup_failure: report.cleanup_failure,
+      persistence_failure: report.persistence_failure, verdict: report.verdict } });
   if (target.scope === 'PUBLIC_LAB') checks.push({
     rule: 'G5-NETWORK', name: 'public-dns-and-actual-browser-connection',
     status: report.public_dns?.length > 0 && report.public_dns.every(row => publicAddress(row.address)) &&
@@ -692,6 +815,54 @@ export function validateReport(report) {
   need(report.commit?.match(/^[a-f0-9]{40}$/) && report.tool_sha256?.match(/^[a-f0-9]{64}$/),
     'REPORT', 'Missing commit/tool identity');
   return checks;
+}
+function retainFailure(report, error, phase) {
+  report.failure ??= { rule: error.rule ?? 'HARNESS', message: error.message,
+    detail: error.detail ?? {}, phase, stack: error.stack };
+  report.verdict = 'FAIL'; report.g5_certified = false;
+}
+function retainCheckFailure(report) {
+  const failed = report.checks.find(check => check.status === 'FAIL');
+  if (failed && !report.failure) report.failure = {
+    rule: failed.rule, message: failed.name, detail: failed.detail, phase: 'gate-evaluation' };
+}
+async function persistReport(run, report) {
+  const filename = path.join(run, 'report.json');
+  const line = () => `PERFORMANCE verdict=${report.verdict} scope=${report.scope} g5_certified=${report.g5_certified} ` +
+    `rc=${report.exit_code} samples=${report.samples.length} checks=${report.checks.length} report=${filename}`;
+  try {
+    // A non-certifying report is always on disk before any late evidence writes.
+    await fs.writeFile(filename, json({ ...report, verdict: 'EVIDENCE_PENDING',
+      g5_certified: false, exit_code: 2 }), { flag: 'wx' });
+    const candidate = path.join(run, 'report-candidate.json');
+    const bytes = json(report);
+    const evidenceLine = `EVIDENCE_READY scope=${report.scope} proposed_verdict=${report.verdict} ` +
+      `terminal_authority=${filename}`;
+    await fs.writeFile(path.join(run, 'run.log'),
+      `${report.started_at} START\n${report.finished_at} ${evidenceLine}\n`, { flag: 'wx' });
+    need((await fs.readFile(path.join(run, 'run.log'), 'utf8')).includes(evidenceLine),
+      'EVIDENCE', 'Terminal log readback mismatch');
+    await fs.writeFile(candidate, bytes, { flag: 'wx' });
+    assert.equal(await fs.readFile(candidate, 'utf8'), bytes);
+    // Publishing the terminal report is the final fallible filesystem operation.
+    await fs.rename(candidate, filename);
+  } catch (error) {
+    report.persistence_failure = { rule: 'EVIDENCE', message: error.message,
+      code: error.code ?? null, phase: 'terminal-persistence', stack: error.stack };
+    retainFailure(report, new Failure('EVIDENCE', error.message,
+      { code: error.code ?? null }), 'terminal-persistence');
+    report.exit_code = 2;
+    const failureFile = path.join(run, `report-failure-${randomUUID()}.json`);
+    try {
+      await fs.writeFile(failureFile, json(report), { flag: 'wx' });
+      await fs.rename(failureFile, filename);
+    } catch (emergency) {
+      console.error(`PERFORMANCE_EVIDENCE_RECOVERY_FAIL ${emergency.message}`);
+    }
+    console.error(`PERFORMANCE_FAIL rule=EVIDENCE phase=terminal-persistence ${error.message}`);
+  }
+  console.log(line());
+  return report.exit_code;
 }
 async function outputDirectory(out) {
   const allowed = await fs.realpath('/hf3fs-jd/data/tmp');
@@ -780,7 +951,16 @@ async function offlineSelftest(directory, options, run, report) {
             observation);
           browserResults.push(observation);
           report.selftest.browser_count = browserResults.length;
-        } finally { await browser.close(); }
+        } catch (error) {
+          report.fixture_failure ??= { file: test.file, rule: error.rule ?? 'SELFTEST',
+            message: error.message, phase: browser.phase };
+          throw error;
+        } finally {
+          try { await browser.close(); } catch (error) {
+            report.fixture_cleanup_failure = { file: test.file, message: error.message };
+            if (!report.fixture_failure) throw error;
+          }
+        }
       }
       need(['lcp_ms', 'cls', 'interaction_latency_ms'].every(metric =>
         browserResults.some(row => row.metric === metric && row.failed)),
@@ -789,6 +969,9 @@ async function offlineSelftest(directory, options, run, report) {
       await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
   }
+  need(!report.fixture_io_failure && !report.fixture_cleanup_failure, 'SELFTEST',
+    'Fixture evidence I/O or cleanup failed', {
+      io: report.fixture_io_failure, cleanup: report.fixture_cleanup_failure });
   return { count: results.length, cases: results, browser_count: browserResults.length,
     browser_cases: browserResults, scope: 'FILE_FIXTURES_NOT_G5', status: 'PASS' };
 }
@@ -817,7 +1000,7 @@ export async function main(argv = process.argv.slice(2)) {
     const git = spawnSync('git', ['-C', ROOT, 'rev-parse', 'HEAD'], { encoding: 'utf8' });
     need(git.status === 0, 'IDENTITY', `Cannot read commit: ${git.stderr}`);
     report.commit = git.stdout.trim();
-    report.tool_sha256 = sha(await fs.readFile(fileURLToPath(import.meta.url)));
+    report.tool_sha256 = LOADED_TOOL_SHA256;
     report.target_url = options.url ?? null; report.scope = options.scope ?? 'OFFLINE_PARSE_NOT_G5';
     if (options.selftest) {
       report.scope = 'OFFLINE_FILE_FIXTURES_NOT_G5';
@@ -832,9 +1015,13 @@ export async function main(argv = process.argv.slice(2)) {
       report.verdict = report.checks.every(c => c.status === 'PASS') ? 'OFFLINE_PARSE_PASS' : 'FAIL';
       exitCode = report.verdict === 'FAIL' ? 1 : 0;
     } else {
+      report.identity_before = await sourceSnapshot();
+      need(snapshotBound(report.identity_before, report), 'IDENTITY',
+        'Loaded tool or application sources do not match the frozen commit', report.identity_before);
       browser = new Browser(options, run, report);
       await browser.launch();
       report.samples.push(await browser.measure());
+      report.identity_after = await sourceSnapshot();
       report.checks = validateReport(report);
       const pass = report.checks.every(c => c.status === 'PASS');
       report.g5_certified = pass && report.scope === 'PUBLIC_LAB';
@@ -842,9 +1029,7 @@ export async function main(argv = process.argv.slice(2)) {
       exitCode = pass ? 0 : 1;
     }
   } catch (e) {
-    report.verdict = 'FAIL'; report.g5_certified = false;
-    report.failure = { rule: e.rule ?? 'HARNESS', message: e.message,
-      detail: e.detail ?? {}, phase: browser?.phase ?? 'configuration', stack: e.stack };
+    retainFailure(report, e, browser?.phase ?? 'configuration');
     exitCode = ['CLI', 'OUTPUT', 'DEPENDENCY', 'REPORT', 'SELFTEST', 'IDENTITY'].includes(e.rule) ||
       !(e instanceof Failure) ? 2 : 1;
     console.error(`PERFORMANCE_FAIL rule=${report.failure.rule} phase=${report.failure.phase} ${e.message}`);
@@ -863,9 +1048,11 @@ export async function main(argv = process.argv.slice(2)) {
       } catch (captureError) { report.partial_capture_failure = { message: captureError.message }; }
     }
   } finally {
+    retainCheckFailure(report);
     if (browser) {
       try { await browser.close(); } catch (e) {
-        report.cleanup_failure = { message: e.message }; report.verdict = 'FAIL';
+        report.cleanup_failure = { message: e.message };
+        retainFailure(report, e, 'browser-cleanup');
         report.g5_certified = false; exitCode = 2;
       }
       report.observed_network = [...browser.requests.values()].map(r => browser.resource(r));
@@ -873,6 +1060,7 @@ export async function main(argv = process.argv.slice(2)) {
       report.network_errors = browser.networkErrors; report.runtime_errors = browser.runtimeErrors;
       if (!report.failure && !report.cleanup_failure && report.samples.length === 1) {
         try {
+          report.identity_after = await sourceSnapshot();
           report.checks = validateReport(report);
           if (report.checks.some(check => check.status === 'FAIL')) {
             report.verdict = 'FAIL'; report.g5_certified = false; exitCode = 1;
@@ -884,21 +1072,11 @@ export async function main(argv = process.argv.slice(2)) {
         }
       }
     }
-    const failed = report.checks.find(check => check.status === 'FAIL');
-    if (failed && !report.failure) report.failure = {
-      rule: failed.rule, message: failed.name, detail: failed.detail, phase: 'gate-evaluation',
-    };
+    retainCheckFailure(report);
     report.failure_count = report.checks.filter(check => check.status === 'FAIL').length;
     report.finished_at = new Date().toISOString(); report.exit_code = exitCode;
     if (run) {
-      await fs.writeFile(path.join(run, 'report.json'), json(report), { flag: 'wx' });
-      const readback = JSON.parse(await fs.readFile(path.join(run, 'report.json'), 'utf8'));
-      assert.equal(readback.verdict, report.verdict); assert.equal(readback.exit_code, exitCode);
-      const line = `PERFORMANCE verdict=${report.verdict} scope=${report.scope} g5_certified=${report.g5_certified} ` +
-        `rc=${exitCode} samples=${report.samples.length} checks=${report.checks.length} report=${run}/report.json`;
-      await fs.writeFile(path.join(run, 'run.log'), `${report.started_at} START\n${report.finished_at} ${line}\n`,
-        { flag: 'wx' });
-      console.log(line);
+      exitCode = await persistReport(run, report);
     }
   }
   return exitCode;

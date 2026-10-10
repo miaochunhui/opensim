@@ -14,11 +14,12 @@ sudo -n -u infra node tools/browser_performance.mjs --url http://127.0.0.1:PORT/
 sudo -n -u infra node tools/browser_performance.mjs --url https://opensim.ai4everyone.top/
 sudo -n -u infra node tools/browser_performance.mjs --parse /ABSOLUTE/REPORT.json
 sudo -n -u infra python3 -B tests/test_browser_performance.py --real-browser
+sudo -n -u infra python3 -B tests/test_browser_performance.py --real-browser --preflight
 sudo -n -u infra node tools/browser_performance.mjs --selftest --fixtures /ABSOLUTE/FIXTURES
 ```
 
 `PORT` 使用新实例启动日志中的实际端口。完整工具路径为
-`/data/dev/opensim-perf-v1/tools/browser_performance.mjs`。
+`/data/dev/opensim-perf-review-v1/tools/browser_performance.mjs`。
 可选 `--chrome PATH` 使用已有 Chromium；默认既有 Chrome 140 可执行文件。
 Node 必须已有原生 WebSocket。缺浏览器/依赖时失败，不自动安装或下载。
 `--out` 仅允许外部 `/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-perf/` 子目录，
@@ -117,6 +118,23 @@ third_party, redirects, network_errors, runtime_errors
 检查输出 rule、name、status、URL、视口、复现方法和实际值/预算。
 `failure` 为首个失败或异常，不吞掉后续 `checks` 与 cleanup_failure。
 
+性能模式在启动 Chromium 前冻结 `identity_before`，停止自有 Chromium 后现读
+`identity_after`。两次均检查 HEAD、已加载工具 SHA256、提交中工具 SHA256、
+五份完整源码 SHA256 及按生成器顺序现算的 page build；实际工具或源码
+未提交、HEAD/源码/工具漂移均闭门，不能把末尾的新 HEAD 归给旧执行代码。
+检查两个完整 `/api/health` 和两个完整 `/api/solve`，不只检查最后一个求解。
+每个响应与 CDP 请求 ID、状态、实际正文 SHA256 绑定；页面正文及 JS/CSS
+原文、health 原文、完整求解、实际 PNG 均外置保存供独立回读。
+页面必须出现当前现算 build 的 `<code>`，不是任意字符串包含即可。
+固定窗口记录实际结果就绪时间，晚于8000ms完成不能延长观察补绿。
+
+报告持久化先写 `EVIDENCE_PENDING`，再写未认证的 `EVIDENCE_READY` 日志，
+回读候选完整报告，最后原子发布终态。晚写、回读或重命名失败为
+`persistence_failure`，强制 FAIL/退出2/不认证；已有首因保持原值。
+磁盘全部不可写时不能保证新增失败文件，但原有未认证状态不会升为绿灯，
+标准错误会保留故障。解析输入保留的 failure/cleanup/persistence 也不能
+重新计算为 PASS。日志不是认证权威，只有最后的 `report.json` 是终态。
+
 公网 G5 PASS 要求页面构建、两个实际 JS/CSS 响应、health 及真实求解中的
 五份源码 SHA256，全部与当前工作树及当前提交字节一致；
 公网 DNS/实际连接地址达标、全部 G5 检查 PASS，才可
@@ -169,3 +187,37 @@ favicon404、legacy JS/CSS 缺完整指纹和 immutable 长缓存。
 未绑定公网、未验证 server 席指纹版本，均不能声称产品 G5 已通过。
 主代理整合后从完整提交启动新实例，再执行一次固定预检及获准公网测量。
 回滚只涉及本席这三个新增文件的独立提交，不回退、覆盖或清理其他席资产。
+
+## Independent Review V1
+
+2026-10-10，本席从 `01311b9` 建立独立 `codex/perf-review-v1`，
+以 `b27ef2af499de7526919c1ff2bc8a9a706f30168` 为性能依赖
+（本工作树依赖提交 `1adfdc1e471f0ec37fd488c6a839e0b7c4985c03`）。
+仅改本工具、性能测试与本文件，不修改 server/render、infra、
+OpenCAD/openopt、生产、凭据或公网入口，不 push。
+
+修前产品单次冷启动
+`review-v1-20261010/before/run-2026-10-10T08-17-51-547Z-1dc9a8d8/report.json`
+有1样本、19检查、LOCAL_PREFLIGHT_PASS，证明该基线图标与指纹资源已修。
+新增回归反例的首次红灯
+`review-v1-20261010/python-tests-20261010T081935Z-d73d1ff9/summary.json`
+为6测试、28文件夹具、3失败：首个求解身份错配被旧工具解析成 PASS；
+自检捕捉该假绿后失败；`run.log` 文件碰撞造成进程退出失败但报告仍 PASS。
+原失败完整保留，修后不追认旧报告。
+
+新增41文件夹具覆盖提交/工具/源码前后漂移、首个 health/solve 错配、
+缺初始求解、空速度、假页面 build、旧错误终态、超观察窗口和 INP 冒称。
+实际 CLI 的日志/候选报告碰撞分别验证绿路径降为 FAIL 与旧首因保持。
+`--preflight` 再用新专属回环服务执行真实 Chromium 日志晚写失败负例，
+之后执行一次完整固定产品冷启动；结束只停止该入口创建的服务进程。
+`--real-browser` 仍为四个真实 Chromium 文件页面：
+快速输入阴性对照、晚 LCP、CLS 跳动、350ms 忙循环输入三个阳性反例，
+不是四个产品算例，也不是生产认证。
+
+全部新增测试及最终产物只在
+`/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-perf/review-v1-20261010/`
+新建带时间/随机后缀的目录，最终 `summary.json` 和 `preflight.json`
+现读实际计数、提交、工具摘要、原始响应/截图核验与自有服务停止状态。
+既有两次启动测试曾用默认 evidence 根创建独立新目录，未覆盖其他产物。
+未覆盖 actual root/public/manual 发布记录，不签 G5 公网或全发布门，
+缺真实触屏、桌面/移动屏幕阅读器以及公网同版本实算仍明确未验。
