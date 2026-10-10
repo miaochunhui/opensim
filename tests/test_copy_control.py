@@ -32,8 +32,9 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
-const [source, url, run, expectedFile] = process.argv.slice(2);
-assert.equal(process.argv.slice(2).length, 4);
+const [source, url, run, expectedFile, mode] = process.argv.slice(2);
+assert.equal(process.argv.slice(2).length, 5);
+assert(["copy", "tab-exclusion-red"].includes(mode));
 assert(run.startsWith("/hf3fs-jd/data/tmp/opensim-fluid-v1/authorized-s1-copy-control-20261011/")
   && path.resolve(run) === run, "Fixed fresh output required");
 const { Browser } = await import(pathToFileURL(path.join(source, "tools/browser_audit.mjs")));
@@ -43,7 +44,7 @@ await fs.mkdir(run);
 await fs.mkdir(path.join(run, "logs"));
 const report = { schema: "opensim-copy-control-browser-v1", scope: "REAL_LOOPBACK_COPY_ONLY",
   release_verdict: "NOT_CERTIFIED", certified: false, checks: [], screenshots: [],
-  started_at: new Date().toISOString(), source_root: source };
+  started_at: new Date().toISOString(), source_root: source, mode, tab_traces: [] };
 const browser = new Browser(url, run, report);
 const record = (name, detail) => report.checks.push({ name, status: "PASS", detail });
 let rc = 1;
@@ -103,6 +104,41 @@ async function click() {
   await browser.send("Input.dispatchMouseEvent", { type: "mousePressed", ...point, button: "left", clickCount: 1 });
   await browser.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button: "left", clickCount: 1 });
 }
+async function focusSnapshot() {
+  return browser.evaluate(() => {
+    const active = document.activeElement;
+    return { tag: active?.tagName, id: active?.id,
+      summary: !!active?.matches("#convergence .evidence-report > summary"),
+      copy: active?.id === "copy-evidence-button",
+      tabindex: document.querySelector("#copy-evidence-button").getAttribute("tabindex"),
+      details_open: document.querySelector("#convergence .evidence-report").open };
+  });
+}
+async function tabToSummary() {
+  const count = await browser.evaluate(() => document.querySelectorAll("button,input,select,a[href],summary,[tabindex]").length);
+  for (let index = 0; index <= count + 2; index++) {
+    if ((await focusSnapshot()).summary) return;
+    await browser.key("Tab");
+  }
+  assert.fail("Real Tab cannot reach convergence summary");
+}
+async function tabToCopy(label) {
+  const start = await focusSnapshot();
+  assert(start.summary && !start.copy && start.details_open, "Tab must start on open summary, not copy button");
+  const trace = { label, start, events: [], reached: false };
+  report.tab_traces.push(trace);
+  const count = await browser.evaluate(() => document.querySelectorAll("button,input,select,a[href],summary,[tabindex]").length);
+  for (let index = 0; index <= count + 2; index++) {
+    await browser.key("Tab");
+    const focus = await focusSnapshot();
+    trace.events.push({ key: "Tab", focus });
+    if (focus.copy) { trace.reached = true; break; }
+    if (focus.summary) break;
+  }
+  assert(trace.reached, "Real Tab cannot reach copy button from summary");
+  assert(trace.events.length > 0);
+  return trace;
+}
 async function success(name, action, text) {
   await browser.evaluate(async () => { await navigator.clipboard.writeText("COPY_TEST_SENTINEL"); });
   await action();
@@ -124,7 +160,7 @@ try {
   await browser.launch();
   await browser.cdp.send("Browser.grantPermissions", { origin: new URL(url).origin,
     permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"] });
-  for (const [width, height] of [[320, 568], [1440, 900]]) {
+  for (const [width, height] of mode === "copy" ? [[320, 568], [1440, 900]] : [[320, 568]]) {
     await browser.viewport(width, height);
     await browser.navigate();
     if (width === 320) await identity("before");
@@ -149,9 +185,37 @@ try {
     assert(["auto", "scroll"].includes(geometry.overflow_x));
     assert(["pre", "pre-wrap", "break-spaces"].includes(geometry.white_space));
     record("geometry-" + width, geometry);
-    await success("mouse-" + width, click, expected);
-    await success("keyboard-enter-" + width, () => browser.activate("#copy-evidence-button"), expected);
+    if (mode === "tab-exclusion-red") {
+      await browser.evaluate(() => document.querySelector("#copy-evidence-button").setAttribute("tabindex", "-1"));
+      await success("legacy-mouse-TEST_ONLY", click, expected);
+      await success("legacy-enter-TEST_ONLY", () => browser.activate("#copy-evidence-button"), expected);
+      await tabToSummary();
+      await tabToCopy("excluded-red-" + width);
+      assert.fail("Excluded copy button unexpectedly passed Tab oracle");
+    }
+    record("keyboard-tab-" + width, await tabToCopy("native-" + width));
+    await browser.screenshot("copy-tab-focus-" + width, false);
+    await success("keyboard-enter-" + width, () => browser.key("Enter"), expected);
     await success("keyboard-space-" + width, () => browser.key(" "), expected);
+    const originalTabindex = await browser.evaluate(() => document.querySelector("#copy-evidence-button").getAttribute("tabindex"));
+    assert.equal(originalTabindex, null, "Original copy button must retain native tab order");
+    try {
+      await browser.evaluate(() => document.querySelector("#copy-evidence-button").setAttribute("tabindex", "-1"));
+      await tabToSummary();
+      await assert.rejects(() => tabToCopy("excluded-" + width), {
+        name: "AssertionError", message: "Real Tab cannot reach copy button from summary",
+      });
+      record("tabindex-minus-one-excluded-" + width, report.tab_traces.at(-1));
+    } finally {
+      await browser.evaluate(value => {
+        const button = document.querySelector("#copy-evidence-button");
+        if (value === null) button.removeAttribute("tabindex");
+        else button.setAttribute("tabindex", value);
+      }, originalTabindex);
+    }
+    await tabToSummary();
+    record("keyboard-tab-restored-" + width, await tabToCopy("restored-" + width));
+    await success("mouse-" + width, click, expected);
     await browser.screenshot("copy-success-" + width, false);
   }
   await browser.viewport(320, 568);
@@ -322,37 +386,71 @@ class CopyControlTests(unittest.TestCase):
         write_new(self.out / "rendered.html", html.encode())
 
     def test_real_clipboard_click_keyboard_failure_and_retry(self):
+        self._real_browser()
+
+    def test_real_tabindex_minus_one_is_rejected(self):
+        self._real_browser("tab-exclusion-red", expected_rc=1)
+
+    def _real_browser(self, mode="copy", expected_rc=0):
+        out = self.out
+        if mode == "tab-exclusion-red":
+            out = self.out / "tab-exclusion"
+            out.mkdir(exist_ok=False)
         numerical = json.loads(EVIDENCE.read_bytes())
         self.assertEqual(numerical["solver"]["sha256"], server.RUNTIME_SOURCES["solver.py"])
         expected = json.dumps(_preview(numerical), ensure_ascii=False, sort_keys=True,
                               indent=2, allow_nan=False)
-        expected_file = self.out / "expected-preview.txt"
-        module = self.out / "copy-browser.mjs"
+        expected_file = out / "expected-preview.txt"
+        module = out / "copy-browser.mjs"
         write_new(expected_file, expected.encode())
         write_new(module, BROWSER_SOURCE.encode())
-        handler = logging.FileHandler(self.out / "server.log", encoding="utf-8")
+        handler = logging.FileHandler(out / "server.log", encoding="utf-8")
         logging.getLogger().addHandler(handler)
         app = server.ApplicationServer(("127.0.0.1", 0), evidence=EVIDENCE)
         worker = threading.Thread(target=app.serve_forever, daemon=True)
         worker.start()
         argv = ["node", str(module), str(ROOT), f"http://127.0.0.1:{app.server_port}/",
-                str(self.out / "browser"), str(expected_file)]
+                str(out / "browser"), str(expected_file), mode]
         started = datetime.now(timezone.utc).isoformat()
         try:
-            with (self.out / "browser.stdout.log").open("xb") as stdout, (self.out / "browser.stderr.log").open("xb") as stderr:
+            with (out / "browser.stdout.log").open("xb") as stdout, (out / "browser.stderr.log").open("xb") as stderr:
                 result = subprocess.run(argv, cwd=ROOT, stdout=stdout, stderr=stderr, timeout=180)
             record = {"argv": argv, "actual_rc": result.returncode, "started_at": started,
                       "finished_at": datetime.now(timezone.utc).isoformat()}
             self.children.append(record)
-            write_new(self.out / "browser-process.json", encode(record))
-            report_file = self.out / "browser/report.json"
-            self.assertEqual(result.returncode, 0, report_file.read_text())
+            write_new(out / "browser-process.json", encode(record))
+            report_file = out / "browser/report.json"
             report = json.loads(report_file.read_bytes())
+            first_failure = report.get("first_failure")
+            self.assertEqual(result.returncode, expected_rc, f"{report_file}: {first_failure}")
             self.assertEqual(report["actual_exit_code"], result.returncode)
             self.assertEqual(report["release_verdict"], "NOT_CERTIFIED")
             self.assertEqual(report["chromium_exit_code"], 0)
+            if mode == "tab-exclusion-red":
+                self.assertEqual(report["verdict"], "FAIL")
+                self.assertEqual(report["first_failure"]["name"], "AssertionError")
+                self.assertEqual(report["first_failure"]["message"], "Real Tab cannot reach copy button from summary")
+                self.assertEqual([row["name"] for row in report["checks"]],
+                                 ["geometry-320", "legacy-mouse-TEST_ONLY", "legacy-enter-TEST_ONLY"])
+                self.assertEqual(len(report["tab_traces"]), 1)
+                trace = report["tab_traces"][0]
+                self.assertTrue(trace["start"]["summary"])
+                self.assertEqual(trace["start"]["tabindex"], "-1")
+                self.assertFalse(trace["reached"])
+                self.assertGreater(len(trace["events"]), 0)
+                self.assertTrue(all(event["key"] == "Tab" and not event["focus"]["copy"] for event in trace["events"]))
+                self.assertTrue(trace["events"][-1]["focus"]["summary"])
+                write_new(out / "tab-negative-readback.json", encode({
+                    "scope": "TEST_ONLY_DYNAMIC_TABINDEX_EXCLUSION", "child_actual_rc": result.returncode,
+                    "first_failure": report["first_failure"], "trace": trace,
+                    "report_sha256": sha(report_file.read_bytes()),
+                    "module_sha256": sha(module.read_bytes()),
+                    "legacy_mouse_and_enter_still_pass": True, "certified": False,
+                }))
+                return
             expected_names = {f"{kind}-{width}" for width in (320, 1440)
-                              for kind in ("geometry", "mouse", "keyboard-enter", "keyboard-space")}
+                              for kind in ("geometry", "mouse", "keyboard-enter", "keyboard-space",
+                                           "keyboard-tab", "tabindex-minus-one-excluded", "keyboard-tab-restored")}
             expected_names.update(("exact-whitespace-TEST_ONLY", "empty-TEST_ONLY",
                                    "duplicate-activation-TEST_ONLY"))
             expected_names.update(f"{kind}-{fault}" for kind in ("fault", "retry")
@@ -361,24 +459,41 @@ class CopyControlTests(unittest.TestCase):
             self.assertEqual(len(names), len(set(names)), "Duplicate test check names")
             self.assertEqual(set(names), expected_names)
             self.assertTrue(all(row["status"] == "PASS" for row in report["checks"]))
+            self.assertEqual([trace["label"] for trace in report["tab_traces"]],
+                             [f"{kind}-{width}" for width in (320, 1440) for kind in ("native", "excluded", "restored")])
+            for trace in report["tab_traces"]:
+                self.assertTrue(trace["start"]["summary"] and not trace["start"]["copy"])
+                self.assertGreater(len(trace["events"]), 0)
+                self.assertTrue(all(event["key"] == "Tab" for event in trace["events"]))
+                excluded = trace["label"].startswith("excluded-")
+                self.assertEqual(trace["reached"], not excluded)
+                self.assertEqual(trace["events"][-1]["focus"]["copy"], not excluded)
+                if excluded:
+                    self.assertEqual(trace["start"]["tabindex"], "-1")
+                    self.assertFalse(any(event["focus"]["copy"] for event in trace["events"]))
             self.assertEqual(len(report["responses"]), 2)
             self.assertEqual(len(report["identity"]), 2)
+            self.assertEqual({row["file"] for row in report["screenshots"]}, {
+                "copy-tab-focus-320.png", "copy-tab-focus-1440.png",
+                "copy-success-320.png", "copy-success-1440.png",
+                "copy-failure-denied.png", "copy-failure-missing.png", "copy-failure-sync-throw.png",
+            })
             for row in report["responses"]:
                 self.assertEqual(row["status"], 200)
                 self.assertEqual(row["payload"]["reproducibility"]["source_sha256"], server.RUNTIME_SOURCES)
-                original = json.loads((self.out / "browser" / row["artifact"]).read_bytes())
+                original = json.loads((out / "browser" / row["artifact"]).read_bytes())
                 self.assertEqual(original["payload"], row["payload"])
                 self.assertEqual(original["body_sha256"], row["body_sha256"])
             for row in report["screenshots"]:
-                data = (self.out / "browser" / row["file"]).read_bytes()
+                data = (out / "browser" / row["file"]).read_bytes()
                 self.assertEqual(sha(data), row["sha256"])
                 self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
-            write_new(self.out / "browser-artifacts.json", encode({
+            write_new(out / "browser-artifacts.json", encode({
                 "report_sha256": sha(report_file.read_bytes()),
-                "log_sha256": sha((self.out / "browser/logs/chromium.log").read_bytes()),
+                "log_sha256": sha((out / "browser/logs/chromium.log").read_bytes()),
                 "module_sha256": sha(module.read_bytes()), "embedded_source_sha256": sha(BROWSER_SOURCE.encode()),
                 "expected_preview_sha256": sha(expected_file.read_bytes()),
-                "posts": [{"file": row["artifact"], "sha256": sha((self.out / "browser" / row["artifact"]).read_bytes())}
+                "posts": [{"file": row["artifact"], "sha256": sha((out / "browser" / row["artifact"]).read_bytes())}
                           for row in report["responses"]],
                 "screenshots": report["screenshots"],
             }))
