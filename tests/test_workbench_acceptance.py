@@ -153,7 +153,8 @@ class WorkbenchTests(unittest.TestCase):
             "fields": {"velocity_m_s": [0, 1, 0]},
             "reproducibility": {"source_sha256": sources, "solver_sha256": sources["solver.py"],
                                 "computed_at": "2026-10-10T00:00:00Z"}}}, "solve-001.json")
-        log = b"BROWSER candidate_verdict=AUTOMATED_PASS candidate_rc=0\n"
+        log = (f"2026-10-10T00:01:00Z BROWSER_CHECK candidate_verdict=AUTOMATED_PASS "
+               f"candidate_rc=0 report={directory / 'report.json'}\n").encode()
         (directory / "run.log").write_bytes(log)
         return {
             "schema_version": 1, "tool": "opensim-browser-check",
@@ -179,6 +180,8 @@ class WorkbenchTests(unittest.TestCase):
 
     def seal_producer_fixture(self, name, value, directory):
         """Actual schema, actual files; this never executes or certifies a producer."""
+        if name == "browser":
+            return
         if name == "audit":
             (directory / "logs").mkdir(exist_ok=True)
             log = (f"AUDIT candidate_verdict={value['verdict']} candidate_rc={value['exit_code']} "
@@ -928,7 +931,8 @@ class WorkbenchTests(unittest.TestCase):
             self.consume_prepared("ui", directory, value)
 
     def test_actual_failure_sidecars_read_before_unknown_report_preserve_first_cause(self):
-        for name, filename in (("audit", "report.failure.json"), ("ui", "finalization-failure.json"),
+        for name, filename in (("browser", "report.failure.json"), ("audit", "report.failure.json"),
+                               ("ui", "finalization-failure.json"),
                                ("perf", "report-failure-file.json")):
             output = self.directory()
             run = output / "run-fixture"
@@ -958,7 +962,8 @@ class WorkbenchTests(unittest.TestCase):
             self.assertEqual(gate.first_failure(value)["rule"], "FIRST_CHECK")
 
     def test_all_actual_failure_markers_veto_unchanged_success_report(self):
-        for name, marker in (("audit", "report.failure.json"), ("ui", "finalization-failure.json"),
+        for name, marker in (("browser", "report.failure.json"), ("audit", "report.failure.json"),
+                             ("ui", "finalization-failure.json"),
                              ("perf", "report-failure-sidecar.json")):
             directory, value = self.prepared(name)
             self.save(directory, {"verdict": "FAIL", "finalization_failure": {"code": "EBADF"}}, marker)
@@ -1025,6 +1030,35 @@ class WorkbenchTests(unittest.TestCase):
                     value["durability"]["log"].update(bytes=len(log), sha256=gate.sha(log))
             with self.subTest(variant=variant), self.assertRaises(gate.EvidenceError):
                 self.validate(value, directory)
+
+    def test_browser_complete_log_binding_and_approved_path_alias(self):
+        for variant in ("time", "tool", "path", "suffix", "missing-newline", "logical-path"):
+            directory = self.directory()
+            value = self.browser(directory)
+            path = directory / "run.log"
+            text = path.read_text()
+            if variant == "time":
+                text = text.replace(value["finished_at"], "2026-10-09T00:01:00Z")
+            elif variant == "tool":
+                text = text.replace("BROWSER_CHECK", "UNKNOWN_TOOL")
+            elif variant == "path":
+                text = text.replace(str(directory / "report.json"), "/unknown/report.json")
+            elif variant == "suffix":
+                text = text.rstrip("\n") + " unbound-extra-field\n"
+            elif variant == "missing-newline":
+                text = text.rstrip("\n")
+            else:
+                logical = gate.EXTERNAL / directory.relative_to(gate.EXTERNAL.resolve())
+                text = text.replace(str(directory / "report.json"), str(logical / "report.json"))
+            path.write_text(text)
+            value["durability"]["log"].update(bytes=len(path.read_bytes()), sha256=gate.sha(path.read_bytes()))
+            self.save(directory, value)
+            if variant == "logical-path":
+                result = self.consume_prepared("browser", directory, value)
+                self.assertEqual(result["durable_completion"]["protocol"], "browser-durable-final-v1")
+            else:
+                with self.subTest(variant=variant), self.assertRaisesRegex(gate.EvidenceError, "candidate termination"):
+                    self.consume_prepared("browser", directory, value)
 
     def numerics(self, directory):
         raw = {"mesh": {"nodes_mm": [[0, 0], [1, 0], [0, 1]]},

@@ -133,8 +133,11 @@ audit coverage 仍 PARTIAL/NOT_TESTED 时为
   创建前快照中不存在的 final-report 操作。旧 manifest-only 协议明确拒绝。
   finalization-failure.json/report-revocation.json 或真实 failure 字段即拒绝。
 - browser：按主席交接的 `browser-durable-final-v1/FINAL_AFTER_DURABLE_LOG`，
-  durability.log.file=run.log，bytes/SHA 对实际非空日志，末行的
-  candidate_verdict/candidate_rc 同报告及真实进程；不要求不存在的 FINAL 文本。
+  durability.log.file=run.log，bytes/SHA 对实际非空日志；末行完整绑定
+  finished_at、BROWSER_CHECK、candidate_verdict/candidate_rc 与本 run 的
+  report=路径（获准逻辑/物理同 realpath），必须有行尾换行，不接受额外词。
+  `report.failure.json` 存在即拒绝，撤销或未知 report 时先读此侧档保留首因。
+  不要求不存在的 FINAL 文本。
   本席未见新版 browser 实际终态产物，只有消费夹具，新版真实组合归主席核验。
 
 报告、receipt、log、manifest 通过有界 no-follow/nonblock 描述符回读，
@@ -254,3 +257,9 @@ commit、最小 run 或文件夹具冒充本候选完整执行。
 55 PASS、0 failures/errors/skips；所有专项已终止，无遗留 RUNNING。
 新版 browser 真实产物仍未回读，整合后的同候选串行组合未运行，
 本席不声明发布认证或全部开发完成；未 push。
+最后 browser 消费修订补齐实际 `report.failure.json` 读取/否决和完整尾行绑定。
+2026-10-10T08:54:34Z 专项
+`workbench-tests-04d9c6db4f6d4834bab9d677955d61c2/summary.json`：
+56 PASS、0 failures/errors/skips；含错时间/工具/路径、多词/缺换行反例，
+合法获准路径别名正例，以及失败侧档首因/未知资产保护。无遗留 RUNNING；
+新版 browser 真实产物和最终候选全组合仍由主席验证。

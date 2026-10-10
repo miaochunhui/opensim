@@ -416,7 +416,7 @@ def producer_file(directory: Path, relative: str, name: str) -> tuple[bytes, dic
 
 
 def marker_paths(directory: Path, name: str) -> list[Path]:
-    patterns = {"browser": (), "audit": ("report.failure.json",),
+    patterns = {"browser": ("report.failure.json",), "audit": ("report.failure.json",),
                 "ui": ("finalization-failure.json", "report-revocation.json"),
                 "perf": ("report-failure-*.json",)}[name]
     return sorted({path for pattern in patterns for path in directory.glob(pattern)})
@@ -458,9 +458,10 @@ def validate_durable_producer(name: str, value: dict, rc: int, directory: Path) 
         need(type(saved_log.get("bytes")) is int and saved_log["bytes"] == log["bytes"] and
              saved_log.get("sha256") == log["sha256"], "browser durable log bytes/SHA differ", name)
         lines = log_data.decode("utf-8").splitlines()
-        need(bool(lines) and re.search(rf"(?:^|\s)candidate_verdict={re.escape(value['verdict'])}(?:\s|$)",
-                                      lines[-1]) is not None and
-             re.search(rf"(?:^|\s)candidate_rc={rc}(?:\s|$)", lines[-1]) is not None,
+        prefix = (f"{value['finished_at']} BROWSER_CHECK candidate_verdict={value['verdict']} "
+                  f"candidate_rc={rc} report=")
+        need(bool(lines) and log_data.endswith(b"\n") and lines[-1].startswith(prefix) and
+             same_evidence_path(lines[-1][len(prefix):], directory / "report.json"),
              "browser log lacks matching candidate termination", name)
         records, protocol = [report, log], "browser-durable-final-v1"
     elif name == "audit":
@@ -581,10 +582,9 @@ def load_producer_terminal(output: Path, name: str) -> tuple[dict, dict, list[di
     need(len(runs) == 1 and runs[0].is_dir() and not runs[0].is_symlink(),
          f"{name} expected exactly one owned run directory", name)
     directory, failures = runs[0], []
-    if name != "browser":
-        for path in marker_paths(directory, name):
-            data, record = producer_file(directory, path.name, name)
-            failures.append({"report": record, "value": decode(data)})
+    for path in marker_paths(directory, name):
+        data, record = producer_file(directory, path.name, name)
+        failures.append({"report": record, "value": decode(data)})
     # A failed finalization may revoke report.json or leave unknown bytes there.
     # Read the actual failure sidecar first rather than masking it as "no report".
     if failures:
