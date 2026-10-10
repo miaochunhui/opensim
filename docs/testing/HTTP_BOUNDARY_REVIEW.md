@@ -1,9 +1,11 @@
 # HTTP Boundary Review
 
 本件核当前独立候选HTTP拒收边界，不是生产、公网或攻击证明。
-旧红仅绑定2a86feb；新绿绑定当前完整源码清单与commit前后，
-server允许本次独占修复，solver及其余运行依赖仍与2a86feb同SHA。
-仅改独立树server.py、本测试和本报告，不复制/chmod/合主/改producer。
+旧红仅绑定2a86feb，不追认为后续候选证据。默认回归绑定当前完整
+Git inventory、commit/status、五源SHA及实际加载的server/solver/renderer
+模块路径；从依赖导入前到每请求及清理再次核一致。不再要求四源
+永远等于历史baseline。迭代修复仅修改独立树本测试和本文，不改server、
+test_server、主仓或producer；fixture副本与全部证据外置。
 测试复用test_server的私有127.0.0.1:0生命周期与workbench.execute/
 persist_result证据入口，原始socket只连接本席持有的随机端口。
 
@@ -15,8 +17,8 @@ null422不称成功FEM；合法CONFIG200另核实际速度/网格/残差/运行�
 不skip、不要求only --out，不导入HTTPTests类到本模块导致重复收集。
 
 ```bash
-sudo -n -u infra python3 -B /data/dev/opensim-resume-sync-chain-20261010/tests/test_http_boundary_review.py --out /hf3fs-jd/data/tmp/opensim-fluid-v1/resume-s6-core-precheck-20261010/green-v1
-sudo -n -u infra python3 -B /data/dev/opensim-resume-sync-chain-20261010/tests/test_http_boundary_review.py --out /hf3fs-jd/data/tmp/opensim-fluid-v1/resume-s6-core-precheck-20261010/server-regression-v1 --regression
+sudo -n -u infra python3 -B /data/dev/opensim-resume-http-current-20261010/tests/test_http_boundary_review.py --out /hf3fs-jd/data/tmp/opensim-fluid-v1/resume-s3-http-current-20261010/current-new-v1
+sudo -n -u infra python3 -B /data/dev/opensim-resume-http-current-20261010/tests/test_http_boundary_review.py --out /hf3fs-jd/data/tmp/opensim-fluid-v1/resume-s3-http-current-20261010/server-new-v1 --regression
 ```
 
 使用不存在的新输出目录，不覆盖旧失败。实际运行结论和真实launcher rc
@@ -24,6 +26,52 @@ sudo -n -u infra python3 -B /data/dev/opensim-resume-sync-chain-20261010/tests/t
 Content-Type重复拒收是无歧义媒体类型策略，不能把接受其中一个值
 直接称安全攻击；leading //也只核现有拒收分支，不声称重定向。
 资源累计deadline、并发跨用户隔离、代理链及生产行为没有运行验证。
+
+## 当前候选与历史证据分离
+
+默认candidate_mode为CURRENT_RUNTIME，dependency_baseline为null；报告另留
+historical_evidence_baseline=2a86feb和historical_evidence_recertified=false，
+不会无声换baseline或把旧红改绿。显式
+--historical-dependency-baseline 2a86febdf472ee1429395b8b073e408cf20dcc38
+保留原四源约束及server豁免，只用于明确的历史依赖复验。
+--regression运行原test_server子进程，不给它添加未知CLI；历史约束及完整
+inventory/实际父runtime在父进程启动前和结束后核验。不能把它描述为
+原test_server自身消费了历史pin或五源日志协议。
+
+--prepare-iteration-fixture --out NEW在外置克隆冻结97477ba，唯一runtime
+修改为solver尾部无行为注释并作真实Git提交。旧test从该候选实际执行
+--regression，首因旧pin、rc1、tests0；这是启动限制反证，不是HTTP红。
+--verify-iteration-fixture --fixture-root LEGACY_CANDIDATE --out NEW仅克隆
+该副本再替换本两件：真实HTTP5、原server14、普通discovery5及独立漂移1。
+准备/验证/漂移CLI互斥，不能叠加历史pin、selection或regression；非法组合
+在创建输出前argparse rc2。显式历史regression仍须真实拒绝solver注释候选。
+
+漂移仅在带指定尾部注释的自有外置Git副本进行，真实私有listener存活时
+追加solver字节，精确断言测试门首因Candidate/source changed since runtime
+import，实际服务健康请求503/SOURCE_CHANGED，留first-cause及原响应。
+finally先确认副本仍是本例修改的精确字节再恢复原字节，记录restored
+inventory相等并停止listener。若发现未知更改拒绝恢复，不覆盖他人资产。
+漂移前/晚变/恢复三个inventory分别保留；不把晚变阶段说成source稳定。
+没有mock候选来源、skip、expectedFailure或全producer/FEM矩阵。
+
+本轮已保留legacy-fixture-v1：2026-10-10T11:59:46..11:59:47Z，旧launcher
+rc1/tests0，首因Pinned dependency differs from old baseline: solver.py。
+该真实候选commit549bc63e1739b748c5b4277b0c9489852d7f5cc7，clean，
+前后完整inventory相同；仅solver注释SHA变动。新验证结果以新的外置
+summary/execution为准，下面历史修复记录不代表本轮新提交已验。
+
+本轮current-verification-v1于2026-10-10T12:04:14Z终态，真实外层session
+15641退出0；HTTP5/5、原server14/14、普通discover5/5、漂移1/1，
+全部子进程rc0、无失败/异常/跳过。六种非法组合实际rc2；显式历史
+regression实际rc1，仍拒solver注释，不执行原server测试。
+正向候选commit25e85cd642a16515f135d05c141323be285bafc8，clean，完整
+inventory前后相等；harness前后亦相等。漂移first-cause记录listener_alive
+为true，服务实际503/SOURCE_CHANGED；source-before与source-restored逐字节
+相等，终态thread_alive=false/socket_fileno=-1。晚变source-after保留且
+明确不同。历史红树未修改。test SHA为
+21fea3953b54709b10d4e144eb22036c3c2d9a97d39a10d678757f4ef98a2a77。
+本段仅追加本轮事实，运行时doc原SHA及清单保持原样，不追認新doc为
+当时字节。外置根resume-s3-http-current-20261010/current-verification-v1。
 
 ## 实际红证据
 
