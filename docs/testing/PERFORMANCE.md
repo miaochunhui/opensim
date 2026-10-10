@@ -315,3 +315,22 @@ critical/initial/Script/font=25515/64697/13007/0字节，原预算没有突破�
 未测INP、公网、actual root或人工/真实设备门；只读源码比较未发现
 release_gate.performance 对当前原生 PUBLIC_LAB 字段的确定误拒，
 这不是实测公网验收。新候选完整组合复验及Curie独立审核由主席收口。
+
+## Admission Fixture Regression
+
+2026-10-10 v3 全套 unittest 的两个子例先被输出目录门拒绝，未到达
+缺文件和越界输入分支。旧 v3 FAIL 与独立红例保留，不追认为通过。
+本次仅修改测试和本文，不改 producer、`validate_review_args`、预算或生产。
+
+夹具使用新 `review-integrated-v2-admission-*` 输出根，完整三输入正控制
+仅调用真实 admission validator，文件明确 `FILE_ADMISSION_ONLY_NOT_PRODUCER_NOT_RELEASE`。
+缺文件用本次专属不存在路径，越界用 `/etc/passwd` 路径但不读取内容；
+两项通过真实 CLI 严格比对完整后段错误、退出2、空stdout、未创建输出，
+并回读输入 bytes/inode 不变。另用真实 Python audit events 记录同一 validator
+的 subprocess/写文件/目录事件，正控制与两个负例都要求零事件；不 mock 判词。
+此正例不是 producer、公网 G5 或完整组合 PASS。
+
+局部红绿使用 unittest 点名方法并由 `script -e` 保留真实父退出码；
+完整离线模块仍用既有 CLI 的新 evidence root，保留全部调用日志、计数和
+测试/producer/文档 SHA 前后绑定，不加 `--real-browser` 或 `--preflight`。
+测试报告的文件持久化仍是既有协议，不冒称新的 fsync/崩溃原子认证。

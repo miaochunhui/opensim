@@ -7,6 +7,7 @@ All subprocess output and the counted unittest result are preserved externally.
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stderr
 import hashlib
 import io
 import json
@@ -647,11 +648,72 @@ class PerformanceTests(unittest.TestCase):
             self.assertEqual(read_exact(ORIGINAL_REPORT), before)
             write_json(self.evidence_run / "original-review.json", actual)
 
+    def admission_inputs(self):
+        original = self.evidence_run / ("admission-input-" + uuid4().hex) / "report.json"
+        original.parent.mkdir()
+        combination = TASK_EVIDENCE / ("workbench-integrated-admission-" + uuid4().hex)
+        combination.mkdir()
+        paths = (original, combination / "state-001.json", combination / "workbench.json")
+        for path in paths:
+            write_json(path, {"scope": "FILE_ADMISSION_ONLY_NOT_PRODUCER_NOT_RELEASE"})
+        output = EVIDENCE / ("review-integrated-v2-admission-" + uuid4().hex) / "argument-child"
+        return paths, output
+
+    def check_admission(self, paths, output, error=None):
+        """Observe real validator effects without mocking its verdict or filesystem."""
+        effects, active = [], [True]
+        mutations = {"subprocess.Popen", "os.system", "os.posix_spawn", "os.spawn",
+                     "os.fork", "os.mkdir", "os.remove", "os.rmdir", "os.rename",
+                     "os.link", "os.symlink", "os.chmod", "os.chown", "os.utime",
+                     "os.truncate"}
+
+        def observe(event, arguments):
+            if not active[0]:
+                return
+            if event in mutations or (event == "open" and
+                    arguments[2] & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC)):
+                effects.append(event)
+
+        sys.addaudithook(observe)
+        args = argparse.Namespace(original_report=paths[0], combination_state=paths[1],
+                                  combination_report=paths[2], tool=TOOL, evidence_root=output,
+                                  health_review_only=False, real_browser=False, preflight=False)
+        diagnostics = io.StringIO()
+        try:
+            with redirect_stderr(diagnostics):
+                if error is None:
+                    value = validate_review_args(argparse.ArgumentParser(), args)
+                    self.assertEqual(value, (TOOL.resolve(), output, paths))
+                else:
+                    with self.assertRaises(SystemExit) as raised:
+                        validate_review_args(argparse.ArgumentParser(), args)
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertEqual(diagnostics.getvalue().split("error: ")[-1].strip(), error)
+        finally:
+            active[0] = False
+        self.assertEqual(effects, [], "Admission executed a subprocess or mutated files")
+        self.assertFalse(output.parent.exists())
+        return {"effects": effects, "error": error, "output_created": output.parent.exists()}
+
+    def test_review_admission_complete_file_positive_control(self):
+        paths, output = self.admission_inputs()
+        before = [read_exact(path) for path in paths]
+        observed = self.check_admission(paths, output)
+        self.assertEqual([read_exact(path) for path in paths], before)
+        write_json(self.evidence_run / "admission-positive.json", {
+            "scope": "FILE_ADMISSION_ONLY_NOT_PRODUCER_NOT_RELEASE",
+            "inputs": [str(path) for path in paths], "output": str(output),
+            "observed": observed, "producer_execution": "NOT_EXECUTED"})
+
     def test_review_cli_rejects_partial_inputs_and_unsafe_paths(self):
         """Reject bad admission before creating any child evidence or executing a tool."""
-        original_args = ["--original-report", str(self.fixtures / "report.json")]
-        state_args = ["--combination-state", str(TASK_EVIDENCE / "workbench-integrated-v2/state-021.json")]
-        combination_args = ["--combination-report", str(TASK_EVIDENCE / "workbench-integrated-v2/workbench.json")]
+        paths, child_output = self.admission_inputs()
+        missing = paths[0].parent / "missing" / "report.json"
+        self.assertFalse(missing.exists())
+        original_args = ["--original-report", str(missing)]
+        state_args = ["--combination-state", str(paths[1])]
+        combination_args = ["--combination-report", str(paths[2])]
+        before_inputs = [read_exact(path) for path in paths]
         triples = [original_args, state_args, combination_args]
         cases = [([arg for index, pair in enumerate(triples) if mask & (1 << index) for arg in pair],
                   "Original review requires") for mask in range(1, 7)]
@@ -664,10 +726,13 @@ class PerformanceTests(unittest.TestCase):
         link = self.evidence_run / "symlink-output"
         link.symlink_to(self.fixtures, target_is_directory=True)
         cases += [(["--evidence-root", str(link / "child")], "symlink")]
-        cases += [(original_args + state_args + combination_args, "No such file")]
+        missing_error = f"[Errno 2] No such file or directory: {str(missing)!r}"
+        outside_error = f"Evidence path must be absolute and inside {TASK_EVIDENCE}: /etc/passwd"
+        cases += [(original_args + state_args + combination_args, missing_error)]
         outside = ["--original-report", "/etc/passwd"] + state_args + combination_args
-        cases += [(outside, "Evidence path")]
-        child_output = self.evidence_run / "argument-child"
+        cases += [(outside, outside_error)]
+        observed = [self.check_admission((missing, *paths[1:]), child_output, missing_error),
+                    self.check_admission((Path("/etc/passwd"), *paths[1:]), child_output, outside_error)]
         for index, (args, message) in enumerate(cases, 1):
             with self.subTest(args=args):
                 command = [sys.executable, "-B", str(Path(__file__).resolve()),
@@ -675,11 +740,20 @@ class PerformanceTests(unittest.TestCase):
                 result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn(message, result.stderr)
-                self.assertNotIn("PERFORMANCE_TESTS", result.stdout)
+                self.assertEqual(result.stdout, "")
+                if message in (missing_error, outside_error):
+                    self.assertEqual(result.stderr.split("error: ")[-1].strip(), message)
+                self.assertFalse(child_output.parent.exists())
                 self.assertFalse(child_output.exists())
+                self.assertFalse((link / "child").exists())
+                self.assertEqual([read_exact(path) for path in paths], before_inputs)
                 log = f"argument-{index:03d}.log"
                 (self.evidence_run / log).write_text(result.stdout + result.stderr, encoding="utf-8")
                 self.argument_invocations.append({"command": command, "exit_code": result.returncode, "log": log})
+        write_json(self.evidence_run / "admission-negatives.json", {
+            "scope": "FILE_ADMISSION_ONLY_NOT_PRODUCER_NOT_RELEASE", "observed": observed,
+            "inputs": [str(path) for path in paths], "output": str(child_output),
+            "producer_execution": "NOT_EXECUTED"})
 
     def test_targets_and_baseline_cannot_be_loosened(self):
         for args in [
@@ -886,16 +960,27 @@ def run_main():
                         help="Start/stop an owned new loopback server and verify actual product evidence")
     parser.add_argument("--health-review-only", action="store_true",
                         help="Only parse health inventory fixtures; never launch Chromium/server")
+    parser.add_argument("--admission-only", action="store_true",
+                        help="Only test file admission; never launch performance/browser/server")
     parser.add_argument("--tool", type=Path, default=TOOL)
     parser.add_argument("--evidence-root", type=Path, default=REVIEW_EVIDENCE)
     parser.add_argument("--original-report", type=Path)
     parser.add_argument("--combination-state", type=Path)
     parser.add_argument("--combination-report", type=Path)
     args = parser.parse_args()
+    if args.admission_only and (args.real_browser or args.preflight or args.health_review_only):
+        parser.error("Admission tests cannot launch browser, preflight or health parsing")
     TOOL, REVIEW_EVIDENCE, originals = validate_review_args(parser, args)
     ORIGINAL_REPORT, COMBINATION_STATE, COMBINATION_REPORT = originals
-    suite = (unittest.TestSuite([PerformanceTests("test_health_response_inventory")])
-             if args.health_review_only else unittest.defaultTestLoader.loadTestsFromTestCase(PerformanceTests))
+    source_paths = (Path(__file__).resolve(), TOOL, ROOT / "docs/testing/PERFORMANCE.md")
+    source_before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths}
+    if args.admission_only:
+        suite = unittest.TestSuite([PerformanceTests(name) for name in (
+            "test_review_admission_complete_file_positive_control",
+            "test_review_cli_rejects_partial_inputs_and_unsafe_paths")])
+    else:
+        suite = (unittest.TestSuite([PerformanceTests("test_health_response_inventory")])
+                 if args.health_review_only else unittest.defaultTestLoader.loadTestsFromTestCase(PerformanceTests))
     test_log = io.StringIO()
     result = unittest.TextTestRunner(verbosity=2, stream=test_log).run(suite)
     directory = PerformanceTests.evidence_run
@@ -907,6 +992,7 @@ def run_main():
               "real_browser": "NOT_RUN", "verdict": "PASS" if result.wasSuccessful() else "FAIL"}
     report.update(tool_path=str(TOOL), tool_sha256=hashlib.sha256(TOOL.read_bytes()).hexdigest(),
                   health_review_only=args.health_review_only, production_changes=0,
+                  admission_only=args.admission_only,
                   original_review="original-review.json" if ORIGINAL_REPORT else None)
     if args.real_browser and result.wasSuccessful():
         fixture_dir = directory / "real-browser-fixtures"
@@ -934,6 +1020,12 @@ def run_main():
                                      int("real_browser_exit_code" in report) +
                                      len(report.get("preflight", {}).get("browser_runs", [])))
     report["argument_invocations"] = len(PerformanceTests.argument_invocations)
+    source_after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths}
+    report.update(source_before=source_before, source_after=source_after,
+                  source_stable=source_before == source_after)
+    if source_before != source_after:
+        report["verdict"] = "FAIL"
+        report["source_failure"] = "Test, documentation or producer bytes changed during execution"
     report["collected_at"] = datetime.now(timezone.utc).isoformat()
     write_json(directory / "summary.json", report)
     print(f"PERFORMANCE_TESTS verdict={report['verdict']} tests={report['tests']} "
