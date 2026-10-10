@@ -7,7 +7,7 @@ No producer is mocked into a production PASS, and no dependencies are installed.
 from __future__ import annotations
 
 import copy
-import io
+import importlib.util
 import json
 import logging
 import os
@@ -21,6 +21,7 @@ import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+RELEASE_SOURCE = ROOT / "tools/release_gate.py"
 sys.path.insert(0, str(ROOT))
 from tools import workbench_acceptance as gate
 
@@ -104,18 +105,23 @@ class ChangedReportStore(gate.DurableStore):
 
 
 class WorkbenchTests(unittest.TestCase):
+    artifact_base = gate.EXTERNAL
+
     @classmethod
     def setUpClass(cls):
-        cls.out = gate.new_output(gate.EXTERNAL / ("workbench-files-" + uuid.uuid4().hex))
+        cls.out = gate.new_output(cls.artifact_base / ("workbench-files-" + uuid.uuid4().hex))
         cls.root = cls.out / "candidate"
         cls.root.mkdir()
-        for relative in (*gate.LOCAL_SOURCES, "tools/integration_acceptance.py",
+        for relative in (*gate.LOCAL_SOURCES, "tools/integration_acceptance.py", "tools/workbench_acceptance.py",
                          *(f"tools/{item[0]}" for item in gate.PRODUCERS.values())):
             path = cls.root / relative
             path.parent.mkdir(exist_ok=True)
-            path.write_text(f"# FILE_PARSER_FIXTURE_NOT_PRODUCT {relative}\n", encoding="ascii")
+            if relative == "tools/workbench_acceptance.py":
+                path.write_bytes((ROOT / relative).read_bytes())
+            else:
+                path.write_text(f"# FILE_PARSER_FIXTURE_NOT_PRODUCT {relative}\n", encoding="ascii")
         command(cls.root, "init", "-b", "codex/file-fixture")
-        command(cls.root, "add", "--", *gate.LOCAL_SOURCES, "tools/integration_acceptance.py",
+        command(cls.root, "add", "--", *gate.LOCAL_SOURCES, "tools/integration_acceptance.py", "tools/workbench_acceptance.py",
                 *(f"tools/{item[0]}" for item in gate.PRODUCERS.values()))
         command(cls.root, "-c", "user.name=OpenSim file fixture", "-c", "user.email=fixture@invalid",
                 "-c", "core.hooksPath=/dev/null", "commit", "-m", "File fixture, not production acceptance")
@@ -144,7 +150,7 @@ class WorkbenchTests(unittest.TestCase):
         self.fixture_records.append(record)
         return readback
 
-    def browser(self, directory):
+    def browser(self, directory, core=True):
         image = png()
         (directory / "fixture.png").write_bytes(image)
         sources = gate.source_map(self.candidate)
@@ -156,7 +162,7 @@ class WorkbenchTests(unittest.TestCase):
         log = (f"2026-10-10T00:01:00Z BROWSER_CHECK candidate_verdict=AUTOMATED_PASS "
                f"candidate_rc=0 report={directory / 'report.json'}\n").encode()
         (directory / "run.log").write_bytes(log)
-        return {
+        value = {
             "schema_version": 1, "tool": "opensim-browser-check",
             "verdict": "AUTOMATED_PASS", "exit_code": 0,
             "started_at": "2026-10-10T00:00:00Z", "finished_at": "2026-10-10T00:01:00Z",
@@ -164,13 +170,85 @@ class WorkbenchTests(unittest.TestCase):
             "commit": self.candidate["commit"],
             "tool_sha256": gate.sha((self.root / "tools/browser_check.mjs").read_bytes()),
             "target_url": self.url, "checks": [{"status": "PASS"}],
-            "matrix": [{"name": name, "status": "PASS"} for name in sorted(gate.VIEWPORTS)],
+            "matrix": [{"name": name, "status": "PASS", "width": dimensions[0],
+                        "height": dimensions[1], "touch": dimensions[2]}
+                       for name, dimensions in sorted(gate.VIEWPORT_MATRIX.items())],
             "result_count": 1, "page_build": {"build_text": gate.page_build(self.root)},
             "screenshots": [{"file": "fixture.png", "sha256": gate.sha(image), "bytes": len(image),
                              "width": 3, "height": 2}],
             "durability": {"protocol": "browser-durable-final-v1", "state": "FINAL_AFTER_DURABLE_LOG",
                            "log": {"file": "run.log", "bytes": len(log), "sha256": gate.sha(log)}},
         }
+        self.capture_fixture(directory, value)
+        if core:
+            (directory / "fixture.png").rename(directory / "preserved-single-image.bin")
+            (directory / "fixture-capture.json").rename(directory / "preserved-single-capture.bin")
+            value["screenshots"], value["captures"] = [], []
+            flows = {name: dimensions[:2] for name, dimensions in gate.VIEWPORT_MATRIX.items()}
+            flows.update({"keyboard-desktop": (1280, 800), "keyboard-mobile": (320, 568),
+                          "reduced-motion": (360, 800), "forced-colors": (360, 800),
+                          "text-200": (360, 800), "page-400": (320, 200)})
+            for name, (width, height) in flows.items():
+                if not name.startswith("keyboard-"):
+                    self.save(directory, {"viewport": {"width": width, "height": height}, "client_width": width - 15},
+                              name + "-layout.json")
+                for suffix, view in (("mesh", "mesh"), ("field", "field"), ("bad-input", "field")):
+                    self.capture_fixture(directory, value, name=name + "-" + suffix,
+                                         viewport={"width": width - 15, "height": height}, view=view, append=True,
+                                         dpr=4 if name == "page-400" else 1)
+                captures = {row["name"]: row for row in value["captures"]}
+                value["checks"].append({"status": "PASS", "coordinate": name,
+                                        "detail": {view: captures[name + "-" + view]["canvas"] for view in ("field", "mesh")}})
+            value["source_audit"], value["breakpoints"] = {"media_widths": []}, [576, 768, 1024, 1280]
+            for point in value["breakpoints"]:
+                for delta in (-1, 0, 1):
+                    name = f"breakpoint-{point + delta}"
+                    self.capture_fixture(directory, value, name=name,
+                                         viewport={"width": point + delta - 15, "height": 800}, append=True)
+                    self.save(directory, {"viewport": {"width": point + delta, "height": 800},
+                                          "client_width": point + delta - 15}, name + "-layout.json")
+                    canvas = value["captures"][-1]["canvas"]
+                    value["checks"].append({"status": "PASS", "rule": "WEB-RWD-002", "coordinate": name,
+                                            "detail": {"field": {"selected_view": "field", "canvas": canvas},
+                                                       "mesh": {"selected_view": "mesh", "canvas": {**canvas, "pixel_hash": "2"}}}})
+            self.capture_fixture(directory, value, name="rectangle",
+                                 viewport={"width": 1280, "height": 800}, append=True)
+        return value
+
+    def capture_fixture(self, directory, value, segmented=False, name="fixture", viewport=None,
+                        view="field", append=False, dpr=1):
+        clips = [{"x": 0, "y": 0, "width": 3, "height": 2, "scale": 1}]
+        if segmented:
+            clips.append({**clips[0], "y": 2})
+        pictures = []
+        for index, clip in enumerate(clips):
+            filename = name + ".png" if not segmented else f"{name}-tile-{index + 1:03d}.png"
+            image = png(3 * dpr, 2 * dpr)
+            (directory / filename).write_bytes(image)
+            canvas = {"width": 3, "height": 4, "nontransparent": 11, "distinct_colors": 3,
+                      "pixel_hash": "1" if view == "field" else "2"}
+            pictures.append({"file": filename, "capture": name, "coordinate": "FILE_FIXTURE",
+                             "selected_view": view, "canvas": canvas, "clip": clip,
+                             "width": 3 * dpr, "height": 2 * dpr, "sha256": gate.sha(image), "bytes": len(image)})
+        if segmented and (directory / "fixture.png").exists():
+            (directory / "fixture.png").rename(directory / "preserved-single-image.bin")
+        height = len(clips) * 2
+        coverage = {"status": "PASS", "source_css_pixels": 3 * height, "tiles": len(clips),
+                    "scaled": False, "gaps": 0, "overlaps": 0}
+        manifest = {"name": name, "coordinate": "FILE_FIXTURE", "selected_view": view,
+                    "canvas": canvas, "content": {"x": 0, "y": 0, "width": 3, "height": height},
+                    "width": 3, "height": height, "dpr": dpr,
+                    "viewport": viewport or {"width": 3, "height": 2}, "tiles": clips,
+                    "artifacts": pictures, "coverage": coverage}
+        self.save(directory, manifest, name + "-capture.json")
+        capture = {"name": name, "manifest": name + "-capture.json", "width": 3,
+                   "height": height, "dpr": dpr, "selected_view": view, "canvas": canvas, **coverage}
+        if append:
+            value["screenshots"].extend(pictures)
+            value["captures"].append(capture)
+        else:
+            value["screenshots"] = pictures + [row for row in value.get("screenshots", []) if row.get("capture") not in (None, name)]
+            value["captures"] = [capture] + [row for row in value.get("captures", []) if row["name"] != name]
 
     def validate(self, value, directory, rc=0, name="browser"):
         if name != "browser":
@@ -250,7 +328,7 @@ class WorkbenchTests(unittest.TestCase):
     def test_valid_real_file_parser_fixture_is_not_product_claim(self):
         directory = self.directory()
         result = self.validate(self.browser(directory), directory)
-        self.assertEqual((result["checks"], result["solves"], len(result["pngs"])), (1, 1, 1))
+        self.assertEqual((result["checks"], result["solves"], len(result["pngs"])), (27, 1, 55))
         self.assertEqual(result["commit"], self.candidate["commit"])
         self.assertEqual(gate.inventory(self.root), self.candidate)
 
@@ -360,7 +438,7 @@ class WorkbenchTests(unittest.TestCase):
         for variant in ("hash", "dimensions", "crc", "truncated", "fake-header"):
             directory = self.directory()
             value = self.browser(directory)
-            image = directory / "fixture.png"
+            image = directory / value["screenshots"][0]["file"]
             if variant == "hash":
                 value["screenshots"][0]["sha256"] = "0" * 64
             elif variant == "dimensions":
@@ -386,7 +464,7 @@ class WorkbenchTests(unittest.TestCase):
             gate.png_record({"file": path.name, "sha256": gate.sha(raw), "width": 3, "height": 2}, directory)
 
     def test_missing_png_or_missing_solve_rejected(self):
-        for missing in ("fixture.png", "solve-001.json"):
+        for missing in ("mobile-narrow-mesh.png", "solve-001.json"):
             directory = self.directory()
             value = self.browser(directory)
             # Rename owned fixture rather than remove evidence.
@@ -529,7 +607,9 @@ class WorkbenchTests(unittest.TestCase):
         log = (directory / "workbench.log").read_bytes()
         self.assertTrue(log.startswith(b"PROVISIONAL_LOG_NOT_TERMINAL\n"))
         self.assertEqual(final["durability"]["log"]["sha256"], gate.sha(log))
-        self.assertEqual(gate.read_final(directory), final)
+        # Persistence alone is not a complete four-producer automation run.
+        with self.assertRaisesRegex(gate.EvidenceError, "terminal scope"):
+            gate.read_final(directory)
 
     def test_real_log_creation_failure_never_leaves_terminal_pass(self):
         directory = self.directory()
@@ -617,7 +697,8 @@ class WorkbenchTests(unittest.TestCase):
                 gate.read_final(directory)
 
     def audit(self, directory):
-        browser = self.browser(directory)
+        browser = self.browser(directory, core=False)
+        (directory / "fixture.png").rename(directory / "preserved-browser-fixture.bin")
         sources = gate.source_map(self.candidate)
         ident = {"verdict": "PASS", "url": self.url, "fixture_asset_override": False,
                  "local_source_sha256": sources, "committed_source_sha256": sources,
@@ -631,7 +712,8 @@ class WorkbenchTests(unittest.TestCase):
         for width, height in ((320, 568), (768, 1024), (1064, 768), (1440, 900)):
             image = png(width, height)
             for state in ("loading-empty", "ready", "error", "empty", "long",
-                          "error-recovery", "empty-recovery", "long-recovery"):
+                          "error-recovery", "empty-recovery", "long-recovery",
+                          "mesh-selected", "field-unselected", "details-open-0"):
                 phase = f"{width}-{state}"
                 for label in (phase, phase + "-tile-000"):
                     filename = label + ".png"
@@ -693,7 +775,7 @@ class WorkbenchTests(unittest.TestCase):
                 self.validate(value, directory, name="audit")
 
     def perf(self, directory):
-        browser = self.browser(directory)
+        browser = self.browser(directory, core=False)
         image = png(360, 800)
         (directory / "result.png").write_bytes(image)
         sources = gate.source_map(self.candidate)
@@ -722,12 +804,16 @@ class WorkbenchTests(unittest.TestCase):
                 self.validate(altered, directory, name="perf")
 
     def ui(self, directory):
-        value = self.browser(directory)
+        value = self.browser(directory, core=False)
         del value["commit"]
         value.update(tool="opensim-ui-contract", mode="REAL_DOM_CDP_CONTRACT", verdict="PASS",
                      tool_sha256=gate.sha((self.root / "tools/ui_contract_test.mjs").read_bytes()),
                      sources=gate.source_map(self.candidate), actual_solver_calls=1,
-                     checks=[{"verdict": "PASS"}], browser_failures=[], downloads=[])
+                     checks=[{"verdict": "PASS"}], browser_failures=[],
+                     downloads=[{"guid": "fixture-export", "state": "completed"}])
+        (directory / "downloads").mkdir()
+        self.save(directory / "downloads", json.loads((directory / "solve-001.json").read_bytes())["result"],
+                  "fixture-export")
         return value
 
     def test_ui_missing_commit_is_explicit_inventory_binding_not_fabrication(self):
@@ -921,10 +1007,10 @@ class WorkbenchTests(unittest.TestCase):
     def test_ui_actual_downloads_manifest_sources_and_inventory(self):
         directory = self.directory()
         value = self.ui(directory)
-        (directory / "downloads").mkdir()
+        self.assertTrue((directory / "downloads").is_dir())
         result = json.loads((directory / "solve-001.json").read_bytes())["result"]
         self.save(directory / "downloads", result, "actual-guid")
-        value["downloads"] = [{"guid": "actual-guid", "state": "completed"}]
+        value["downloads"].append({"guid": "actual-guid", "state": "completed"})
         self.validate(value, directory, name="ui")
         (directory / "downloads" / "unlisted-file").write_bytes(b"unlisted actual download\n")
         with self.assertRaisesRegex(gate.EvidenceError, "download inventory"):
@@ -1174,31 +1260,427 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(gate.inventory(ROOT), candidate)
 
 
+    def test_resume_browser_segmented_manifest_mutations_rejected(self):
+        for variant in ("missing-manifest", "missing-captures", "missing-tile", "extra-tile",
+                        "dimensions", "gap", "overlap", "orphan", "view", "canvas", "dpr"):
+            with self.subTest(variant=variant):
+                directory = self.directory()
+                value = self.browser(directory, core=False)
+                self.capture_fixture(directory, value, segmented=True)
+                self.save(directory, value)
+                gate.validate_browser_captures(value, directory)
+                path = directory / "fixture-capture.json"
+                manifest = json.loads(path.read_bytes())
+                if variant == "missing-manifest":
+                    path.rename(directory / "preserved-capture.json")
+                elif variant == "missing-captures":
+                    del value["captures"]
+                elif variant == "orphan":
+                    (directory / "unlisted.png").write_bytes(png())
+                else:
+                    if variant == "missing-tile":
+                        manifest["artifacts"].pop()
+                    elif variant == "extra-tile":
+                        manifest["artifacts"].append(manifest["artifacts"][0])
+                    elif variant == "dimensions":
+                        manifest["artifacts"][0]["width"] = 1
+                    elif variant in ("gap", "overlap"):
+                        manifest["tiles"][1]["y"] = 3 if variant == "gap" else 1
+                        manifest["artifacts"][1]["clip"] = manifest["tiles"][1]
+                        value["screenshots"][1]["clip"] = manifest["tiles"][1]
+                    elif variant == "view":
+                        manifest["selected_view"] = "mesh"
+                    elif variant == "canvas":
+                        manifest["artifacts"][0]["canvas"] = {"pixel_hash": "stale"}
+                    else:
+                        manifest["dpr"] = 2
+                    self.save(directory, manifest, path.name)
+                self.save(directory, value)
+                with self.assertRaises(gate.EvidenceError):
+                    gate.validate_browser_captures(value, directory)
+
+    def test_resume_audit_orphan_tile_and_extra_segment_rejected(self):
+        for variant in ("orphan", "extra-segment", "wrong-name"):
+            with self.subTest(variant=variant):
+                directory, value = self.prepared("audit")
+                picture = copy.deepcopy(value["screenshots"][1])
+                picture.update(file="320-loading-empty-tile-999.png", state="320-loading-empty-tile-999")
+                (directory / picture["file"]).write_bytes((directory / value["screenshots"][1]["file"]).read_bytes())
+                value["screenshots"].append(picture)
+                value["coverage_counts"]["screenshots"] += 1
+                if variant != "orphan":
+                    coverage = json.loads((directory / "320-loading-empty.coverage.json").read_bytes())
+                    if variant == "extra-segment":
+                        coverage["tiles"].append({"file": picture["file"], "document_y": 0,
+                                                  "viewport": {"width": 320, "height": 568}})
+                    else:
+                        coverage["tiles"][0]["file"] = picture["file"]
+                    self.save(directory, coverage, "320-loading-empty.coverage.json")
+                self.seal_producer_fixture("audit", value, directory)
+                self.save(directory, value)
+                with self.assertRaises(gate.EvidenceError):
+                    self.consume_prepared("audit", directory, value)
+
+    def test_resume_ui_empty_download_set_rejected_even_when_resealed(self):
+        directory, value = self.prepared("ui")
+        (directory / "downloads").rename(directory / "preserved-downloads")
+        value["downloads"] = []
+        self.seal_producer_fixture("ui", value, directory)
+        self.save(directory, value)
+        with self.assertRaisesRegex(gate.EvidenceError, "download inventory"):
+            self.consume_prepared("ui", directory, value)
+
+    def test_resume_terminal_success_without_closed_inventory_rejected(self):
+        directory = self.directory()
+        gate.persist_result(directory, self.terminal_fixture())
+        with self.assertRaises(gate.EvidenceError):
+            gate.read_final(directory)
+
+    def extra_audit_capture(self, directory, value):
+        phase, width, height = "320-details-open-1", 320, 568
+        for label in (phase, phase + "-tile-000"):
+            image = png(width, height)
+            (directory / (label + ".png")).write_bytes(image)
+            value["screenshots"].append({"file": label + ".png", "state": label, "url": self.url,
+                                          "width": width, "height": height, "sha256": gate.sha(image)})
+        self.save(directory, {"status": "PASS", "scale": 1, "horizontal_coverage": "COMPLETE",
+                              "document": {"width": width, "height": height}, "vertical_coverage": height,
+                              "tiles": [{"file": phase + "-tile-000.png", "document_y": 0,
+                                         "viewport": {"width": width, "height": height}}]}, phase + ".coverage.json")
+        value["coverage_counts"]["screenshots"] = len(value["screenshots"])
+
+    def test_resume_audit_extra_whole_capture_is_consumed_and_missing_coverage_rejected(self):
+        for variant in ("missing", "gap", "orphan-whole", "dimensions"):
+            with self.subTest(variant=variant):
+                directory, value = self.prepared("audit")
+                self.extra_audit_capture(directory, value)
+                self.seal_producer_fixture("audit", value, directory)
+                self.save(directory, value)
+                result = self.consume_prepared("audit", directory, value)
+                self.assertEqual(len(result["pngs"]), 90)
+                path = directory / "320-details-open-1.coverage.json"
+                if variant == "missing":
+                    path.rename(directory / "preserved-extra-coverage.json")
+                elif variant == "orphan-whole":
+                    (directory / "unlisted-whole.png").write_bytes(png())
+                elif variant == "dimensions":
+                    value["screenshots"][-2]["width"] = 1
+                else:
+                    coverage = json.loads(path.read_bytes())
+                    coverage["tiles"][0]["document_y"] = 1
+                    self.save(directory, coverage, path.name)
+                self.seal_producer_fixture("audit", value, directory)
+                self.save(directory, value)
+                with self.assertRaises(gate.EvidenceError):
+                    self.consume_prepared("audit", directory, value)
+
+    def test_resume_browser_single_png_missing_core_and_matrix_geometry_rejected(self):
+        for variant in ("single", "matrix", "touch", "core-view", "core-canvas", "viewport"):
+            with self.subTest(variant=variant):
+                directory = self.directory()
+                value = self.browser(directory, core=variant != "single")
+                if variant == "matrix":
+                    value["matrix"][0]["width"] = 3
+                elif variant == "touch":
+                    value["matrix"][0]["touch"] = not value["matrix"][0]["touch"]
+                elif variant in ("core-view", "core-canvas", "viewport"):
+                    row = value["captures"][0]
+                    path = directory / row["manifest"]
+                    manifest = json.loads(path.read_bytes())
+                    if variant == "core-view":
+                        row["selected_view"] = manifest["selected_view"] = "field"
+                        for artifact in manifest["artifacts"]:
+                            artifact["selected_view"] = "field"
+                        value["screenshots"][0]["selected_view"] = "field"
+                    elif variant == "core-canvas":
+                        row["canvas"] = manifest["canvas"] = None
+                        manifest["artifacts"][0]["canvas"] = value["screenshots"][0]["canvas"] = None
+                    else:
+                        manifest["viewport"]["width"] = 3
+                    self.save(directory, manifest, path.name)
+                self.save(directory, value)
+                with self.assertRaises(gate.EvidenceError):
+                    self.consume_prepared("browser", directory, value)
+
+    def complete_fixture(self, directory):
+        """File protocol fixture; git subprocesses are not product producers."""
+        report = {"schema_version": 1, "tool": "opensim-workbench-acceptance",
+                  "scope": "LOCAL_AUTOMATION_NOT_RELEASE", "release_verdict": "NOT_CERTIFIED",
+                  "before": self.candidate, "after": self.candidate, "producers": {}, "remaining": [],
+                  "owned_server": {"url": self.url, "stopped": True}, "steps": [], "counts": {},
+                  "finished_at": gate.now(), "verdict": gate.PARTIAL, "exit_code": 3}
+        for name in [*(f"local-{index}" for index in range(1, 6)), "browser", "audit", "perf", "perf-readback", "ui"]:
+            report["steps"].append(gate.execute(["git", "--version"], self.root, directory, name))
+        for name in gate.PRODUCERS:
+            child_dir = directory / name
+            child_dir.mkdir()
+            value = getattr(self, name)(child_dir)
+            validation = self.validate(value, child_dir, name=name)
+            entry = {"report": gate.file_record(child_dir / "report.json", directory),
+                     "terminal": {"rc": 0, "exit_code": 0, "verdict": value["verdict"]}, "validation": validation}
+            report["producers"][name] = entry
+            report["remaining"].extend({"producer": name, **row} for row in validation["remaining"])
+            if name == "perf":
+                parsed_dir = child_dir / "readback"
+                parsed_dir.mkdir()
+                parsed = {**value, "scope": "OFFLINE_PARSE_NOT_G5", "verdict": "OFFLINE_PARSE_PASS",
+                          "parsed_source": entry["report"]}
+                self.seal_producer_fixture("perf", parsed, parsed_dir)
+                self.save(parsed_dir, parsed)
+                entry["raw_metric_readback"] = gate.file_record(parsed_dir / "report.json", directory)
+                entry["readback_durable_completion"] = gate.validate_perf_readback(
+                    parsed, 0, parsed_dir, entry["report"], value["tool_sha256"])
+        for key, value in (("producers_validated", 4),
+                           ("checks", sum(row["validation"]["checks"] for row in report["producers"].values())),
+                           ("solves", sum(row["validation"]["solves"] for row in report["producers"].values())),
+                           ("pngs", sum(len(row["validation"]["pngs"]) for row in report["producers"].values()))):
+            report["counts"][key] = value
+        health = {"status": "ok", "source_sha256": gate.source_map(self.candidate),
+                  "page_build": gate.page_build(self.root)}
+        for stage in ("before", "after"):
+            records = {}
+            for endpoint in ("api/health", "", "web/app.js", "web/app.css"):
+                path = directory / f"server-{stage}-{endpoint.replace(chr(47), chr(45)) or chr(112)}.bin"
+                path.write_bytes(gate.json_bytes(health) if endpoint == "api/health" else
+                                 (self.root / endpoint).read_bytes() if endpoint else b"FILE_SERVER_FIXTURE")
+                records[endpoint] = gate.file_record(path, directory)
+            report["server_" + stage] = {"health": health, "artifacts": records}
+        report["first_cause"] = {"coordinate": "coverage", "message": "Producer coverage remains PARTIAL/NOT_TESTED",
+                                 "detail": report["remaining"][0]}
+        return report
+
+    def test_resume_complete_terminal_rejects_inventory_rc_log_and_preserves_partial(self):
+        directory = self.directory()
+        report = self.complete_fixture(directory)
+        gate.validate_complete_run(report)
+        gate.persist_result(directory, report)
+        self.assertEqual(gate.read_final(directory)["exit_code"], 3)
+        for variant in ("producer", "receipt", "rc", "step", "server-after", "download", "parse", "counts", "promote"):
+            value = copy.deepcopy(report)
+            if variant == "producer":
+                del value["producers"]["ui"]
+            elif variant == "receipt":
+                value["producers"]["audit"]["validation"]["durable_completion"]["artifacts"] = []
+            elif variant == "rc":
+                value["producers"]["browser"]["terminal"]["exit_code"] = 1
+            elif variant == "step":
+                value["steps"].pop()
+            elif variant == "server-after":
+                del value["server_after"]["artifacts"]["web/app.js"]
+            elif variant == "download":
+                value["producers"]["ui"]["validation"]["downloads"] = 0
+            elif variant == "parse":
+                del value["producers"]["perf"]["raw_metric_readback"]
+            elif variant == "counts":
+                value["counts"]["pngs"] = 1
+            else:
+                value.update(verdict=gate.PASS, exit_code=0)
+            with self.subTest(variant=variant), self.assertRaises(gate.EvidenceError):
+                gate.validate_complete_run(value)
+        with (directory / "logs/browser.stdout.log").open("ab") as stream:
+            stream.write(b"actual late log drift\n")
+        with self.assertRaisesRegex(gate.EvidenceError, "subprocess log"):
+            gate.read_final(directory)
+
+    def test_resume_synchronized_canvas_change_and_fixed_plan_omission_rejected(self):
+        for variant in ("stale-hash", "drawing-check", "keyboard", "breakpoint", "rectangle"):
+            with self.subTest(variant=variant):
+                directory = self.directory()
+                value = self.browser(directory)
+                if variant in ("keyboard", "breakpoint", "rectangle"):
+                    selected = {"keyboard": "keyboard-mobile-mesh", "breakpoint": "breakpoint-575",
+                                "rectangle": "rectangle"}[variant]
+                    row = next(row for row in value["captures"] if row["name"] == selected)
+                    manifest = json.loads((directory / row["manifest"]).read_bytes())
+                    for artifact in manifest["artifacts"]:
+                        (directory / artifact["file"]).rename(directory / ("preserved-" + artifact["file"] + ".bin"))
+                    (directory / row["manifest"]).rename(directory / ("preserved-" + row["manifest"] + ".bin"))
+                    value["captures"] = [row for row in value["captures"] if row["name"] != selected]
+                    value["screenshots"] = [row for row in value["screenshots"] if row["capture"] != selected]
+                else:
+                    selected = "mobile-narrow-mesh"
+                    row = next(row for row in value["captures"] if row["name"] == selected)
+                    manifest = json.loads((directory / row["manifest"]).read_bytes())
+                    canvas = {**row["canvas"], "pixel_hash": "1" if variant == "stale-hash" else "3"}
+                    row["canvas"] = manifest["canvas"] = canvas
+                    for artifact in manifest["artifacts"]:
+                        artifact["canvas"] = canvas
+                    next(row for row in value["screenshots"] if row["capture"] == selected)["canvas"] = canvas
+                    self.save(directory, manifest, row["manifest"])
+                self.save(directory, value)
+                with self.assertRaises(gate.EvidenceError):
+                    self.consume_prepared("browser", directory, value)
+
+    def test_resume_pinned_release_gate_consumes_same_pure_audit_reader(self):
+        source = RELEASE_SOURCE
+        frozen = source.read_bytes()
+        spec = importlib.util.spec_from_file_location("resume_pinned_gate", source)
+        release = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(release)
+        directory, value = self.prepared("audit")
+        self.extra_audit_capture(directory, value)
+        expected = {"source_sha256": gate.source_map(self.candidate),
+                    "tool_sha256": {"tools/workbench_acceptance.py": gate.sha((ROOT / "tools/workbench_acceptance.py").read_bytes())}}
+        result = release.audit_dependencies(value, directory / "report.json", expected, self.root)
+        self.assertEqual((result["successful_posts"], result["coverage_artifacts"], result["pngs"]), (1, 45, 90))
+        path = directory / "320-details-open-1.coverage.json"
+        path.rename(directory / "preserved-extra-coverage.json")
+        with self.assertRaises(release.GateError):
+            release.audit_dependencies(value, directory / "report.json", expected, self.root)
+        self.assertEqual(source.read_bytes(), frozen)
+        self.fixture_records.append({"scope": "READONLY_CURRENT_RELEASE_GATE_NOT_AUTHORIZATION",
+                                     "path": str(source), "sha256": gate.sha(frozen),
+                                     "source_stable": True, "validated_artifacts": result})
+
+    def test_resume_audit_required_view_and_details_group_cannot_be_omitted(self):
+        for suffix in ("mesh-selected", "field-unselected", "details-open-0"):
+            directory, value = self.prepared("audit")
+            phase = "320-" + suffix
+            value["screenshots"] = [row for row in value["screenshots"] if not row["state"].startswith(phase)]
+            for path in (directory / (phase + ".png"), directory / (phase + "-tile-000.png"),
+                         directory / (phase + ".coverage.json")):
+                path.rename(directory / ("preserved-" + path.name + ".bin"))
+            value["coverage_counts"]["screenshots"] = len(value["screenshots"])
+            self.seal_producer_fixture("audit", value, directory)
+            self.save(directory, value)
+            with self.subTest(suffix=suffix), self.assertRaisesRegex(gate.EvidenceError, "required viewport/state"):
+                self.consume_prepared("audit", directory, value)
+
+    def test_resume_client_viewport_binding_and_cleared_bad_input_canvas(self):
+        directory = self.directory()
+        value = self.browser(directory)
+        # No FEM result remains after terminal input rejection; not a ready canvas.
+        capture = next(row for row in value["captures"] if row["name"] == "mobile-narrow-bad-input")
+        canvas = {**capture["canvas"], "nontransparent": 0, "distinct_colors": 1}
+        capture["canvas"] = canvas
+        manifest = json.loads((directory / capture["manifest"]).read_bytes())
+        manifest["canvas"] = manifest["artifacts"][0]["canvas"] = canvas
+        next(row for row in value["screenshots"] if row["capture"] == capture["name"])["canvas"] = canvas
+        self.save(directory, manifest, capture["manifest"])
+        result = self.validate(value, directory)
+        self.assertEqual(len(result["pngs"]), 55)
+        # A real layout records innerWidth=320 and clientWidth=305 independently.
+        path = directory / "mobile-narrow-layout.json"
+        original = json.loads(path.read_bytes())
+        self.assertEqual((original["viewport"]["width"], original["client_width"]), (320, 305))
+        for key in ("viewport", "client_width"):
+            altered = copy.deepcopy(original)
+            if key == "viewport":
+                altered[key]["width"] = 305
+            else:
+                altered[key] = 320
+            self.save(directory, altered, path.name)
+            with self.subTest(key=key), self.assertRaisesRegex(gate.EvidenceError, "viewport"):
+                self.consume_prepared("browser", directory, value)
+            self.save(directory, original, path.name)
+
+
+class ProgressResult(unittest.TextTestResult):
+    def startTest(self, test):
+        super().startTest(test)
+        self.stream.write(f"PROGRESS collected_at={gate.now()} test={test.id()} state=RUNNING\n")
+        self.stream.flush()
+
+    def stopTest(self, test):
+        super().stopTest(test)
+        self.stream.write(f"PROGRESS collected_at={gate.now()} tests={self.testsRun} "
+                          f"failures={len(self.failures)} errors={len(self.errors)}\n")
+        self.stream.flush()
+
+
 def main():
+    global RELEASE_SOURCE
     parser = gate.argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--regression", action="store_true")
     parser.add_argument("--cli-smoke", choices=("dirty", "missing"))
     parser.add_argument("--producer-readback", nargs=2, metavar=("PRODUCER", "REPORT"))
     parser.add_argument("--producer-rc", type=int, default=0)
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--focused", action="store_true")
+    parser.add_argument("--release-source", type=Path, default=RELEASE_SOURCE)
+    parser.add_argument("--suite-child", action="store_true", help=gate.argparse.SUPPRESS)
     args = parser.parse_args()
-    output = gate.new_output(gate.EXTERNAL / ("workbench-tests-" + uuid.uuid4().hex))
+    RELEASE_SOURCE = args.release_source
+    if args.suite_child:
+        WorkbenchTests.artifact_base = args.out
+        suite = unittest.TestSuite()
+        suite.addTests(WorkbenchTests(name) for name in unittest.defaultTestLoader.getTestCaseNames(WorkbenchTests)
+                       if name.startswith("test_resume_"))
+        if not args.focused:
+            suite.addTests(WorkbenchTests(name) for name in unittest.defaultTestLoader.getTestCaseNames(WorkbenchTests)
+                           if not name.startswith("test_resume_"))
+        with (args.out / "progress.log").open("x", encoding="utf-8", buffering=1) as stream:
+            result = unittest.TextTestRunner(stream=stream, verbosity=2, resultclass=ProgressResult).run(suite)
+        summary = {"tests": result.testsRun, "failures": len(result.failures), "errors": len(result.errors),
+                   "skipped": len(result.skipped), "fixture_roots": [str(WorkbenchTests.out)],
+                   "verdict": "PASS" if result.wasSuccessful() and result.testsRun > 0 else "FAIL",
+                   "first_cause": (result.failures + result.errors)[0][1] if result.failures or result.errors else None,
+                   "collected_at": gate.now()}
+        gate.write_json(args.out / "unit-result.json", summary)
+        print("WORKBENCH_UNIT verdict={verdict} tests={tests}".format(**summary))
+        return 0 if summary["verdict"] == "PASS" else 1
+    output = gate.new_output(args.out or gate.EXTERNAL / ("workbench-tests-" + uuid.uuid4().hex))
+    if not (args.producer_readback or args.regression or args.cli_smoke):
+        before = gate.inventory(ROOT)
+        gate.write_json(output / "run-start.json", {"state": "RUNNING", "source_before": before,
+                        "collected_at": gate.now(), "focused": args.focused})
+        argv = [sys.executable, "-B", str(Path(__file__).resolve()), "--suite-child", "--out", str(output),
+                "--release-source", str(RELEASE_SOURCE)]
+        if args.focused:
+            argv.append("--focused")
+        step = gate.execute(argv, ROOT, output, "unittest")
+        result, _ = gate.read_report(output / "unit-result.json", output)
+        after = gate.inventory(ROOT)
+        summary = {"scope": "FILE_AND_HTTP_SELFTEST_NOT_FULL_WORKBENCH_OR_RELEASE", **result,
+                   "step": step, "launcher_rc": step["rc"], "source_before": before,
+                   "source_after": after, "source_stable": before == after,
+                   "verdict": "PASS" if result["verdict"] == "PASS" and step["rc"] == 0 and before == after else "FAIL",
+                   "collected_at": gate.now(), "log": gate.file_record(output / "progress.log", output)}
+        gate.write_json(output / "summary.json", summary)
+        print("WORKBENCH_SELFTEST verdict={verdict} tests={tests} failures={failures} errors={errors} "
+              "child_rc={launcher_rc} source_stable={source_stable} report=".format(**summary) +
+              str(output / "summary.json"))
+        if summary["first_cause"]:
+            print("FIRST_CAUSE " + summary["first_cause"])
+        return 0 if summary["verdict"] == "PASS" else 1
     if args.producer_readback:
+        before = gate.inventory(ROOT)
+        gate.write_json(output / "run-start.json", {"state": "RUNNING", "source_before": before,
+                                                   "collected_at": gate.now()})
         name, filename = args.producer_readback
+        result = {}
         try:
             gate.need(name in ("browser", "audit", "perf", "ui"), "Unknown protocol readback producer")
             path = gate.bounded(Path(filename))
             value, original = gate.read_report(path, gate.EXTERNAL)
             result = gate.validate_durable_producer(name, value, args.producer_rc, path.parent)
+            if name in ("browser", "audit"):
+                result["observed_pngs"] = [gate.png_record(row, path.parent) for row in value["screenshots"]]
+                result["png_count"] = len(result["observed_pngs"])
+            if name == "browser":
+                result["observed_segment_manifests"] = gate.validate_browser_captures(value, path.parent)
+                result["capture_count"] = len(result["observed_segment_manifests"])
+                result["observed_captures"] = gate.validate_browser_core(value, path.parent, ROOT)
             if name == "audit":
                 result["observed_post_files"] = gate.validate_audit_payload(
                     value, path.parent, value["source_sha256"], value["url"])
                 result["observed_state_coverages"] = gate.validate_audit_coverage(value, path.parent, value["url"])
+                result["post_count"] = len(result["observed_post_files"])
+                result["coverage_count"] = len(result["observed_state_coverages"])
             summary = {"verdict": "PASS", "scope": "EXISTING_PRODUCER_PROTOCOL_READBACK_NOT_PRODUCT",
                        "producer": name, "observed_cli_rc": args.producer_rc, "original": original,
                        "validation": result, "collected_at": gate.now()}
         except Exception as exc:
             summary = {"verdict": "FAIL", "scope": "EXISTING_PRODUCER_PROTOCOL_READBACK_NOT_PRODUCT",
-                       "producer": name, "first_cause": str(exc), "collected_at": gate.now()}
+                       "producer": name, "first_cause": str(exc), "validation_before_failure": result,
+                       "observed_cli_rc": args.producer_rc, "collected_at": gate.now()}
+        after = gate.inventory(ROOT)
+        summary.update(source_before=before, source_after=after, source_stable=before == after)
+        if before != after:
+            summary.update(verdict="FAIL", first_cause="Source changed during native readback")
+        with (output / "readback.log").open("x", encoding="utf-8") as log:
+            log.write("NATIVE_READBACK " + json.dumps({key: item for key, item in summary.items()
+                      if key not in ("source_before", "source_after", "validation", "validation_before_failure")}) + "\n")
         gate.write_json(output / "summary.json", summary)
         print(f"WORKBENCH_PROTOCOL_READBACK verdict={summary['verdict']} producer={name} "
               f"collected_at={summary['collected_at']} report={output / 'summary.json'}")
@@ -1230,24 +1712,6 @@ def main():
         if not passed:
             print("FIRST_CAUSE " + Path(step["stderr"]["path"]).read_text(encoding="utf-8")[-4000:])
         return 0 if passed else 1
-    stream = io.StringIO()
-    result = unittest.TextTestRunner(stream=stream, verbosity=2).run(
-        unittest.defaultTestLoader.loadTestsFromTestCase(WorkbenchTests))
-    with (output / "unittest.log").open("x", encoding="utf-8") as log:
-        log.write(stream.getvalue())
-    summary = {"scope": "FILE_AND_HTTP_SELFTEST_NOT_FULL_WORKBENCH_OR_RELEASE",
-               "tests": result.testsRun, "failures": len(result.failures), "errors": len(result.errors),
-               "skipped": len(result.skipped), "fixture_root": str(WorkbenchTests.out),
-               "verdict": "PASS" if result.wasSuccessful() and result.testsRun > 0 else "FAIL",
-               "collected_at": gate.now(),
-               "log": gate.file_record(output / "unittest.log", output)}
-    gate.write_json(output / "summary.json", summary)
-    print(f"WORKBENCH_SELFTEST verdict={summary['verdict']} tests={result.testsRun} "
-          f"failures={summary['failures']} errors={summary['errors']} "
-          f"collected_at={summary['collected_at']} report={output / 'summary.json'}")
-    if result.failures or result.errors:
-        print("FIRST_CAUSE " + (result.failures + result.errors)[0][1])
-    return 0 if summary["verdict"] == "PASS" else 1
 
 
 if __name__ == "__main__":

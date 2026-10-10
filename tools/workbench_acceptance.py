@@ -37,10 +37,13 @@ PRODUCERS = {
     "perf": ("browser_performance.mjs", "seat-perf", "opensim-browser-performance"),
     "ui": ("ui_contract_test.mjs", "seat-ui", "opensim-ui-contract"),
 }
-VIEWPORTS = {
-    "mobile-narrow", "mobile-common", "mobile-wide", "tablet-portrait",
-    "desktop-small", "desktop-browser-common", "desktop-standard", "desktop-wide",
+VIEWPORT_MATRIX = {
+    "mobile-narrow": (320, 568, True), "mobile-common": (360, 800, True),
+    "mobile-wide": (390, 844, True), "tablet-portrait": (768, 1024, True),
+    "desktop-small": (1024, 768, False), "desktop-browser-common": (1064, 768, False),
+    "desktop-standard": (1280, 800, False), "desktop-wide": (1440, 900, False),
 }
+VIEWPORTS = set(VIEWPORT_MATRIX)
 PARTIAL = "LOCAL_AUTOMATION_PARTIAL_NOT_RELEASE"
 PASS = "LOCAL_AUTOMATION_PASS_NOT_RELEASE"
 PERF_PERSISTENCE = {
@@ -526,7 +529,9 @@ def validate_durable_producer(name: str, value: dict, rc: int, directory: Path) 
         expected_files = {row["file"] for row in value["screenshots"]}
         expected_files.update(path.name for path in directory.glob("solve-*.json"))
         downloads = value.get("downloads")
-        need(isinstance(downloads, list), "ui missing download inventory", name)
+        need(isinstance(downloads, list) and bool(downloads), "ui missing/empty download inventory", name)
+        need(len({row.get("guid") for row in downloads}) == len(downloads),
+             "ui duplicate download inventory", name)
         for download in downloads:
             need(isinstance(download, dict) and download.get("state") == "completed" and
                  isinstance(download.get("guid"), str) and Path(download["guid"]).name == download["guid"],
@@ -635,6 +640,163 @@ def validate_audit_payload(value: dict, directory: Path, sources: dict, url: str
     return records
 
 
+def validate_browser_captures(value: dict, directory: Path) -> list[dict]:
+    """Reconstruct the producer row-major tiling, not its self-reported PASS."""
+    captures, pictures = value.get("captures"), value.get("screenshots")
+    need(isinstance(captures, list) and bool(captures) and isinstance(pictures, list) and bool(pictures),
+         "Browser missing capture/PNG inventory", "browser")
+    need(all(isinstance(row, dict) for row in [*captures, *pictures]),
+         "Browser malformed capture/PNG inventory", "browser")
+    picture_map = {row.get("file"): row for row in pictures}
+    need(len(picture_map) == len(pictures), "Browser duplicate PNG inventory", "browser")
+    records, names, manifests, consumed = [], set(), set(), set()
+    for row in captures:
+        name, manifest_file = row.get("name"), row.get("manifest")
+        need(isinstance(name, str) and bool(name) and Path(name).name == name and name not in names and
+             manifest_file == name + "-capture.json", "Browser duplicate/unsafe capture manifest", "browser")
+        names.add(name)
+        manifests.add(manifest_file)
+        data, record = producer_file(directory, manifest_file, "browser")
+        manifest = decode(data)
+        need(manifest.get("name") == name and
+             all(manifest.get(key) == row.get(key) for key in ("width", "height", "dpr", "selected_view", "canvas")),
+             "Browser capture summary/manifest differs", "browser")
+        content, viewport = manifest.get("content", {}), manifest.get("viewport", {})
+        numeric = lambda item: type(item) in (int, float) and math.isfinite(item)
+        need(all(numeric(content.get(key)) for key in ("x", "y", "width", "height")) and
+             content["width"] > 0 and content["height"] > 0 and
+             all(numeric(viewport.get(key)) and viewport[key] > 0 for key in ("width", "height")) and
+             numeric(row.get("dpr")) and row["dpr"] > 0,
+             "Browser invalid capture geometry/DPR", "browser")
+        width, height, dpr = math.ceil(content["width"]), math.ceil(content["height"]), row["dpr"]
+        need(type(row.get("width")) is int and type(row.get("height")) is int and
+             (row["width"], row["height"]) == (width, height), "Browser capture dimensions differ", "browser")
+        tiles, artifacts = manifest.get("tiles"), manifest.get("artifacts")
+        need(isinstance(tiles, list) and bool(tiles) and isinstance(artifacts, list) and
+             len(tiles) == len(artifacts), "Browser missing/extra capture segments", "browser")
+        # A regular row-major grid may have a shorter final row/column.
+        first = tiles[0]
+        need(isinstance(first, dict) and type(first.get("width")) is int and type(first.get("height")) is int and
+             0 < first["width"] <= min(width, math.floor(viewport["width"])) and
+             0 < first["height"] <= min(height, math.floor(viewport["height"])),
+             "Browser invalid capture tile dimensions", "browser")
+        tw, th = first["width"], first["height"]
+        count = math.ceil(width / tw) * math.ceil(height / th)
+        need(count == len(tiles), "Browser missing/extra capture grid segments", "browser")
+        expected = [{"x": content["x"] + x, "y": content["y"] + y,
+                     "width": min(tw, width - x), "height": min(th, height - y), "scale": 1}
+                    for y in range(0, height, th) for x in range(0, width, tw)]
+        need(tiles == expected, "Browser capture gaps/overlaps/order differ", "browser")
+        for index, (clip, artifact) in enumerate(zip(expected, artifacts)):
+            filename = name + (".png" if count == 1 else f"-tile-{index + 1:03d}.png")
+            need(isinstance(artifact, dict) and artifact.get("file") == filename and filename not in consumed and
+                 picture_map.get(filename) == artifact and artifact.get("capture") == name and
+                 artifact.get("coordinate") == manifest.get("coordinate") and artifact.get("clip") == clip and
+                 artifact.get("selected_view") == manifest.get("selected_view") and
+                 artifact.get("canvas") == manifest.get("canvas") and
+                 (artifact.get("width"), artifact.get("height")) ==
+                 (math.ceil(clip["width"] * dpr), math.ceil(clip["height"] * dpr)),
+                 "Browser capture PNG/clip/view inventory differs", "browser")
+            consumed.add(filename)
+        coverage = {"status": "PASS", "source_css_pixels": width * height, "tiles": count,
+                    "scaled": False, "gaps": 0, "overlaps": 0}
+        need(manifest.get("coverage") == coverage and all(row.get(key) == item for key, item in coverage.items()),
+             "Browser capture coverage summary differs", "browser")
+        records.append(record)
+    need(consumed == set(picture_map) == {path.name for path in directory.glob("*.png")} and
+         manifests == {path.name for path in directory.glob("*-capture.json")},
+         "Browser unconsumed capture/PNG inventory differs", "browser")
+    for record in records:
+        need(producer_file(directory, Path(record["path"]).name, "browser")[1] == record,
+             "Browser capture manifest changed during validation", "browser")
+    return records
+
+
+def validate_browser_core(value: dict, directory: Path, root: Path) -> list[dict]:
+    records = validate_browser_captures(value, directory)
+    captures = {row["name"]: row for row in value["captures"]}
+    css = (root / "web/app.css").read_text(encoding="utf-8")
+    media = re.findall(r"@media\s*([^\{]+)\{", css)
+    widths = sorted({int(float(number) * (1 if unit == "px" else 16))
+                     for condition in media for number, unit in re.findall(
+                         r"(?:min-|max-)?width\s*:\s*(\d+(?:\.\d+)?)(px|rem|em)", condition)})
+    breakpoints = sorted({576, 768, 1024, 1280, *widths})
+    need(value.get("source_audit", {}).get("media_widths") == widths and value.get("breakpoints") == breakpoints,
+         "Browser source CSS/breakpoint plan differs", "browser")
+    flows = {name: dimensions[:2] for name, dimensions in VIEWPORT_MATRIX.items()}
+    flows.update({"keyboard-desktop": (1280, 800), "keyboard-mobile": (320, 568),
+                  "reduced-motion": (360, 800), "forced-colors": (360, 800),
+                  "text-200": (360, 800), "page-400": (320, 200)})
+    if any(re.search(r"prefers-color-scheme\s*:\s*dark", condition) for condition in media):
+        flows["dark-mode"] = (360, 800)
+    required = {name + "-" + suffix for name in flows for suffix in ("mesh", "field", "bad-input")}
+    required.update(f"breakpoint-{point + delta}" for point in breakpoints for delta in (-1, 0, 1))
+    required.add("rectangle")
+    need(set(captures) == required, "Browser fixed full capture plan missing/extra names", "browser")
+    for name, (width, height) in flows.items():
+        layout_name = {"keyboard-desktop": "desktop-standard", "keyboard-mobile": "mobile-narrow"}.get(name, name)
+        layout_data, layout_record = producer_file(directory, layout_name + "-layout.json", "browser")
+        layout = decode(layout_data)
+        need(layout.get("viewport") == {"width": width, "height": height} and
+             type(layout.get("client_width")) is int and 0 < layout["client_width"] <= width,
+             "Browser configured/layout viewport differs", "browser")
+        records.append(layout_record)
+        for suffix, view in (("mesh", "mesh"), ("field", "field"), ("bad-input", "field")):
+            capture = captures.get(name + "-" + suffix, {})
+            canvas = capture.get("canvas", {})
+            need(capture.get("selected_view") == view and isinstance(canvas, dict) and
+                 all(type(canvas.get(key)) is int and canvas[key] > 0 for key in
+                     ("width", "height")) and
+                 isinstance(canvas.get("pixel_hash"), str) and
+                 re.fullmatch(r"[a-f0-9]{1,8}", canvas["pixel_hash"]) is not None,
+                 f"Browser required core capture selected view/canvas missing: {name}-{suffix}", "browser")
+            if suffix != "bad-input":
+                need(type(canvas.get("nontransparent")) is int and canvas["nontransparent"] > 10 and
+                     type(canvas.get("distinct_colors")) is int and canvas["distinct_colors"] > 2,
+                     "Browser normal field/mesh canvas empty", "browser")
+            data, _ = producer_file(directory, capture["manifest"], "browser")
+            viewport = decode(data).get("viewport", {})
+            need((viewport.get("width"), viewport.get("height")) == (layout["client_width"], height) and
+                 capture.get("dpr") == (4 if name == "page-400" else 1),
+                 "Browser core capture client viewport/DPR differs", "browser")
+        mesh, field = captures[name + "-mesh"]["canvas"], captures[name + "-field"]["canvas"]
+        need(mesh["pixel_hash"] != field["pixel_hash"], "Browser field/mesh canvas did not redraw", "browser")
+        checks = [row for row in value["checks"] if row.get("coordinate") == name and
+                  isinstance(row.get("detail"), dict) and {"field", "mesh"} <= set(row["detail"])]
+        if name in VIEWPORTS or name.startswith("keyboard-") or name == "page-400":
+            need(len(checks) == 1 and checks[0]["detail"]["mesh"] == mesh and
+                 checks[0]["detail"]["field"] == field,
+                 "Browser core canvas differs from actual flow drawing check", "browser")
+    for point in breakpoints:
+        for delta in (-1, 0, 1):
+            name = f"breakpoint-{point + delta}"
+            capture = captures[name]
+            layout_data, layout_record = producer_file(directory, name + "-layout.json", "browser")
+            layout = decode(layout_data)
+            manifest_data, _ = producer_file(directory, capture["manifest"], "browser")
+            viewport = decode(manifest_data).get("viewport", {})
+            need(layout.get("viewport") == {"width": point + delta, "height": 800} and
+                 type(layout.get("client_width")) is int and 0 < layout["client_width"] <= point + delta and
+                 (viewport.get("width"), viewport.get("height")) == (layout["client_width"], 800) and
+                 capture.get("dpr") == 1, "Browser breakpoint layout/client viewport differs", "browser")
+            records.append(layout_record)
+            checks = [row for row in value["checks"] if row.get("coordinate") == name and
+                      row.get("rule") == "WEB-RWD-002"]
+            need(len(checks) == 1 and capture.get("selected_view") == "field" and
+                 checks[0].get("detail", {}).get("field", {}).get("selected_view") == "field" and
+                 checks[0]["detail"]["field"].get("canvas") == capture.get("canvas") and
+                 checks[0]["detail"].get("mesh", {}).get("selected_view") == "mesh" and
+                 checks[0]["detail"]["mesh"].get("canvas", {}).get("pixel_hash") !=
+                 capture.get("canvas", {}).get("pixel_hash"),
+                 "Browser breakpoint capture differs from actual view drawing check", "browser")
+    need(captures["rectangle"].get("selected_view") == "field" and bool(captures["rectangle"].get("canvas")),
+         "Browser rectangle selected view/canvas missing", "browser")
+    for record in records:
+        need(producer_file(directory, Path(record["path"]).name, "browser")[1] == record,
+             "Browser capture/layout dependency changed", "browser")
+    return records
+
+
 def validate_audit_coverage(value: dict, directory: Path, url: str) -> list[dict]:
     screenshots, injections, records = value.get("screenshots", []), value.get("injections", []), []
     need(isinstance(injections, list) and len(injections) == 16, "Audit incomplete injection inventory", "audit")
@@ -643,6 +805,7 @@ def validate_audit_coverage(value: dict, directory: Path, url: str) -> list[dict
          "Audit duplicate/missing injection request", "audit")
     pictures = {row["file"]: row for row in screenshots}
     need(len(pictures) == len(screenshots), "Audit duplicate screenshot file", "audit")
+    phases = set()
     for width, height in ((320, 568), (768, 1024), (1064, 768), (1440, 900)):
         for mode in ("hold", "error", "empty", "long"):
             phase = f"{width}-loading-empty" if mode == "hold" else f"{width}-{mode}"
@@ -659,34 +822,53 @@ def validate_audit_coverage(value: dict, directory: Path, url: str) -> list[dict
                 length = positive(rows[0].get("injected_warning_length"), "audit-long")
                 need(length <= 4096, "Audit long warning outside actual contract", "audit")
         for state in ("loading-empty", "ready", "error", "empty", "long",
-                      "error-recovery", "empty-recovery", "long-recovery"):
+                      "error-recovery", "empty-recovery", "long-recovery",
+                      "mesh-selected", "field-unselected", "details-open-0"):
             phase = f"{width}-{state}"
             main = pictures.get(phase + ".png", {})
             need(main.get("state") == phase and main.get("url") == url and
                  (main.get("width"), main.get("height")) == (width, height),
                  "Audit required viewport/state screenshot missing", "audit")
-            data, record = producer_file(directory, phase + ".coverage.json", "audit")
-            coverage = decode(data)
-            document, tiles = coverage.get("document", {}), coverage.get("tiles", [])
-            need(coverage.get("status") == "PASS" and coverage.get("scale") == 1 and
-                 coverage.get("horizontal_coverage") == "COMPLETE" and
-                 type(document.get("height")) is int and document["height"] > 0 and
-                 type(document.get("width")) is int and 0 < document["width"] <= width and
-                 isinstance(tiles, list) and bool(tiles), "Audit incomplete state screenshot coverage", "audit")
-            covered, seen = 0, set()
-            for tile in tiles:
-                picture = pictures.get(tile.get("file"), {})
-                y = tile.get("document_y")
-                need(tile.get("file") not in seen and type(y) is int and 0 <= y <= covered and
-                     tile.get("viewport") == {"width": width, "height": height} and
-                     picture.get("url") == url and picture.get("state", "").startswith(phase + "-tile-") and
-                     (picture.get("width"), picture.get("height")) == (width, height),
-                     "Audit tile inventory/coverage gap differs", "audit")
-                seen.add(tile["file"])
-                covered = max(covered, y + height)
-            need(covered >= document["height"] and coverage.get("vertical_coverage") == covered,
-                 "Audit incomplete vertical state coverage", "audit")
-            records.append(record)
+            phases.add(phase)
+    # Enumerate every declared whole capture, including view/details states.
+    whole = {row["file"][:-4]: row for row in screenshots if "-tile-" not in row["file"]}
+    covers = {path.name for path in directory.glob("*.coverage.json")}
+    need(phases <= set(whole) and covers == {phase + ".coverage.json" for phase in whole},
+         "Audit whole capture/coverage inventory differs", "audit")
+    consumed = set()
+    for phase, main in whole.items():
+        width, height = main.get("width"), main.get("height")
+        need(main.get("file") == phase + ".png" and main.get("state") == phase and main.get("url") == url and
+             (width, height) in {(320, 568), (768, 1024), (1064, 768), (1440, 900)},
+             "Audit whole screenshot URL/state/dimensions differ", "audit")
+        data, record = producer_file(directory, phase + ".coverage.json", "audit")
+        coverage = decode(data)
+        document, tiles = coverage.get("document", {}), coverage.get("tiles", [])
+        need(coverage.get("status") == "PASS" and coverage.get("scale") == 1 and
+             coverage.get("horizontal_coverage") == "COMPLETE" and
+             type(document.get("height")) is int and document["height"] > 0 and
+             type(document.get("width")) is int and 0 < document["width"] <= width and
+             isinstance(tiles, list) and bool(tiles), "Audit incomplete state screenshot coverage", "audit")
+        need(len(tiles) == math.ceil(document["height"] / height),
+             "Audit missing/extra state screenshot segments", "audit")
+        covered = 0
+        consumed.add(main["file"])
+        for index, tile in enumerate(tiles):
+            filename = f"{phase}-tile-{index:03d}.png"
+            picture, y = pictures.get(filename, {}), tile.get("document_y")
+            need(tile.get("file") == filename and filename not in consumed and type(y) is int and
+                 y == min(index * height, max(0, document["height"] - height)) and 0 <= y <= covered and
+                 tile.get("viewport") == {"width": width, "height": height} and
+                 picture.get("url") == url and picture.get("state") == filename[:-4] and
+                 (picture.get("width"), picture.get("height")) == (width, height),
+                 "Audit tile inventory/coverage gap differs", "audit")
+            consumed.add(filename)
+            covered = max(covered, y + height)
+        need(covered >= document["height"] and coverage.get("vertical_coverage") == covered,
+             "Audit incomplete vertical state coverage", "audit")
+        records.append(record)
+    need(consumed == set(pictures) == {path.name for path in directory.glob("*.png")},
+         "Audit unconsumed whole/tile PNG inventory differs", "audit")
     counts = value.get("coverage_counts", {})
     for key, expected in (("matrix", 4), ("checks", len(value["checks"])),
                           ("screenshots", len(screenshots)), ("injected_requests", len(injections))):
@@ -782,10 +964,14 @@ def validate_producer(name: str, value: dict, rc: int, root: Path,
         need(value.get("mode") == "OPENSIM_ACCEPTANCE", "Browser probe/selftest is not full scope", name)
         matrix = value.get("matrix", [])
         need(len(matrix) == len(VIEWPORTS) and {row.get("name") for row in matrix} == VIEWPORTS and
-             all(row.get("status") == "PASS" for row in matrix), "Incomplete browser matrix", name)
+             all(row.get("status") == "PASS" and
+                 type(row.get("touch")) is bool and
+                 (row.get("width"), row.get("height"), row["touch"]) == VIEWPORT_MATRIX[row["name"]]
+                 for row in matrix), "Incomplete browser matrix/geometry/touch", name)
         need(build in value.get("page_build", {}).get("build_text", ""), "Stale browser build", name)
         solves = positive(value.get("result_count"), name)
         solve_artifacts(directory, sources, solves, name)
+        validate_browser_core(value, directory, root)
         pictures = value.get("screenshots")
     elif name == "audit":
         need(value.get("mode") == "G3_G6_AUTOMATIC_EXTENSION_NOT_RELEASE", "Audit smoke/fixture scope", name)
@@ -853,6 +1039,7 @@ def validate_producer(name: str, value: dict, rc: int, root: Path,
     pngs = [png_record(row, directory, (360, 800) if name == "perf" else None) for row in pictures]
     durability = validate_durable_producer(name, value, rc, directory)
     return {"checks": len(checks), "solves": solves, "pngs": pngs, "remaining": remaining,
+            "downloads": len(value["downloads"]) if name == "ui" else None,
             "durable_completion": durability,
             "commit": candidate["commit"], "source_sha256": sources, "page_build": build,
             "commit_binding": "CLEAN_BEFORE_AFTER_INVENTORY" if name == "ui" else "PRODUCER_AND_INVENTORY"}
@@ -1073,7 +1260,107 @@ def read_final(output: Path) -> dict:
          value["exit_code"] == (0 if value["verdict"] == PASS else
                                 3 if value["verdict"] == PARTIAL else 1),
          "Final verdict/exit-code mismatch", "persistence")
+    log = (output / "workbench.log").read_bytes()
+    need(log == ("PROVISIONAL_LOG_NOT_TERMINAL\n" + verdict_line(value, output / "workbench.json") + "\n").encode("utf-8"),
+         "Final log termination differs from report", "persistence")
+    if value["verdict"] != "FAIL":
+        validate_complete_run(value)
     return value
+
+
+def validate_complete_run(report: dict) -> None:
+    """Positive terminal closure; diagnostic FAIL may legitimately be incomplete."""
+    need(report.get("schema_version") == 1 and report.get("tool") == "opensim-workbench-acceptance" and
+         report.get("scope") == "LOCAL_AUTOMATION_NOT_RELEASE" and report.get("release_verdict") == "NOT_CERTIFIED",
+         "Incomplete/unknown workbench terminal scope", "completion")
+    before, after = report.get("before"), report.get("after")
+    need(isinstance(before, dict) and bool(before) and before == after and not before.get("status") and
+         bool(before.get("tracked_sha256")), "Workbench missing/stale final source inventory", "completion")
+    producers = report.get("producers")
+    need(isinstance(producers, dict) and set(producers) == set(PRODUCERS) and
+         all(isinstance(row, dict) and isinstance(row.get("validation"), dict) for row in producers.values()),
+         "Workbench incomplete four-producer inventory", "completion")
+    steps = report.get("steps", [])
+    reused = producers["browser"].get("reused") is True
+    expected = (["audit", "perf", "perf-readback", "ui"] if reused else
+                [*(f"local-{index}" for index in range(1, 6)), "browser", "audit", "perf", "perf-readback", "ui"])
+    need(isinstance(steps, list) and [row.get("name") for row in steps] == expected,
+         "Workbench completion subprocess inventory differs", "completion")
+    for step in steps:
+        need(type(step.get("rc")) is int and step["rc"] == 0, "Workbench completion subprocess rc differs", "completion")
+        for stream in ("stdout", "stderr"):
+            saved = step.get(stream, {})
+            need(file_record(Path(saved["path"]), EXTERNAL, True) == saved,
+                 "Workbench completion subprocess log differs", "completion")
+    if reused:
+        need(isinstance(report.get("integration"), dict) and
+             file_record(Path(report["integration"]["path"]), EXTERNAL) == report["integration"],
+             "Workbench missing/stale integration receipt", "completion")
+    remaining, checks, solves, pngs = [], 0, 0, 0
+    for name, entry in producers.items():
+        validation = entry["validation"]
+        need(validation.get("commit") == before.get("commit") and
+             validation.get("source_sha256") == source_map(before),
+             "Workbench producer final source mismatch", name)
+        durable = validation.get("durable_completion", {})
+        dependencies = durable.get("artifacts", [])
+        need(bool(durable.get("protocol")) and isinstance(dependencies, list) and bool(dependencies) and
+             isinstance(entry.get("report"), dict), "Workbench producer receipt missing", name)
+        for saved in dependencies:
+            path = Path(saved["path"])
+            need(producer_file(path.parent, path.name, name)[1] == saved,
+                 "Workbench producer completion dependency changed", name)
+        saved = entry["report"]
+        failure_markers(Path(saved["path"]).parent, name)
+        need(file_record(Path(saved["path"]), EXTERNAL) ==
+             {key: saved[key] for key in ("path", "bytes", "sha256")},
+             "Workbench producer report changed", name)
+        if not (name == "browser" and reused):
+            step = next(row for row in steps if row["name"] == name)
+            terminal = entry.get("terminal", {})
+            need(type(terminal.get("rc")) is int and terminal["rc"] == step["rc"] and
+                 type(terminal.get("exit_code")) is int and terminal["exit_code"] == step["rc"],
+                 "Workbench producer process/report terminal differs", name)
+        checks += positive(validation.get("checks"), name)
+        solves += positive(validation.get("solves"), name)
+        need(isinstance(validation.get("pngs"), list) and bool(validation["pngs"]),
+             "Workbench producer PNG inventory missing", name)
+        pngs += len(validation["pngs"])
+        remaining.extend({"producer": name, **row} for row in validation.get("remaining", []))
+    perf = producers["perf"]
+    need(bool(perf.get("readback_durable_completion", {}).get("artifacts")) and
+         isinstance(perf.get("raw_metric_readback"), dict), "Workbench perf parse receipt missing", "perf")
+    for saved in perf["readback_durable_completion"]["artifacts"]:
+        path = Path(saved["path"])
+        need(producer_file(path.parent, path.name, "perf")[1] == saved,
+             "Workbench perf parse dependency changed", "perf")
+    need(type(producers["ui"]["validation"].get("downloads")) is int and
+         producers["ui"]["validation"]["downloads"] > 0, "Workbench UI download inventory missing", "ui")
+    need(report.get("remaining") == remaining, "Workbench remaining coverage inventory differs", "coverage")
+    if report.get("verdict") in {PASS, PARTIAL}:
+        need(automation_verdict(remaining)[0] == report["verdict"],
+             "Workbench coverage promoted or terminal mismatch", "coverage")
+    counts = report.get("counts", {})
+    need(all(type(counts.get(key)) is int and counts[key] == value for key, value in
+             (("producers_validated", 4), ("checks", checks), ("solves", solves), ("pngs", pngs))),
+         "Workbench terminal counts differ", "completion")
+    server = report.get("owned_server", {})
+    need(server.get("stopped") is True and bool(server.get("url")), "Workbench owned server not stopped", "completion")
+    before_hashes = None
+    for stage in ("before", "after"):
+        identity = report.get("server_" + stage, {})
+        records = identity.get("artifacts", {})
+        need(set(records) == {"api/health", "", "web/app.js", "web/app.css"},
+             "Workbench server-after/before artifact inventory missing", "server-" + stage)
+        for record in records.values():
+            need(file_record(Path(record["path"]), EXTERNAL) == record,
+                 "Workbench server artifact changed", "server-" + stage)
+        health = decode(Path(records["api/health"]["path"]).read_bytes())
+        need(health == identity.get("health") and health.get("status") == "ok" and
+             health.get("source_sha256") == source_map(before), "Workbench server source differs", "server-" + stage)
+        hashes = {key: row["sha256"] for key, row in records.items()}
+        need(before_hashes is None or hashes == before_hashes, "Workbench server final bytes differ", "server-after")
+        before_hashes = hashes
 
 
 def run(root: Path, output: Path, integration: Path | None = None) -> dict:
@@ -1224,6 +1511,13 @@ def run(root: Path, output: Path, integration: Path | None = None) -> dict:
     report["counts"]["checks"] = sum(row.get("validation", {}).get("checks", 0) for row in report["producers"].values())
     report["counts"]["pngs"] = sum(len(row.get("validation", {}).get("pngs", [])) for row in report["producers"].values())
     report["counts"]["solves"] = sum(row.get("validation", {}).get("solves", 0) for row in report["producers"].values())
+    if report["verdict"] != "FAIL":
+        try:
+            validate_complete_run(report)
+        except Exception as exc:
+            report["completion_failure"] = {"coordinate": getattr(exc, "coordinate", "completion"), "message": str(exc)}
+            report.setdefault("first_cause", report["completion_failure"])
+            report["verdict"] = "FAIL"
     report["finished_at"] = now()
     report["exit_code"] = 0 if report["verdict"] == PASS else (3 if report["verdict"] == PARTIAL else 1)
     report["tool_sha256"] = sha(Path(__file__).read_bytes())

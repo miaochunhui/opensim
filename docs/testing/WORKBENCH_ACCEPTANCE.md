@@ -1,5 +1,51 @@
 # 工作台组合验收
 
+## 2026-10-10 续跑消费门
+
+独立基线 `6734853` 的新增负例先保留于
+`resume-s3-workbench-20261010/original-red-v1/summary.json`：4 methods、
+14 failures、0 errors，真实 launcher rc1，source_before==source_after。
+这证明原消费门漏拒，不追认旧红；后续计数以新 summary 为准。
+
+完整 browser 必须逐一消费 capture manifest 和实际 PNG，clip/DPR/尺寸、
+row-major 无缺口无重叠、selected_view/canvas/coordinate、摘要及实际文件
+集合双向一致。固定八矩阵的 width/height/touch 不由报告自行定义；
+捕获名字从固定 core、keyboard、media、text/page、rectangle 流程及当前
+CSS 断点推导。当前无 dark mode 时为55 captures，不是55 PNG。
+八矩阵、keyboard/page core 的 canvas 与实际 flow check 对拍，breakpoint
+与实际 view check 对拍；field/mesh hash 必须不同。producer 没有独立
+drawing_state 字段，不能虚构它，也不声称 PNG/FNV 摘要能抵抗恶意同 UID
+同时重写全部证据。media/text check 没有返回 core canvas，保持明确边界。
+配置视口核已有 layout.viewport；捕获宽度核 layout.client_width，不假设滚动条
+宽度，不把 clientWidth 与 innerWidth 硬等。keyboard 无独立 layout，使用同尺寸
+基线 layout 并明确不称该阶段重新采集 layout。bad-input 已清旧结果，核视图/
+有界画布/格式，不要求未清 FEM 像素；正常 field/mesh 仍拒绝空画布。
+
+audit 的44必需 whole 状态包括四视口各 loading/ready/error/empty/long、
+三 recovery、mesh-selected、field-unselected、details-open-0。
+其它实际 details 状态也必须消费；whole/coverage/所有 tile/实际 PNG
+双向闭合，段数、顺序、末段允许 producer 的正常重叠滚动，但不漏段多段。
+该逻辑只扩展原纯 validate_audit_coverage，不新增 helper 依赖，供 pinned
+release_gate 复用，不执行其 runner 或授予 human/production 信任。
+
+全模式 UI 必须有实际 completed downloads，空集合不假绿。正向组合终态
+额外核四 producer、各自完成协议与实际依赖、同次进程码/完整日志、perf
+parse 回执、server-before/after 四正文、已停止的自有服务和源码前后一致。
+read_final 同样核闭合和完整终止日志；FAIL 诊断可不完整，原首因优先保留。
+
+专项入口（目录必须新建；不运行 producer 或全 FEM）：
+
+```bash
+sudo -n -u infra python3 -B tests/test_workbench_acceptance.py --out /hf3fs-jd/data/tmp/opensim-fluid-v1/resume-s3-workbench-20261010/module-new --release-source /data/dev/opensim/tools/release_gate.py
+```
+
+默认使用本 checkout 的 release_gate；基线树缺新 API 时显式只读覆写其源码。
+--focused 仅新 controls。run-start/progress/summary/log 全在指定目录，summary
+记实际子进程 rc、tests/failures/errors/skips 和完整 source_before/source_after。
+文件夹具只证明检测器，不是实际产品证据。--producer-readback 原生入口
+回读旧真实 PNG/POST/captures/receipt/log，但旧 commit 不升本候选认证；
+新版 selected-view 证据缺失必须拒绝，不补造历史字段。最终 v3 全组合归主席。
+
 本入口只组合真实本地自动化，不签署授权、例外、公网同步或发布认证。
 不安装、不下载、不修改生产、不重试，不复用在役 FEM 端口。
 只有当前干净且已提交的候选可以运行；dirty/untracked、运行中源码变化、
