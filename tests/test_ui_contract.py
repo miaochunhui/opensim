@@ -1,7 +1,7 @@
 """Run the real UI contract against an owned ephemeral loopback FEM server.
 
 unittest retains immutable external logs/reports. CLI --scan checks only the
-five seat files; --verify-browser rereads full-matrix PNG/solve evidence.
+three finalizer delta files; --verify-browser rereads full-matrix PNG/solve evidence.
 No production, dependency installation, shared process cleanup or credentials.
 """
 
@@ -30,6 +30,7 @@ from tools.render_page import SOURCE_PATHS
 OUT = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-ui")
 WRITE_SET = ("web/app.js", "web/app.css", "tools/ui_contract_test.mjs",
              "tests/test_ui_contract.py", "docs/testing/UI_CONTRACT.md")
+DELTA_SET = ("tools/ui_contract_test.mjs", "tests/test_ui_contract.py", "docs/testing/UI_CONTRACT.md")
 
 
 def sha(data):
@@ -43,10 +44,62 @@ def write_report(destination, report):
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("x", encoding="utf-8") as stream:
         stream.write(json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     return destination
 
 
+def run_contract(destination, app, *options):
+    command = ["node", str(ROOT / "tools/ui_contract_test.mjs"),
+               "--url", f"http://127.0.0.1:{app.server_port}/",
+               "--out", str(destination), *options]
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True,
+                            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1",
+                                     OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1"))
+    write_report(destination / "execution.json", {
+        "argv": command, "rc": result.returncode, "stdout": result.stdout, "stderr": result.stderr,
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return result
+
+
 class UIContractTests(unittest.TestCase):
+    def test_minimal_durable_smoke(self):
+        destination = OUT / ("durable-smoke-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                             + "-" + uuid4().hex[:8])
+        app = ApplicationServer(("127.0.0.1", 0))
+        worker = threading.Thread(target=app.serve_forever, daemon=True)
+        worker.start()
+        try:
+            result = run_contract(destination, app, "--minimal")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            reports = list(destination.glob("run-*/report.json"))
+            self.assertEqual(len(reports), 1)
+            report = json.loads(reports[0].read_text())
+            self.assertEqual((report["verdict"], report["state"], report["exit_code"]),
+                             ("PASS", "FINAL", result.returncode))
+            self.assertEqual(report["actual_solver_calls"], 3)
+            self.assertEqual(report["durability"]["state"], "FINAL_AFTER_FSYNC_AND_INODE_READBACK")
+            operations = report["durability"]["operations"]
+            for file in ("report.provisional.json", "run.log", "evidence.json"):
+                self.assertTrue(any(row["operation"] == "fsync-file" and
+                                    Path(row["file"]).name == file for row in operations))
+                self.assertTrue(any(row["operation"] == "exact-readback" and
+                                    Path(row["file"]).name == file for row in operations))
+            self.assertTrue(any(row["operation"] == "fsync-directory" for row in operations))
+            self.assertEqual(sha((reports[0].parent / "evidence.json").read_bytes()),
+                             report["evidence_sha256"])
+        finally:
+            app.shutdown()
+            app.server_close()
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+
     def test_real_dom_and_fem_contract(self):
         destination = OUT / ("unittest-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                              + "-" + uuid4().hex[:8])
@@ -97,7 +150,7 @@ class UIContractTests(unittest.TestCase):
             worker.join(5)
             self.assertFalse(worker.is_alive(), "Owned HTTP test thread did not stop")
 
-    def test_real_finalization_failures_revoke_pass_and_match_process(self):
+    def test_finalization_fault_simulations_revoke_pass_and_match_process(self):
         destination = OUT / ("finalization-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                              + "-" + uuid4().hex[:8])
         destination.mkdir(parents=True)
@@ -125,7 +178,8 @@ class UIContractTests(unittest.TestCase):
                     self.assertEqual(report["state"], "FINALIZATION_FAILED")
                     self.assertEqual(report["finalization_failure"]["candidate_verdict"], "PASS")
                     self.assertIn(stage, report["finalization_failure"]["message"])
-                    self.assertEqual(report["finalization_failure"]["code"], "EIO")
+                    self.assertEqual(report["finalization_failure"]["code"], "SIMULATED_EIO")
+                    self.assertEqual(report["finalization_failure"]["method"], "FAULT_SIMULATION")
                     self.assertEqual(report["actual_solver_calls"], 3)
                     self.assertIn("verdict=FAIL rc=2", result.stdout)
                     self.assertNotIn("UI_CONTRACT verdict=PASS", result.stdout)
@@ -136,6 +190,7 @@ class UIContractTests(unittest.TestCase):
                                  "stdout": result.stdout, "stderr": result.stderr})
             write_report(destination / "execution.json", {
                 "verdict": "PASS", "checks": rows, "failures_retained": True,
+                "method": "FAULT_SIMULATION_NOT_REAL_IO_ERRNO",
                 "collected_at": datetime.now(timezone.utc).isoformat(),
             })
         finally:
@@ -144,10 +199,85 @@ class UIContractTests(unittest.TestCase):
             worker.join(5)
             self.assertFalse(worker.is_alive(), "Owned fault-test HTTP thread did not stop")
 
+    def test_real_filesystem_errno_and_unknown_inode_protection(self):
+        destination = OUT / ("filesystem-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                             + "-" + uuid4().hex[:8])
+        app = ApplicationServer(("127.0.0.1", 0))
+        worker = threading.Thread(target=app.serve_forever, daemon=True)
+        worker.start()
+        cases = {
+            "directory-evidence": "EEXIST", "dev-full-log": "ENOSPC",
+            "closed-fd-file-sync": "EBADF", "closed-fd-directory-sync": "EBADF",
+            "same-bytes-provisional-replacement": None, "same-bytes-final-replacement": None,
+            "symlink-final-replacement": "ELOOP", "late-evidence-directory": "EISDIR",
+        }
+        rows = []
+        try:
+            for name, errno in cases.items():
+                with self.subTest(case=name):
+                    result = run_contract(destination / name, app, "--minimal", "--finalize-io", name)
+                    runs = list((destination / name).glob("run-*"))
+                    self.assertEqual(len(runs), 1, result.stdout + result.stderr)
+                    run = runs[0]
+                    markers = list(run.glob("finalization-failure.json"))
+                    self.assertEqual(len(markers), 1, result.stdout + result.stderr)
+                    report = json.loads(markers[0].read_text())
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertEqual(report["exit_code"], result.returncode)
+                    self.assertEqual((report["verdict"], report["state"]), ("FAIL", "FINALIZATION_FAILED"))
+                    failure = report["finalization_failure"]
+                    self.assertEqual(failure["candidate_verdict"], "PASS")
+                    self.assertEqual(failure["method"], "REAL_FILESYSTEM_OR_READBACK")
+                    self.assertEqual(report["actual_solver_calls"], 3)
+                    if errno:
+                        self.assertEqual(failure["code"], errno, failure)
+                        self.assertTrue(failure["syscall"], failure)
+                    else:
+                        self.assertIn("inode changed", failure["message"])
+                    self.assertIn("verdict=FAIL rc=2", result.stdout)
+                    self.assertNotIn("UI_CONTRACT verdict=PASS", result.stdout)
+                    unknown = run / "unknown-replacement.json"
+                    if unknown.exists():
+                        saved = json.loads(unknown.read_text())
+                        file = Path(saved["file"])
+                        stat = file.lstat()
+                        self.assertEqual({"dev": str(stat.st_dev), "ino": str(stat.st_ino)},
+                                         saved["replacement"])
+                        self.assertNotEqual(saved["original"], saved["replacement"])
+                        self.assertEqual(sha(file.read_bytes()), saved["sha256"])
+                        self.assertEqual(file.is_symlink(), saved["symlink"])
+                        if file.name == "report.json":
+                            self.assertIn("revocation_failure", report)
+                            self.assertIn(str(markers[0]), result.stdout)
+                    terminal = run / "report.json"
+                    if terminal.exists() and name not in {
+                            "same-bytes-final-replacement", "symlink-final-replacement"}:
+                        final = json.loads(terminal.read_text())
+                        self.assertEqual((final["verdict"], final["exit_code"]), ("FAIL", 2))
+                    if name == "late-evidence-directory":
+                        self.assertTrue(report["revocation"]["preserved"])
+                        self.assertFalse(report["revocation"]["consumable"])
+                    rows.append({"case": name, "kernel_errno": failure["code"], "syscall": failure["syscall"],
+                                 "process_rc": result.returncode, "report_rc": report["exit_code"],
+                                 "report": str(markers[0]), "sha256": sha(markers[0].read_bytes()),
+                                 "actual_solver_calls": report["actual_solver_calls"],
+                                 "unknown_inode_protected": unknown.exists()})
+            write_report(destination / "summary.json", {
+                "verdict": "PASS", "scope": "REAL_FILESYSTEM_NEGATIVES_NOT_RELEASE",
+                "cases": rows, "collected_at": datetime.now(timezone.utc).isoformat(),
+            })
+        finally:
+            app.shutdown()
+            app.server_close()
+            worker.join(5)
+            self.assertFalse(worker.is_alive(), "Owned filesystem-test HTTP thread did not stop")
+
     def test_scan_scope_is_exact(self):
         self.assertEqual(set(WRITE_SET), {"web/app.js", "web/app.css",
                          "tools/ui_contract_test.mjs", "tests/test_ui_contract.py",
                          "docs/testing/UI_CONTRACT.md"})
+        self.assertEqual(set(DELTA_SET), {"tools/ui_contract_test.mjs",
+                         "tests/test_ui_contract.py", "docs/testing/UI_CONTRACT.md"})
 
 
 def scan(destination):
@@ -159,16 +289,16 @@ def scan(destination):
     assert not secret.search(b"no credential assignment")
     assert private.search(b"-----BEGIN " + b"PRIVATE KEY-----")
     rows = []
-    for name in WRITE_SET:
+    for name in DELTA_SET:
         content = (ROOT / name).read_bytes()
         rows.append({"path": name, "bytes": len(content), "sha256": sha(content),
                      "credential_shape_hits": len(secret.findall(content)),
                      "private_key_hits": len(private.findall(content))})
-    diff = subprocess.run(["git", "diff", "--check", "--", *WRITE_SET], cwd=ROOT,
+    diff = subprocess.run(["git", "diff", "--check", "--", *DELTA_SET], cwd=ROOT,
                           capture_output=True, text=True)
     status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
                             cwd=ROOT, capture_output=True, text=True, check=True)
-    outside = [line[3:] for line in status.stdout.splitlines() if line[3:] not in WRITE_SET]
+    outside = [line[3:] for line in status.stdout.splitlines() if line[3:] not in DELTA_SET]
     passed = diff.returncode == 0 and not outside and all(
         row["bytes"] > 0 and not row["credential_shape_hits"] and not row["private_key_hits"]
         for row in rows)

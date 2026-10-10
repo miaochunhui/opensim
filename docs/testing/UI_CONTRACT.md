@@ -42,12 +42,29 @@ Chromium 页面观察 phase、aria-busy、错误与控件状态，实际请求�
 仅临时去除字形再逐元素恢复并核 computed color，不用静态色 token 假通过。
 这是自动对比度检查，不代替完整 G3/G6 审计或人工阅读评估。
 
-报告先落 `PROVISIONAL/RUNNING/exit_code=2`。真实执行日志、PNG、实际求解与
-下载文件逐件回读，写证据 manifest 并核精确字节，再用本 run 的已知精确
-provisional 原子替换为 FINAL。最后回读失败时必须以已知候选精确字节撤销 PASS，
-写 `FINALIZATION_FAILED/FAIL/exit_code=2`；替换失败则只移除本 run 已知字节，
-保留独立失败记录，不覆盖未知内容。日志写入/回读、证据写入/回读、最终
-写入/回读六类故障均在真实最小 DOM/FEM run 注入，Python 同验进程码与报告码。
+报告先独占创建 `report.provisional.json`，字段为
+`PROVISIONAL/RUNNING/exit_code=2`。日志、PNG、实际求解、下载和证据 manifest
+执行文件 fsync、父目录 fsync，并以 `O_NOFOLLOW`、设备号/inode 和精确字节回读。
+现有真实执行日志只向已核 inode 追加，不覆盖。最后独占创建 `report.json`，
+不以 rename 覆盖 provisional 或未知终态；终态和依赖再次回读后才输出成功。
+成功字段保持 `FINAL/PASS/exit_code=0`，
+`durability.state=FINAL_AFTER_FSYNC_AND_INODE_READBACK`，绑定
+`evidence_sha256` 和 `run_log_sha256`；operations 保留实际 fsync/回读记录。
+
+晚失败将本席已知 inode/字节的终态移至唯一 `revoked-owned-*` 非消费证据，
+独立写 `finalization-failure.json`，空缺终态才另行独占创建 FAIL 报告。
+未知文件即使字节相同也不得覆盖或删除，symlink 不跟随。此时未知 PASS 可仍存在，
+但进程码为 2、stdout 指向独立 FAIL 标记；消费者必须同时核进程码、终态、
+失败标记和身份，不得仅扫描任意 PASS JSON。
+
+原 `--finalize-fault` 六项是异常注入 **fault simulation**，不是内核 I/O errno；
+新版明确记录 `method=FAULT_SIMULATION/code=SIMULATED_EIO`。
+`--minimal --finalize-io CASE` 八项另在每个 3 次真求解的 DOM/FEM run 中实际操作
+文件系统：目录占位 EEXIST、只写 `/dev/full` ENOSPC、关闭文件/目录 fd 后 fsync
+EBADF、同字节不同 inode 替换、symlink ELOOP、终态回读后目录化 evidence 的 EISDIR。
+内核错误保留 code/syscall/path；inode 替换是实文件竞态负例，不冒称内核 errno。
+Python 同验实际进程码、失败报告、未知 inode/字节和未输出成功。只写本次外置 run；
+`/dev/full` 不创建、更换或改权限。
 
 ## 失败证据
 
@@ -82,7 +99,8 @@ favicon、主仓、infra、CAD/openopt、凭据、身份或权限；无生产与
 - `seat-ui/unittest-20261010T082132Z-299f3429/run-2026-10-10T08-21-32-411Z-5b0d4ad5/report.json`：
   FINAL、进程退出 0，与真实日志及 evidence manifest 摘要同验。
 - `seat-ui/finalization-20261010T082156Z-2835dee7/execution.json`：
-  六故障回归 PASS；各故障原 run 为 FAIL、进程及报告退出码均 2，各实际求解 3 次。
+  六项 fault simulation 回归 PASS；不是实际 I/O errno，各原 run 为 FAIL、
+  进程及报告退出码均 2，各实际求解 3 次。
 - `seat-ui/local-v1/acceptance.json`：2026-10-10T08:16:11Z，5/5 PASS、
   241 unittest；数值 15 算例、3 收敛组、152 拒绝例、170 检查 PASS。
 - `browser/ui-20261010-unique/run-2026-10-10T08-16-34-312Z-95128bab/report.json`：
@@ -94,9 +112,27 @@ favicon、主仓、infra、CAD/openopt、凭据、身份或权限；无生产与
 - 最终全本地 `seat-ui/local-v2/acceptance.json`：
   2026-10-10T08:26:03Z，5/5 PASS、242 unittest，数值仍为 15/3/152/170 PASS。
   新工具终结协议实跑在 `seat-ui/unittest-20261010T082451Z-c16798fb/`，
-  六类故障及退出码/失败报告同验在
+  六项 fault simulation 及退出码/失败报告同验在
   `seat-ui/finalization-20261010T082516Z-0c613cc5/execution.json`。
   不追认旧工具版本 run，旧报告保留以便复查。
+
+2026-10-10 持久化复核仅追加工具、测试、本文三件，不再修改 JS/CSS；
+点名 scan 也只收这三件。首次新 smoke 留存
+`seat-ui/durable-smoke-20261010T083735Z-9f0ec010/`：EEXIST 首因是终结器试图
+独占创建已存在的真实 run.log，修为保留原 inode 后持久追加，不删除旧失败。
+新版专项证据：
+
+- `seat-ui/filesystem-20261010T084008Z-a4274486/summary.json`：
+  8/8 实文件负例 PASS；各实际求解 3 次、进程与失败报告码均 2，
+  六个内核 errno 操作及两个 inode 竞态均保留，未知替换物不改。
+- `seat-ui/unittest-20261010T084206Z-7bd59a43/run-2026-10-10T08-42-06-706Z-03680c1c/report.json`：
+  新持久化协议下 43 检查、61 次真求解、28 PNG，FINAL/PASS/rc=0；
+  同根 execution.json 记录实际进程退出码与 stdout。
+- `seat-ui/finalization-20261010T084206Z-398dcb52/execution.json`：
+  六项 fault simulation PASS，明确不是实际 I/O errno，各进程/报告均 FAIL/rc=2。
+
+这次仅跑 UI 持久化专项及完整 UI 契约，不重复 FEM 全套或旧 browser；
+最终统一组合由主席执行，旧全本地/browser 不冒称新版工具组合证据。
 
 完整 browser 的固定外置边界不同，按用户裁决写 `browser/ui-20261010-unique/`，
 不改工具固定边界。`release_verdict=NOT_CERTIFIED` 保持；未获得真实触屏及

@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { constants, fsyncSync } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -72,7 +73,7 @@ function args(argv) {
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--minimal') options.minimal = true;
     else {
-      requireCheck(['--url', '--out', '--chrome', '--finalize-fault'].includes(argv[i]) && argv[i + 1],
+      requireCheck(['--url', '--out', '--chrome', '--finalize-fault', '--finalize-io'].includes(argv[i]) && argv[i + 1],
         `Invalid argument ${argv[i]}`);
       options[argv[i].slice(2)] = argv[++i];
     }
@@ -90,6 +91,13 @@ function args(argv) {
       'log-write', 'log-readback', 'evidence-write', 'evidence-readback',
       'final-write', 'final-readback',
     ].includes(options['finalize-fault']), 'Finalization fault requires a named minimal real run');
+  }
+  if (options['finalize-io']) {
+    requireCheck(options.minimal && !options['finalize-fault'] && [
+      'directory-evidence', 'dev-full-log', 'closed-fd-file-sync', 'closed-fd-directory-sync',
+      'same-bytes-provisional-replacement', 'same-bytes-final-replacement',
+      'symlink-final-replacement', 'late-evidence-directory',
+    ].includes(options['finalize-io']), 'Filesystem negative requires a named minimal real run');
   }
   return options;
 }
@@ -767,108 +775,241 @@ async function rereadArtifacts(run, report, browser) {
   return files;
 }
 
-async function finalize(run, report, browser, code, options, provisional) {
+const ioFailure = error => ({ message: error.message, code: error.code ?? null,
+  syscall: error.syscall ?? null, path: error.path ?? null, stack: error.stack });
+const inode = info => ({ dev: String(info.dev), ino: String(info.ino) });
+const sameInode = (info, expected) => String(info.dev) === expected.dev && String(info.ino) === expected.ino;
+
+class DurableFiles {
+  constructor(run, options) {
+    Object.assign(this, { run, options, owned: new Map(), directories: new Map(), operations: [] });
+  }
+  async directory(directory, closed = false) {
+    const handle = await fs.open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try {
+      const info = await handle.stat();
+      if (this.directories.has(directory)) {
+        requireCheck(sameInode(info, this.directories.get(directory)), 'Evidence directory inode changed');
+      } else this.directories.set(directory, inode(info));
+      if (closed) {
+        const fd = handle.fd;
+        await handle.close();
+        fsyncSync(fd);
+      }
+      await handle.sync();
+      this.operations.push({ operation: 'fsync-directory', path: directory, ...inode(info) });
+      requireCheck(sameInode(await fs.lstat(directory), inode(info)), 'Directory replaced during fsync');
+    } finally {
+      if (handle.fd !== -1) await handle.close();
+    }
+  }
+  async verify(file) {
+    const expected = this.owned.get(file);
+    requireCheck(expected, 'Refusing to read unowned evidence', { file });
+    const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const info = await handle.stat();
+      requireCheck(info.isFile() && sameInode(info, expected), 'Evidence inode changed; unknown file protected',
+        { file, expected: { dev: expected.dev, ino: expected.ino }, actual: inode(info) });
+      const bytes = await handle.readFile();
+      requireCheck(bytes.equals(expected.bytes), 'Exact evidence readback mismatch', { file });
+      const current = await fs.lstat(file);
+      requireCheck(current.isFile() && sameInode(current, expected), 'Evidence replaced during readback', { file });
+      this.operations.push({ operation: 'exact-readback', file, ...inode(current), sha256: sha(bytes) });
+    } finally { await handle.close(); }
+  }
+  async create(file, content, closed = false) {
+    const bytes = Buffer.from(content);
+    const handle = await fs.open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
+    const info = await handle.stat();
+    const owned = { ...inode(info), bytes: Buffer.alloc(0) };
+    this.owned.set(file, owned);
+    try {
+      let offset = 0;
+      while (offset < bytes.length) {
+        const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset, offset);
+        requireCheck(bytesWritten > 0, 'Zero byte evidence write', { file });
+        offset += bytesWritten;
+        owned.bytes = bytes.subarray(0, offset);
+      }
+      if (closed) {
+        const fd = handle.fd;
+        await handle.close();
+        fsyncSync(fd);
+      }
+      await handle.sync();
+      this.operations.push({ operation: 'fsync-file', file, ...inode(info), sha256: sha(bytes) });
+    } finally {
+      if (handle.fd !== -1) await handle.close();
+    }
+    await this.directory(path.dirname(file));
+    await this.verify(file);
+  }
+  async capture(file, digest) {
+    const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const info = await handle.stat(), bytes = await handle.readFile();
+      if (this.owned.has(file)) {
+        requireCheck(sameInode(info, this.owned.get(file)), 'Captured evidence inode changed', { file });
+      }
+      requireCheck(info.isFile() && bytes.length > 0 && sha(bytes) === digest,
+        'Actual artifact differs before durable capture', { file });
+      this.owned.set(file, { ...inode(info), bytes });
+      await handle.sync();
+      this.operations.push({ operation: 'fsync-file', file, ...inode(info), sha256: digest });
+    } finally { await handle.close(); }
+    await this.directory(path.dirname(file));
+    await this.verify(file);
+  }
+  async append(file, content) {
+    await this.verify(file);
+    const expected = this.owned.get(file);
+    const handle = await fs.open(file, constants.O_WRONLY | constants.O_NOFOLLOW);
+    try {
+      requireCheck(sameInode(await handle.stat(), expected), 'Log inode changed before append', { file });
+      const bytes = Buffer.from(content), initial = expected.bytes;
+      let offset = 0;
+      while (offset < bytes.length) {
+        const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset, initial.length + offset);
+        requireCheck(bytesWritten > 0, 'Zero byte log append');
+        offset += bytesWritten;
+        expected.bytes = Buffer.concat([initial, bytes.subarray(0, offset)]);
+      }
+      await handle.sync();
+      this.operations.push({ operation: 'fsync-file', file, dev: expected.dev, ino: expected.ino,
+        sha256: sha(expected.bytes) });
+    } finally { await handle.close(); }
+    await this.directory(path.dirname(file));
+    await this.verify(file);
+    return expected.bytes;
+  }
+  async revoke(file) {
+    await this.verify(file);
+    const saved = path.join(this.run, `revoked-owned-${randomUUID()}-${path.basename(file)}`);
+    // Move only our exact inode/bytes out of the consumable terminal name.
+    await fs.rename(file, saved);
+    const expected = this.owned.get(file);
+    this.owned.delete(file);
+    this.owned.set(saved, expected);
+    await this.directory(this.run);
+    await this.verify(saved);
+    return { original: file, preserved: saved, dev: expected.dev, ino: expected.ino,
+      sha256: sha(expected.bytes), consumable: false };
+  }
+}
+
+async function filesystemNegative(stage, run, store) {
+  const selected = store.options['finalize-io'];
+  if (stage === 'log-write' && selected === 'dev-full-log') {
+    const handle = await fs.open('/dev/full', constants.O_WRONLY | constants.O_NOFOLLOW);
+    try { await handle.write(Buffer.from('UI finalization real device write\n')); }
+    finally { await handle.close(); }
+    throw new Error('/dev/full unexpectedly accepted data');
+  }
+  if (stage === 'evidence-write' && selected === 'directory-evidence') {
+    await fs.mkdir(path.join(run, 'evidence.json'));
+  }
+  if ((stage === 'before-final' && selected === 'same-bytes-provisional-replacement') ||
+      (stage === 'after-final' && ['same-bytes-final-replacement', 'symlink-final-replacement'].includes(selected))) {
+    const file = path.join(run, stage === 'before-final' ? 'report.provisional.json' : 'report.json');
+    const original = await fs.lstat(file), bytes = await fs.readFile(file);
+    await fs.rename(file, path.join(run, `negative-original-${path.basename(file)}`));
+    if (selected === 'symlink-final-replacement') {
+      await fs.symlink('negative-original-report.json', file);
+    } else await fs.writeFile(file, bytes, { flag: 'wx' });
+    const replacement = await fs.lstat(file);
+    await store.create(path.join(run, 'unknown-replacement.json'), encode({
+      file, original: inode(original), replacement: inode(replacement),
+      sha256: sha(bytes), symlink: replacement.isSymbolicLink(), scope: 'FILESYSTEM_NEGATIVE_NOT_PRODUCT',
+    }));
+  }
+  if (stage === 'after-final' && selected === 'late-evidence-directory') {
+    const file = path.join(run, 'evidence.json');
+    await fs.rename(file, path.join(run, 'negative-original-evidence.json'));
+    await fs.mkdir(file);
+    await fs.readFile(file);
+  }
+}
+
+async function finalize(run, report, browser, code, options, store) {
   const filename = path.join(run, 'report.json');
-  const owned = new Set([sha(provisional)]);
-  let candidate;
+  let terminal = filename;
   const fault = stage => {
     if (options['finalize-fault'] === stage) {
-      throw Object.assign(new Error(`Injected finalization failure: ${stage}`), { code: 'EIO' });
+      throw Object.assign(new Error(`Fault simulation: ${stage}`), { code: 'SIMULATED_EIO' });
     }
   };
-  const exact = async (file, expected) => {
-    requireCheck((await fs.readFile(file)).equals(Buffer.from(expected)), 'Exact evidence readback mismatch',
-      { file: path.basename(file) });
-  };
   try {
-    await exact(filename, provisional);
+    await store.verify(path.join(run, 'report.provisional.json'));
     const files = browser ? await rereadArtifacts(run, report, browser) : [];
-    const log = `${new Date().toISOString()} CANDIDATE verdict=${report.verdict} rc=${code} checks=${report.checks.length}\n`;
+    for (const row of files) await store.capture(path.join(run, row.file), row.sha256);
+    const logFile = path.join(run, 'run.log');
+    await store.capture(logFile, sha(await fs.readFile(logFile)));
     fault('log-write');
-    await fs.appendFile(path.join(run, 'run.log'), log);
-    const logBytes = await fs.readFile(path.join(run, 'run.log'));
+    await filesystemNegative('log-write', run, store);
+    const logBytes = await store.append(logFile,
+      `${new Date().toISOString()} CANDIDATE verdict=${report.verdict} rc=${code} checks=${report.checks.length}\n`);
     fault('log-readback');
-    requireCheck(logBytes.toString('utf8').endsWith(log) && logBytes.length > log.length,
-      'Real execution log is empty or missing candidate termination');
+    await store.verify(path.join(run, 'run.log'));
     const evidence = encode({ state: 'COMPLETE', run_log_sha256: sha(logBytes), files,
       actual_solver_calls: browser?.calls.length ?? 0, sources: report.sources,
       collected_at: new Date().toISOString() });
     fault('evidence-write');
-    await fs.writeFile(path.join(run, 'evidence.json'), evidence, { flag: 'wx' });
+    await filesystemNegative('evidence-write', run, store);
+    await store.create(path.join(run, 'evidence.json'), evidence,
+      options['finalize-io'] === 'closed-fd-file-sync');
     fault('evidence-readback');
-    await exact(path.join(run, 'evidence.json'), evidence);
+    await store.verify(path.join(run, 'evidence.json'));
+    await store.directory(run, options['finalize-io'] === 'closed-fd-directory-sync');
+    await filesystemNegative('before-final', run, store);
+    for (const file of store.owned.keys()) await store.verify(file);
     report.state = 'FINAL';
     report.evidence_sha256 = sha(evidence);
     report.run_log_sha256 = sha(logBytes);
     report.exit_code = code;
-    const final = encode(report);
-    candidate = final;
+    report.durability = { state: 'FINAL_AFTER_FSYNC_AND_INODE_READBACK',
+      protocol: 'exclusive-create/no-follow/fsync-file/fsync-directory/exact-inode-and-bytes-readback',
+      operations: [...store.operations] };
     fault('final-write');
-    await fs.writeFile(path.join(run, 'report-candidate.json'), final, { flag: 'wx' });
-    await exact(path.join(run, 'report-candidate.json'), final);
-    // Only replace our exact provisional report; unknown bytes are never revoked.
-    await exact(filename, provisional);
-    await fs.rename(path.join(run, 'report-candidate.json'), filename);
-    owned.add(sha(final));
+    await store.create(filename, encode(report));
     fault('final-readback');
-    await exact(filename, final);
+    await store.verify(filename);
+    // Recheck dependencies after terminal readback: a late failure must revoke PASS.
+    await filesystemNegative('after-final', run, store);
+    for (const file of store.owned.keys()) await store.verify(file);
+    if (browser) await rereadArtifacts(run, report, browser);
     console.log(`UI_CONTRACT verdict=${report.verdict} rc=${code} checks=${report.checks.length} actual_solver_calls=${report.actual_solver_calls} report=${filename}`);
     return code;
   } catch (error) {
-    const failure = { message: error.message, code: error.code ?? null, stack: error.stack,
-      candidate_verdict: report.verdict, candidate_exit_code: code, stage: 'finalization' };
+    const failure = { ...ioFailure(error), candidate_verdict: report.verdict,
+      candidate_exit_code: code, stage: 'finalization',
+      method: options['finalize-fault'] ? 'FAULT_SIMULATION' : 'REAL_FILESYSTEM_OR_READBACK' };
     report.verdict = 'FAIL';
     report.state = 'FINALIZATION_FAILED';
     report.exit_code = 2;
     report.finalization_failure = failure;
     report.finished_at = new Date().toISOString();
-    try {
-      const log = `${report.finished_at} FINALIZATION_FAIL rc=2 ${failure.message}\n`;
-      await fs.appendFile(path.join(run, 'run.log'), log);
-      const bytes = await fs.readFile(path.join(run, 'run.log'));
-      requireCheck(bytes.toString('utf8').endsWith(log), 'Failure log readback mismatch');
-      report.run_log_sha256 = sha(bytes);
-    } catch (logError) {
-      report.failure_log_failure = { message: logError.message, stack: logError.stack };
+    report.durability = { state: 'FAILED_NOT_CONSUMABLE', operations: store.operations };
+    if (store.owned.has(filename)) {
+      try { report.revocation = await store.revoke(filename); }
+      catch (revokeError) { report.revocation_failure = ioFailure(revokeError); }
     }
-    if (candidate) {
-      try {
-        const candidatePath = path.join(run, 'report-candidate.json');
-        const bytes = await fs.readFile(candidatePath);
-        requireCheck(bytes.equals(Buffer.from(candidate)), 'Unknown candidate bytes; not removed');
-        await fs.unlink(candidatePath);
-      } catch (candidateError) {
-        if (candidateError.code !== 'ENOENT') {
-          report.candidate_revocation_failure = { message: candidateError.message, stack: candidateError.stack };
-        }
-      }
-    }
-    const revoked = encode(report);
     try {
-      const current = await fs.readFile(filename);
-      requireCheck(owned.has(sha(current)), 'Refusing to revoke unowned report bytes');
-      await fs.writeFile(path.join(run, 'report-revocation.json'), revoked, { flag: 'wx' });
-      await exact(path.join(run, 'report-revocation.json'), revoked);
-      requireCheck((await fs.readFile(filename)).equals(current), 'Report changed before exact revocation');
-      await fs.rename(path.join(run, 'report-revocation.json'), filename);
-      await exact(filename, revoked);
-    } catch (revokeError) {
-      report.revocation_failure = { message: revokeError.message, stack: revokeError.stack };
-      // If replacement is unavailable, remove only our exact candidate, never unknown artifacts.
-      try {
-        const current = await fs.readFile(filename);
-        if (owned.has(sha(current))) await fs.unlink(filename);
-      } catch (removeError) {
-        report.revocation_remove_failure = removeError.message;
+      terminal = path.join(run, 'finalization-failure.json');
+      await store.create(terminal, encode(report));
+      // Never overwrite an unknown report, even one with identical bytes.
+      if (!(await fs.lstat(filename).catch(error => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      }))) {
+        await store.create(filename, encode(report));
+        terminal = filename;
       }
-      try {
-        await fs.writeFile(path.join(run, 'finalization-failure.json'), encode(report), { flag: 'wx' });
-      } catch (recordError) {
-        console.error(`UI_CONTRACT failure-record unavailable: ${recordError.message}`);
-      }
+    } catch (recordError) {
+      console.error(`UI_CONTRACT failure-record unavailable: ${recordError.message}`);
     }
     console.error(`UI_CONTRACT FINALIZATION_FAIL rc=2 ${failure.message}`);
-    console.log(`UI_CONTRACT verdict=FAIL rc=2 checks=${report.checks.length} actual_solver_calls=${report.actual_solver_calls} report=${filename}`);
+    console.log(`UI_CONTRACT verdict=FAIL rc=2 checks=${report.checks.length} actual_solver_calls=${report.actual_solver_calls} report=${terminal}`);
     return 2;
   }
 }
@@ -878,7 +1019,7 @@ async function main() {
     mode: 'REAL_DOM_CDP_CONTRACT', verdict: 'RUNNING', release_verdict: 'NOT_CERTIFIED',
     manual_gates: { physical_touch: 'NOT_RUN', screen_reader: 'NOT_RUN' },
     checks: [], screenshots: [], console: [], sources: {} };
-  let run, browser, code = 2, options, provisional;
+  let run, browser, code = 2, options, store;
   try {
     options = args(process.argv.slice(2));
     const mount = await fs.realpath('/hf3fs-jd/data/tmp');
@@ -899,11 +1040,10 @@ async function main() {
     await fs.mkdir(path.join(run, 'downloads'));
     report.state = 'PROVISIONAL';
     report.exit_code = 2;
-    provisional = encode(report);
-    await fs.writeFile(path.join(run, 'report.json'), provisional, { flag: 'wx' });
-    requireCheck((await fs.readFile(path.join(run, 'report.json'))).equals(Buffer.from(provisional)),
-      'Initial provisional report readback failed');
-    await fs.writeFile(path.join(run, 'run.log'), `${report.started_at} START mode=PROVISIONAL\n`, { flag: 'wx' });
+    store = new DurableFiles(run, options);
+    await store.directory(run);
+    await store.create(path.join(run, 'report.provisional.json'), encode(report));
+    await store.create(path.join(run, 'run.log'), `${report.started_at} START mode=PROVISIONAL\n`);
     for (const source of SOURCES) report.sources[source] = sha(await fs.readFile(path.join(ROOT, source)));
     report.tool_sha256 = sha(await fs.readFile(fileURLToPath(import.meta.url)));
     report.target_url = options.url;
@@ -932,8 +1072,8 @@ async function main() {
     }
     report.finished_at = new Date().toISOString();
     report.exit_code = code;
-    if (run && provisional) {
-      code = await finalize(run, report, browser, code, options, provisional);
+    if (run && store) {
+      code = await finalize(run, report, browser, code, options, store);
     }
     process.exitCode = code;
   }
