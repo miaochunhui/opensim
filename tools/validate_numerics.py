@@ -514,8 +514,25 @@ def report_summary(report):
     require(isinstance(report, dict) and report.get("verdict") in ("PASS", "FAIL"),
             "invalid report")
     if report["verdict"] == "PASS":
+        require(report.get("state") == "COMPLETE" and
+                type(report.get("exit_code")) is int and report["exit_code"] == 0,
+                "PASS report is not a completed successful collection")
         require(bool(report.get("cases")) and bool(report.get("convergence"))
                 and bool(report.get("rejections")), "empty PASS report")
+        require(type(report.get("checks_executed")) is int and
+                report["checks_executed"] > 0, "PASS report has no executed checks")
+        for name in ("cases", "rejections"):
+            require(isinstance(report[name], list) and all(
+                isinstance(row, dict) and row.get("verdict") == "PASS"
+                for row in report[name]), f"PASS report contains unfinished/failed {name}")
+        require(isinstance(report["convergence"], dict) and all(
+            isinstance(row, dict) and row.get("verdict") == "PASS"
+            for row in report["convergence"].values()),
+            "PASS report contains unfinished/failed convergence")
+        require(all(isinstance(row.get("result_path"), str) and row["result_path"]
+                    and isinstance(row.get("result_sha256"), str) and
+                    len(row["result_sha256"]) == 64 for row in report["cases"]),
+                "PASS report lacks raw case binding")
     return (f"NUMERICS verdict={report['verdict']} collected_at={report['collected_at']} "
             f"cases={len(report['cases'])} convergence={len(report['convergence'])} "
             f"rejections={len(report['rejections'])} checks={report['checks_executed']} "
@@ -612,12 +629,19 @@ def read_report(path):
     data = Path(path).read_bytes()
     report = json.loads(data)
     json_bytes(report)
+    line = report_summary(report)
+    if report["verdict"] == "PASS":
+        require(isinstance(report.get("solver"), dict) and
+                isinstance(report["solver"].get("path"), str) and
+                isinstance(report["solver"].get("sha256"), str),
+                "PASS report lacks solver source binding")
+        assert_source_unchanged(report["solver"])
     for row in report["cases"]:
         if "result_path" in row:
             raw = Path(row["result_path"]).read_bytes()
             require(digest(raw) == row["result_sha256"],
                     f"raw artifact changed: {row['result_path']}")
-    print(report_summary(report))
+    print(line)
     for group, row in report["convergence"].items():
         print(f"CONVERGENCE group={group} grids={row['resolutions']} "
               f"l2={row['quadrature_relative_l2_error']['errors']} "

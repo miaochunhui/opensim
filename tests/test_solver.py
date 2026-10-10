@@ -6,6 +6,7 @@
 
 --selftest runs ONLY validator/oracle negative controls, not solver acceptance.
 Normal unittest discovery also works, using OPENSIM_SOLVER_ROOT or this tree.
+Use --select ExactTestName --out NEW_EXTERNAL_DIR for a source-bound focused run.
 """
 
 import argparse
@@ -17,6 +18,7 @@ from pathlib import Path
 import sys
 import unittest
 import uuid
+from unittest.mock import patch
 
 import numpy as np
 
@@ -29,6 +31,8 @@ numerics = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = numerics
 spec.loader.exec_module(numerics)
 SOLVER_ROOT = Path(os.environ.get("OPENSIM_SOLVER_ROOT", str(ROOT)))
+TEST_ARTIFACT_ROOT = numerics.external_path(Path(os.environ.get(
+    "OPENSIM_NUMERICS_TEST_ARTIFACT_ROOT", str(numerics.ARTIFACT_ROOT))))
 
 
 class OracleAndGateTests(unittest.TestCase):
@@ -114,7 +118,7 @@ class OracleAndGateTests(unittest.TestCase):
         report = {"verdict": "FAIL", "collected_at": numerics.timestamp(),
                   "cases": [], "convergence": {}, "rejections": [],
                   "checks_executed": 0, "exit_code": 2}
-        out = numerics.ARTIFACT_ROOT / f"gate-selftest-{uuid.uuid4().hex}.json"
+        out = TEST_ARTIFACT_ROOT / f"gate-selftest-{uuid.uuid4().hex}.json"
         writer = numerics.ReportWriter(out, report)
         writer.checkpoint(stage="initial")
         raw = {"metrics": {"flow_rate_m3_s": 1}}
@@ -137,7 +141,7 @@ class OracleAndGateTests(unittest.TestCase):
     def test_report_writer_rejects_existing_file(self):
         report = {"verdict": "FAIL", "collected_at": numerics.timestamp(),
                   "cases": [], "convergence": {}, "rejections": [], "checks_executed": 0}
-        out = numerics.ARTIFACT_ROOT / f"gate-existing-{uuid.uuid4().hex}.json"
+        out = TEST_ARTIFACT_ROOT / f"gate-existing-{uuid.uuid4().hex}.json"
         first = numerics.ReportWriter(out, copy.deepcopy(report))
         first.checkpoint()
         original = out.read_bytes()
@@ -147,9 +151,10 @@ class OracleAndGateTests(unittest.TestCase):
         self.assertEqual(out.read_bytes(), original)
 
     def test_missing_solver_report_preserves_initial_checkpoint(self):
-        out = numerics.ARTIFACT_ROOT / f"gate-missing-{uuid.uuid4().hex}.json"
+        out = TEST_ARTIFACT_ROOT / f"gate-missing-{uuid.uuid4().hex}.json"
         exit_code = numerics.main([
-            "--solver-root", str(ROOT / "nonexistent-solver-root"), "--out", str(out)])
+            "--solver-root", str(ROOT / "nonexistent-solver-root"), "--out", str(out),
+            "--log-dir", str(TEST_ARTIFACT_ROOT / "logs")])
         report = numerics.json.loads(out.read_bytes())
         self.assertEqual(exit_code, 2)
         self.assertEqual(report["verdict"], "FAIL")
@@ -157,6 +162,22 @@ class OracleAndGateTests(unittest.TestCase):
         self.assertEqual(report["cases"], [])
         self.assertEqual(report["failure"]["type"], "FileNotFoundError")
         self.assertEqual(len(list(Path(report["parts_dir"]).glob("checkpoint-*.json"))), 2)
+
+    def test_exact_loaded_bytes_and_source_drift(self):
+        directory = TEST_ARTIFACT_ROOT / f"source-binding-{uuid.uuid4().hex}"
+        directory.mkdir()
+        source = (ROOT / "solver.py").read_bytes()
+        path = directory / "solver.py"
+        with path.open("xb") as stream:
+            stream.write(source)
+        module, fingerprint = numerics.load_solver(directory)
+        self.assertEqual(fingerprint["sha256"], numerics.digest(source))
+        self.assertEqual(module.solve_case.__code__.co_filename, str(path.resolve()))
+        with path.open("ab") as stream:
+            stream.write(b"\n# Deliberate isolated source-drift negative control.\n")
+        with self.assertRaisesRegex(numerics.AcceptanceError, "source changed"):
+            numerics.assert_source_unchanged(fingerprint)
+        self.assertEqual(fingerprint["sha256"], numerics.digest(source))
 
 
 class SolverTests(unittest.TestCase):
@@ -244,6 +265,144 @@ class SolverTests(unittest.TestCase):
         with self.assertRaisesRegex(numerics.AcceptanceError, "nonzero wall"):
             numerics.audit_result(result, numerics.base_config())
 
+    def readback_fixture(self):
+        """Protocol-only fixture with a real raw solve, not convergence evidence."""
+        row = copy.deepcopy(self.validation.case("circle", 8))
+        out = TEST_ARTIFACT_ROOT / f"readback-{uuid.uuid4().hex}.json"
+        report = {
+            "verdict": "FAIL", "state": "RUNNING", "collected_at": numerics.timestamp(),
+            "cases": [], "convergence": {}, "rejections": [],
+            "checks_executed": 1, "exit_code": 2,
+            "solver": dict(self.validation.fingerprint),
+        }
+        writer = numerics.ReportWriter(out, report)
+        writer.checkpoint({row["name"]: row})
+        report.update(verdict="PASS", state="COMPLETE", exit_code=0,
+                      convergence={"circle": numerics.convergence([
+                          self.validation.case("circle", grid) for grid in numerics.GRIDS])},
+                      rejections=[{"verdict": "PASS"}])
+        writer.checkpoint(stage="fixture_complete")
+        return out, report
+
+    def test_complete_readback_fixture_is_valid(self):
+        out, _ = self.readback_fixture()
+        self.assertEqual(numerics.read_report(out), 0)
+
+    def test_pass_readback_rejects_running_and_failed_records(self):
+        for variant in ("running", "exit_code", "case", "rejection", "convergence", "raw"):
+            with self.subTest(variant=variant):
+                out, report = self.readback_fixture()
+                if variant == "running":
+                    report["state"] = "RUNNING"
+                elif variant == "exit_code":
+                    report["exit_code"] = 2
+                elif variant == "case":
+                    report["cases"][0]["verdict"] = "RUNNING"
+                elif variant == "rejection":
+                    report["rejections"][0]["verdict"] = "FAIL"
+                elif variant == "convergence":
+                    report["convergence"]["circle"]["verdict"] = "FAIL"
+                else:
+                    del report["cases"][0]["result_path"]
+                corrupted = out.with_name(f"corrupted-{out.name}")
+                with corrupted.open("xb") as stream:
+                    stream.write(numerics.json_bytes(report))
+                with self.assertRaises(numerics.AcceptanceError):
+                    numerics.read_report(corrupted)
+
+    def test_pass_readback_rejects_stale_solver_binding(self):
+        out, report = self.readback_fixture()
+        report["solver"]["sha256"] = "0" * 64
+        corrupted = out.with_name(f"corrupted-{out.name}")
+        with corrupted.open("xb") as stream:
+            stream.write(numerics.json_bytes(report))
+        with self.assertRaisesRegex(numerics.AcceptanceError, "source changed"):
+            numerics.read_report(corrupted)
+
+    def test_analytic_nodal_fill_is_not_a_fem_solution(self):
+        result = copy.deepcopy(self.validation.case("circle", 8)["result"])
+        result["fields"]["velocity_m_s"] = result["reference"]["velocity_m_s"][:]
+        result["metrics"]["relative_residual"] = 0.0
+        result["metrics"]["relative_l2_error"] = 0.0
+        with self.assertRaisesRegex(numerics.AcceptanceError, "weak-form residual"):
+            numerics.audit_result(result, numerics.base_config("circle", 8))
+
+    def test_length_and_section_units_scale_independently(self):
+        for group in ("circle", "rectangle"):
+            with self.subTest(group=group):
+                base = self.validation.case(group, 8)["result"]
+                config = base["config"]
+                longer = self.validation.solver.solve_case({
+                    **config, "length_mm": config["length_mm"] * 2})
+                numerics.audit_result(longer, longer["config"])
+                numerics.audit_scale(base, longer, 0.5)
+                larger = self.validation.solver.solve_case({
+                    **config, "width_mm": config["width_mm"] * 2,
+                    "height_mm": config["height_mm"] * 2})
+                measured = numerics.audit_result(larger, larger["config"])
+                np.testing.assert_allclose(larger["mesh"]["nodes_mm"],
+                                           2 * np.asarray(base["mesh"]["nodes_mm"]),
+                                           rtol=1e-13, atol=0)
+                np.testing.assert_allclose(larger["fields"]["velocity_m_s"],
+                                           4 * np.asarray(base["fields"]["velocity_m_s"]),
+                                           rtol=1e-11, atol=0)
+                self.assertAlmostEqual(measured["flow_rate_m3_s"] /
+                                       base["metrics"]["flow_rate_m3_s"], 16, places=10)
+                self.assertAlmostEqual(larger["metrics"]["reynolds"] /
+                                       base["metrics"]["reynolds"], 8, places=10)
+
+    def test_density_changes_mass_flow_and_re_not_velocity(self):
+        for group in ("circle", "rectangle"):
+            with self.subTest(group=group):
+                base = self.validation.case(group, 8)["result"]
+                config = {**base["config"], "density_kg_m3":
+                          base["config"]["density_kg_m3"] * 2}
+                changed = self.validation.solver.solve_case(config)
+                measured = numerics.audit_result(changed, config)
+                numerics.audit_scale(base, changed, 1.0)
+                self.assertAlmostEqual(changed["metrics"]["reynolds"] /
+                                       base["metrics"]["reynolds"], 2, places=11)
+                nodes = np.asarray(changed["mesh"]["nodes_mm"]) / 1000
+                cells = np.asarray(changed["mesh"]["triangles"])
+                points = nodes[cells]
+                first, second = points[:, 1] - points[:, 0], points[:, 2] - points[:, 0]
+                areas = (first[:, 0] * second[:, 1] - first[:, 1] * second[:, 0]) / 2
+                centroids = np.asarray(changed["fields"]["velocity_m_s"])[cells].mean(axis=1)
+                # P1 is exactly integrated at cell centroids; density is not PDE forcing.
+                mass_flow = math.fsum((areas * centroids * config["density_kg_m3"]).tolist())
+                self.assertAlmostEqual(mass_flow / (
+                    measured["flow_rate_m3_s"] * config["density_kg_m3"]), 1, places=13)
+                self.assertAlmostEqual(mass_flow / (
+                    base["metrics"]["flow_rate_m3_s"] * base["config"]["density_kg_m3"]),
+                    2, places=13)
+
+    def test_underestimated_reference_cannot_bypass_numerical_rejection(self):
+        solver = self.validation.solver
+        for group in ("circle", "rectangle"):
+            config = numerics.near_re_config(group, 32, 2010)
+            exact = numerics.reference_flow(config)
+            with self.subTest(group=group):
+                with patch.object(solver, "_reference_flow_rate", return_value=exact * 0.95):
+                    solver.validate_config(config)
+                    with self.assertRaisesRegex(solver.InputError, "Reynolds"):
+                        solver.solve_case(config)
+
+    def test_fem_field_does_not_use_reference_velocity_as_solution(self):
+        solver = self.validation.solver
+        for group in ("circle", "rectangle"):
+            base = self.validation.case(group, 8)["result"]
+            original = solver._reference_velocity
+            with self.subTest(group=group):
+                with patch.object(solver, "_reference_velocity",
+                                  side_effect=lambda *args: original(*args) * 1.1):
+                    changed = solver.solve_case(base["config"])
+                np.testing.assert_array_equal(changed["fields"]["velocity_m_s"],
+                                              base["fields"]["velocity_m_s"])
+                self.assertEqual(changed["metrics"]["flow_rate_m3_s"],
+                                 base["metrics"]["flow_rate_m3_s"])
+                with self.assertRaisesRegex(numerics.AcceptanceError, "reference disagrees"):
+                    numerics.audit_result(changed, base["config"])
+
 
 def numerical_test(group, grid):
     def test(self):
@@ -301,12 +460,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--solver-root", type=Path, default=SOLVER_ROOT)
     parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("--select", nargs="+", help="Exact unittest names/classes; partial scope")
+    parser.add_argument("--out", type=Path, help="New external launcher directory and receipts")
     args = parser.parse_args(argv)
     SOLVER_ROOT = args.solver_root
+    if args.out:
+        return logged_tests(args)
     loader = unittest.TestLoader()
-    suite = loader.loadTestsFromTestCase(OracleAndGateTests)
-    if not args.selftest:
-        suite.addTests(loader.loadTestsFromTestCase(SolverTests))
+    if args.select:
+        suite = loader.loadTestsFromNames(args.select, sys.modules[__name__])
+    else:
+        suite = loader.loadTestsFromTestCase(OracleAndGateTests)
+        if not args.selftest:
+            suite.addTests(loader.loadTestsFromTestCase(SolverTests))
     discovered = suite.countTestCases()
     numerics.require(discovered > 0, "empty unittest suite")
     result = unittest.TextTestRunner(verbosity=1).run(suite)
@@ -319,6 +485,63 @@ def main(argv=None):
         print(f"SOLVER_SOURCE sha256={SolverTests.validation.fingerprint['sha256']} "
               f"path={SolverTests.validation.fingerprint['path']}")
     return 0 if passed else 1
+
+
+def logged_tests(args):
+    """Reuse workbench execution and durable stores; run no other producers."""
+    import re
+
+    spec = importlib.util.spec_from_file_location(
+        "opensim_workbench_launcher", ROOT / "tools" / "workbench_acceptance.py")
+    workbench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(workbench)
+    output = workbench.new_output(args.out)
+    before = workbench.inventory(ROOT)
+    workbench.write_json(output / "source-before.json", before)
+    (output / "test-artifacts").mkdir()
+    os.environ["OPENSIM_NUMERICS_TEST_ARTIFACT_ROOT"] = str(output / "test-artifacts")
+    argv = [sys.executable, "-B", str(Path(__file__).resolve()),
+            "--solver-root", str(args.solver_root)]
+    if args.selftest:
+        argv.append("--selftest")
+    if args.select:
+        argv.extend(["--select", *args.select])
+    start = {"owner": "S5", "state": "RUNNING", "argv": argv, "started_at": workbench.now(),
+             "scope": "ISOLATED_NUMERICS_NO_PRODUCTION_NO_NESTED_NO_FLASH"}
+    workbench.write_json(output / "START.json", start)
+    step = workbench.execute(argv, ROOT, output, "solver-tests")
+    workbench.write_json(output / "execution.json", step)
+    after = workbench.inventory(ROOT)
+    workbench.write_json(output / "source-after.json", after)
+    text = Path(step["stdout"]["path"]).read_text(encoding="utf-8")
+    markers = re.findall(
+        r"(?:SOLVER_UNITTEST|VALIDATOR_SELFTEST) verdict=(PASS|FAIL) .*?"
+        r"discovered=(\d+) tests_run=(\d+) failures=(\d+) errors=(\d+) skipped=(\d+)", text)
+    counts, verdict = None, None
+    if len(markers) == 1:
+        verdict, *numbers = markers[0]
+        counts = dict(zip(("discovered", "tests_run", "failures", "errors", "skipped"),
+                          map(int, numbers)))
+    passed = (step["rc"] == 0 and before == after and counts is not None and
+              verdict == "PASS" and counts["discovered"] == counts["tests_run"] > 0 and
+              counts["failures"] == counts["errors"] == counts["skipped"] == 0)
+    summary = {"schema": "opensim-s5-numerics-tests-v1",
+               "verdict": "PASS" if passed else "FAIL", "state": "COMPLETE",
+               "scope": ("SELECTED_NUMERICS_TESTS" if args.select else
+                         "VALIDATOR_SELFTEST" if args.selftest else "SOLVER_TEST_SUITE"),
+               "collected_at": workbench.now(), "launcher_rc": step["rc"],
+               "source_unchanged": before == after, "counts": counts,
+               "execution": step, "selected": args.select,
+               "solver": text.split("SOLVER_SOURCE ")[-1].strip() if "SOLVER_SOURCE " in text else None}
+    if not passed:
+        summary["first_cause_log"] = step["stderr"]
+    workbench.write_json(output / "summary.json", summary)
+    line = (f"S5_NUMERICS_TESTS verdict={summary['verdict']} launcher_rc={step['rc']} "
+            f"counts={counts} source_unchanged={before == after} collected_at={summary['collected_at']}")
+    workbench.DurableStore().create(output / "progress.log", (line + "\n").encode("ascii"))
+    print(line)
+    print(f"SUMMARY path={output / 'summary.json'}")
+    return 0 if passed else (step["rc"] or 1)
 
 
 if __name__ == "__main__":
