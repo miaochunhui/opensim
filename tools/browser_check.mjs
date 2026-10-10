@@ -403,7 +403,7 @@ function parseArgs(argv) {
     if (['--selftest', '--help', '--no-sandbox', '--probe-input', '--probe-screenshot'].includes(argument)) {
       options[argument.slice(2).replaceAll('-', '_')] = true;
     } else {
-      requireCheck(['--url', '--out', '--chrome', '--timeout-ms', '--finalize-fixture'].includes(argument),
+      requireCheck(['--url', '--out', '--chrome', '--timeout-ms', '--finalize-fixture', '--view-fixture'].includes(argument),
         'CLI', `Unknown argument ${argument}`);
       requireCheck(argv[index + 1] && !argv[index + 1].startsWith('--'), 'CLI', `Missing ${argument}`);
       options[argument === '--timeout-ms' ? 'timeout' : argument.slice(2)] = argv[++index];
@@ -423,6 +423,9 @@ function parseArgs(argv) {
   requireCheck(!options["finalize-fixture"] || options.selftest &&
     ["log-directory", "log-enospc", "log-fsync", "post-publish-fsync", "same-inode", "replaced-directory"].includes(options["finalize-fixture"]),
   "CLI", "Finalization fixtures require --selftest and a known real filesystem fault");
+  requireCheck(!options["view-fixture"] || options.selftest &&
+    ["wrong-selection", "stuck-toggle", "capture-change"].includes(options["view-fixture"]),
+  "CLI", "View fixtures require --selftest and a known DOM fault");
   requireCheck(!(options.selftest && options.probe_input), 'CLI', '--selftest and --probe-input are exclusive');
   requireCheck([options.selftest, options.probe_input, options.probe_screenshot].filter(Boolean).length <= 1,
     'CLI', 'Selftest and narrow probes are mutually exclusive');
@@ -932,8 +935,48 @@ class Harness {
       if (key !== 'geometry') await this.input(`#${key}`, value, keyboard);
     }
   }
-  async screenshot(name) {
+  async viewState() {
+    const state = await this.evaluate(() => Object.fromEntries(["field", "mesh"].map(view => {
+      const controls = document.querySelectorAll(`#view-${view}`);
+      return [view, { count: controls.length, pressed: controls[0]?.getAttribute("aria-pressed") ?? null }];
+    })));
+    if (Object.values(state).every(control => control.count === 0)) return { selected_view: "unavailable" };
+    requireCheck(Object.values(state).every(control => control.count === 1 &&
+      ["true", "false"].includes(control.pressed)), "BROWSER-VIEW", "Missing, duplicate or invalid view controls", { state });
+    const field = state.field.pressed === "true", mesh = state.mesh.pressed === "true";
+    return { field, mesh, selected_view: field ? (mesh ? "field+mesh" : "field") : (mesh ? "mesh" : "none") };
+  }
+  async confirmView(expected = null) {
+    const state = await this.viewState();
+    requireCheck(expected === null || ["field", "mesh"].includes(expected),
+      "BROWSER-VIEW", "Unknown expected view", { expected });
+    requireCheck(expected === null || state.selected_view === expected,
+      "BROWSER-VIEW", "Actual selected view does not match capture expectation", { expected, ...state });
+    return state;
+  }
+  async selectView(expected, keyboard = false) {
+    requireCheck(["field", "mesh"].includes(expected), "BROWSER-VIEW", "Unknown requested view", { expected });
+    let state = await this.viewState();
+    requireCheck(state.selected_view !== "unavailable", "BROWSER-VIEW", "Cannot select missing view controls", { expected });
+    // Independent toggles: clicking an already enabled control would turn it off.
+    for (const view of ["field", "mesh"]) {
+      if (state[view] === (view === expected)) continue;
+      await this.activate(`#view-${view}`, keyboard);
+      await this.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      state = await this.viewState();
+      requireCheck(state[view] === (view === expected), "BROWSER-VIEW",
+        "Real activation did not set requested view toggle", { expected, activated: view, ...state });
+    }
+    return this.confirmView(expected);
+  }
+  async screenshot(name, expectedView = null) {
     await this.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const view = await this.confirmView(expectedView);
+    const confirmCaptureView = async () => {
+      const actual = await this.confirmView(expectedView);
+      requireCheck(actual.selected_view === view.selected_view, "BROWSER-VIEW",
+        "Selected view changed during screenshot capture", { before: view, after: actual, capture: name });
+    };
     const metrics = await this.send('Page.getLayoutMetrics');
     const content = metrics.cssContentSize ?? metrics.contentSize;
     const original = await this.evaluate(() => ({ dpr: devicePixelRatio, x: scrollX, y: scrollY,
@@ -952,13 +995,16 @@ class Harness {
           clip.x + clip.width <= position.x + position.width + 1 &&
           clip.y + clip.height <= position.y + position.height + 1,
         'SCREENSHOT-COVERAGE', 'Planned crop is not visible at the actual scroll position', { clip, position });
+        await confirmCaptureView();
         const response = await this.send('Page.captureScreenshot', {
           format: 'png', captureBeyondViewport: false, fromSurface: true, clip,
         });
+        await confirmCaptureView();
         const buffer = Buffer.from(response.data, 'base64');
         const file = plan.tiles.length === 1 ? `${name}.png` :
           `${name}-tile-${String(index + 1).padStart(3, '0')}.png`;
-        const artifact = { file, capture: name, coordinate: this.coordinate, clip, scroll: position, ...validatePng(buffer) };
+        const artifact = { file, capture: name, coordinate: this.coordinate, selected_view: view.selected_view,
+          clip, scroll: position, ...validatePng(buffer) };
         validateCoverage({ ...plan, tiles: [clip], width: clip.width, height: clip.height }, [artifact]);
         await fs.writeFile(path.join(this.run, file), buffer, { flag: 'wx' });
         const reread = await fs.readFile(path.join(this.run, file));
@@ -972,19 +1018,23 @@ class Harness {
         await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       }, original);
     }
+    await confirmCaptureView();
     const after = await this.send('Page.getLayoutMetrics');
     requireCheck(JSON.stringify(after.cssContentSize ?? after.contentSize) === JSON.stringify(content),
       'SCREENSHOT-COVERAGE', 'Page geometry changed while capturing full coverage',
       { before: content, after: after.cssContentSize ?? after.contentSize });
     const coverage = validateCoverage(plan, artifacts);
-    const manifest = { name, coordinate: this.coordinate, ...plan, artifacts, coverage };
+    const manifest = { name, coordinate: this.coordinate, selected_view: view.selected_view, ...plan, artifacts, coverage };
     const manifestFile = `${name}-capture.json`;
     await fs.writeFile(path.join(this.run, manifestFile), json(manifest), { flag: 'wx' });
     const reread = JSON.parse(await fs.readFile(path.join(this.run, manifestFile), 'utf8'));
     validateCoverage(reread, reread.artifacts);
+    requireCheck(reread.selected_view === view.selected_view &&
+      reread.artifacts.every(artifact => artifact.selected_view === view.selected_view),
+    "BROWSER-VIEW", "Capture manifest selected view read-back mismatch", { manifestFile });
     this.report.captures ??= [];
     this.report.captures.push({ name, manifest: manifestFile, width: plan.width, height: plan.height,
-      dpr: plan.dpr, ...coverage });
+      dpr: plan.dpr, selected_view: view.selected_view, ...coverage });
     return plan.tiles.length === 1 ? artifacts[0] : { manifest: manifestFile, ...coverage };
   }
   async canvas() {
@@ -1081,14 +1131,15 @@ class Harness {
     await this.check('DOM-CONTRACT', `${name}: configure default case`, () => this.config(DEFAULT_CONFIG, keyboard));
     const baseline = await this.check('FEM-METRICS', `${name}: real solve and all FEM metrics`,
       () => this.solve(DEFAULT_CONFIG, keyboard));
+    await this.selectView("field", keyboard);
     const field = await this.canvas();
-    await this.activate('#view-mesh', keyboard);
+    await this.selectView("mesh", keyboard);
     const mesh = await this.waitFor('Mesh redraw', async () => {
       const rendered = await this.canvas();
       return rendered.pixel_hash !== field.pixel_hash ? rendered : false;
     });
-    await this.screenshot(`${name}-mesh`);
-    await this.activate('#view-field', keyboard);
+    await this.screenshot(`${name}-mesh`, "mesh");
+    await this.selectView("field", keyboard);
     await this.waitFor('Field redraw', async () => (await this.canvas()).pixel_hash !== mesh.pixel_hash);
     const changed = { ...DEFAULT_CONFIG, pressure_pa: 2 };
     await this.input('#pressure_pa', 2, keyboard);
@@ -1145,7 +1196,8 @@ class Harness {
       return { actual, metrics, response_artifact: completed.response.artifact,
         state: completed.state };
     });
-    await this.screenshot(`${name}-field`);
+    await this.selectView("field", keyboard);
+    await this.screenshot(`${name}-field`, "field");
     return { baseline: baseline.metrics, doubled: doubled.metrics, field, mesh };
   }
   async layout(name) {
@@ -1414,9 +1466,9 @@ class Harness {
     await this.navigate();
     await this.textStress();
     const solved = await this.solve(DEFAULT_CONFIG);
-    await this.activate('#view-mesh');
+    await this.selectView("mesh");
     await this.check('SCREENSHOT-COVERAGE', '200% text full-resolution complete-page screenshot',
-      () => this.screenshot('probe-text-200-mesh'));
+      () => this.screenshot('probe-text-200-mesh', "mesh"));
     this.report.probe_metrics = solved.metrics;
     this.report.probe_scope = 'Capture only; text layout and complete main flow remain independent acceptance gates';
   }
@@ -1576,11 +1628,17 @@ button,input,select{margin:8px}canvas{max-width:100%;height:auto}*:focus-visible
 <label for="probe">Probe</label><input id="probe" type="number" value="1">
 <label for="geometry">Choice</label><select id="geometry"><option value="circle">circle</option><option value="rectangle">rectangle</option></select>
 <button id="draw">Render</button><button id="save">Export fixture</button>
+<button id="view-field" aria-pressed="true">Fixture field</button>
+<button id="view-mesh" aria-pressed="false">Fixture mesh</button>
 <p id="error" role="alert" tabindex="-1"></p><p id="state" role="status" aria-live="polite">Fixture loaded</p>
 <canvas id="flow-canvas" width="200" height="120" aria-label="Fixture drawing"></canvas></main>
 <script>
 const canvas=document.getElementById('flow-canvas'),ctx=canvas.getContext('2d');
 let color=0;
+for(const view of ["field","mesh"]){
+ const button=document.getElementById("view-"+view);
+ button.addEventListener("click",()=>button.setAttribute("aria-pressed",String(button.getAttribute("aria-pressed")!=="true")));
+}
 document.getElementById('draw').addEventListener('click',()=>{
  const input=document.getElementById('probe'),error=document.getElementById('error');
  if(Number(input.value)<=0){error.textContent='Probe must be positive; enter 1 to recover';input.setAttribute('aria-invalid','true');error.focus();return}
@@ -1644,6 +1702,51 @@ document.getElementById('save').addEventListener('click',()=>{
       requireCheck(await harness.evaluate(() => innerWidth === 1064 &&
         matchMedia('(prefers-reduced-motion: reduce)').matches), 'HARNESS-MEDIA', 'Emulation did not take effect');
       await harness.screenshot('selftest-resize');
+    });
+    await harness.check("HARNESS-VIEW", "real view activation, capture binding and wrong-selection rejection", async () => {
+      const fault = harness.options["view-fixture"];
+      const initial = await harness.confirmView("field");
+      if (fault === "stuck-toggle") await harness.evaluate(() => {
+        document.querySelector("#view-field").addEventListener("click", event => event.stopImmediatePropagation(),
+          { capture: true, once: true });
+      });
+      const mesh = await harness.selectView("mesh");
+      if (fault === "wrong-selection") await harness.screenshot("selftest-wrong-field", "field");
+      await harness.screenshot("selftest-mesh", "mesh");
+      const field = await harness.selectView("field", true);
+      if (fault === "capture-change") await harness.evaluate(() => {
+        window.addEventListener("scroll", () => {
+          document.querySelector("#view-field").setAttribute("aria-pressed", "false");
+          document.querySelector("#view-mesh").setAttribute("aria-pressed", "true");
+        }, { once: true });
+        const spacer = document.createElement("div");
+        spacer.style.height = "1600px";
+        document.body.append(spacer);
+      });
+      await harness.screenshot("selftest-field", "field");
+      const captures = harness.report.captures.length, screenshots = harness.report.screenshots.length;
+      await assert.rejects(() => harness.screenshot("selftest-wrong-mesh", "mesh"),
+        error => error.rule === "BROWSER-VIEW" && error.detail.selected_view === "field");
+      assert.equal(harness.report.captures.length, captures);
+      assert.equal(harness.report.screenshots.length, screenshots);
+      assert(!(await fs.readdir(harness.run)).some(file => file.startsWith("selftest-wrong-")));
+      const again = await harness.selectView("field", true);
+      assert.equal(again.selected_view, "field");
+      for (const [pressed, selected] of [[["true", "true"], "field+mesh"], [["false", "false"], "none"],
+        [["invalid", "false"], null]]) {
+        await harness.evaluate(values => ["field", "mesh"].forEach((view, index) =>
+          document.querySelector(`#view-${view}`).setAttribute("aria-pressed", values[index])), pressed);
+        await assert.rejects(() => harness.confirmView("field"), error => error.rule === "BROWSER-VIEW" &&
+          (selected === null || error.detail.selected_view === selected));
+      }
+      await assert.rejects(() => harness.selectView("field"), error => error.rule === "BROWSER-VIEW");
+      // Restore only the deliberately invalid DOM fixture; production never repairs attributes.
+      await harness.evaluate(() => {
+        document.querySelector("#view-field").setAttribute("aria-pressed", "true");
+        document.querySelector("#view-mesh").setAttribute("aria-pressed", "false");
+      });
+      return { initial, mesh, field, wrong_selection_rejected: true, no_wrong_capture_written: true,
+        repeated_selection_preserved: true, both_none_invalid_rejected: true, scope: "REAL_DOM_FIXTURE_NOT_PRODUCT" };
     });
     await harness.check('HARNESS-NEGATIVE', 'empty screenshot/result and nonfinite metrics are rejected', async () => {
       assert.throws(() => validatePng(Buffer.alloc(0)));

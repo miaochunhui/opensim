@@ -16,17 +16,21 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/browser")
 FAULTS = ("log-directory", "log-enospc", "log-fsync", "post-publish-fsync",
           "same-inode", "replaced-directory")
+VIEW_FAULTS = ("wrong-selection", "stuck-toggle", "capture-change")
 
 
 class BrowserFinalizationTests(unittest.TestCase):
     case_summaries = []
 
-    def run_case(self, fault=None, prior=False):
+    def run_case(self, fault=None, prior=False, view_fault=None):
         folder = OUTPUT / f"finalize-test-{time.time_ns()}"
         folder.mkdir(parents=True)
         command = ["node", str(ROOT / "tools/browser_check.mjs"), "--selftest", "--out", str(folder)]
+        before_sha256 = hashlib.sha256((ROOT / "tools/browser_check.mjs").read_bytes()).hexdigest()
         if fault:
             command.extend(["--finalize-fixture", fault])
+        if view_fault:
+            command.extend(["--view-fixture", view_fault])
         if prior:
             command.extend(["--chrome", str(folder / "missing-chromium")])
         with (folder / "stdout.log").open("w") as out, (folder / "stderr.log").open("w") as err:
@@ -39,25 +43,40 @@ class BrowserFinalizationTests(unittest.TestCase):
         summary = {"scope": "REAL_BROWSER_SELFTEST_NOT_PRODUCT", "command": command,
                    "report": str(report_path), "exit_code": process.returncode,
                    "tool_sha256": hashlib.sha256((ROOT / "tools/browser_check.mjs").read_bytes()).hexdigest(),
-                   "fault": fault, "started_browser": bool(report.get("browser")),
+                   "tool_sha256_before": before_sha256,
+                   "fault": fault, "view_fault": view_fault, "started_browser": bool(report.get("browser")),
                    "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
                    "checks": len(report["checks"]), "screenshots": len(report["screenshots"]),
                    "browser": report.get("browser"),
                    "verdict": "RUNNING"}
         try:
+            self.assertEqual(summary["tool_sha256"], before_sha256)
+            self.assertEqual(report["tool_sha256"], before_sha256)
             self.assertEqual(report["schema_version"], 1)
             self.assertEqual(report["mode"], "HARNESS_SELFTEST_NOT_OPENSIM")
             self.assertEqual(report["release_verdict"], "NOT_CERTIFIED")
             provisional = json.loads((run / "report.provisional.json").read_text())
             self.assertEqual(provisional["verdict"], "PROVISIONAL_NOT_FINAL")
             self.assertEqual(provisional["exit_code"], 2)
-            if not prior:
-                self.assertEqual(len(report["checks"]), 10)
+            if not prior and not view_fault:
+                self.assertEqual(len(report["checks"]), 11)
                 self.assertTrue(all(row["status"] == "PASS" for row in report["checks"]))
                 self.assertGreater(len(report["screenshots"]), 0)
                 for shot in report["screenshots"]:
                     self.assertEqual(hashlib.sha256((run / shot["file"]).read_bytes()).hexdigest(), shot["sha256"])
                 self.assertTrue(report.get("fixture_url", "").startswith("http://127.0.0.1:"))
+                view_check = next(row for row in report["checks"] if row["rule"] == "HARNESS-VIEW")
+                self.assertTrue(view_check["detail"]["wrong_selection_rejected"])
+                self.assertTrue(view_check["detail"]["no_wrong_capture_written"])
+                self.assertTrue(view_check["detail"]["repeated_selection_preserved"])
+                self.assertFalse(list(run.glob("selftest-wrong-*")))
+                for name, view in (("selftest-field", "field"), ("selftest-mesh", "mesh")):
+                    capture = next(row for row in report["captures"] if row["name"] == name)
+                    manifest = json.loads((run / capture["manifest"]).read_text())
+                    self.assertEqual(capture["selected_view"], view)
+                    self.assertEqual(manifest["selected_view"], view)
+                    self.assertTrue(manifest["artifacts"])
+                    self.assertTrue(all(row["selected_view"] == view for row in manifest["artifacts"]))
             if fault:
                 self.assertEqual(process.returncode, 2)
                 self.assertEqual(report["exit_code"], 2)
@@ -91,12 +110,28 @@ class BrowserFinalizationTests(unittest.TestCase):
                 summary["revocations"] = report["durability"]["revocations"]
                 summary["first_failure"] = report["first_failure"]
             else:
-                self.assertEqual(process.returncode, 0)
-                self.assertEqual(report["verdict"], "SELFTEST_PASS")
+                self.assertEqual(process.returncode, 1 if view_fault else 0)
+                self.assertEqual(report["exit_code"], process.returncode)
+                self.assertEqual(report["verdict"], "FAIL" if view_fault else "SELFTEST_PASS")
                 self.assertEqual(report["durability"]["state"], "FINAL_AFTER_DURABLE_LOG")
+                self.assertFalse((run / "report.failure.json").exists())
                 log = (run / "run.log").read_bytes()
                 self.assertEqual(hashlib.sha256(log).hexdigest(), report["durability"]["log"]["sha256"])
                 self.assertEqual(len(log), report["durability"]["log"]["bytes"])
+                if view_fault:
+                    self.assertEqual(report["failure"]["rule"], "BROWSER-VIEW")
+                    failed = [row for row in report["checks"] if row["status"] == "FAIL"]
+                    self.assertEqual(len(failed), 1)
+                    self.assertEqual(failed[0]["rule"], "BROWSER-VIEW")
+                    self.assertEqual(failed[0]["detail"], report["failure"]["detail"])
+                    self.assertEqual(report["failure"]["detail"]["expected"], "field" if view_fault != "stuck-toggle" else "mesh")
+                    self.assertIn("BROWSER_CHECK FAIL rule=BROWSER-VIEW", (folder / "stderr.log").read_text())
+                    self.assertFalse(list(run.glob("selftest-wrong-*")))
+                    if view_fault == "capture-change":
+                        self.assertFalse((run / "selftest-field-capture.json").exists())
+                        partial = list(run.glob("selftest-field-tile-*.png"))
+                        self.assertTrue(partial, "Earlier valid tiles must remain after a later wrong view")
+                    summary["selection_failure"] = report["failure"]
             summary["verdict"] = "PASS"
         except BaseException as error:
             summary["verdict"] = "FAIL"
@@ -105,7 +140,7 @@ class BrowserFinalizationTests(unittest.TestCase):
         finally:
             (folder / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
             self.case_summaries.append({"summary": str(folder / "summary.json"),
-                                        "verdict": summary["verdict"], "fault": fault})
+                                        "verdict": summary["verdict"], "fault": fault, "view_fault": view_fault})
             print("BROWSER_FINALIZE_TEST verdict={} fault={} summary={}".format(summary["verdict"], fault, folder / "summary.json"), flush=True)
 
     def test_real_chromium_selftest_positive(self):
@@ -118,6 +153,11 @@ class BrowserFinalizationTests(unittest.TestCase):
 
     def test_browser_first_cause_survives_later_io_fault(self):
         self.run_case("post-publish-fsync", prior=True)
+
+    def test_real_dom_wrong_view_fails_loudly(self):
+        for view_fault in VIEW_FAULTS:
+            with self.subTest(view_fault=view_fault):
+                self.run_case(view_fault=view_fault)
 
 
 if __name__ == "__main__":

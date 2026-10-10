@@ -3,9 +3,10 @@
 ## Scope
 
 `tools/browser_check.mjs` keeps `schema_version=1`, existing `mode` values,
-acceptance checks and `release_verdict=NOT_CERTIFIED`. This change concerns
-durable evidence finalization only. It does not complete G3/G6, certify a
-product build, or substitute AX inspection for desktop/mobile screen readers.
+acceptance checks and `release_verdict=NOT_CERTIFIED`. The protocol concerns
+durable evidence finalization; the focused view-binding addition below prevents
+mislabelled field/mesh captures. Neither completes G3/G6, certifies a
+product build, or substitutes AX inspection for desktop/mobile screen readers.
 The separate audit tool and its PARTIAL coverage remain unchanged.
 
 ## Protocol
@@ -67,15 +68,18 @@ From the audit worktree:
 sudo -n -u infra python3 -B tests/test_browser_finalize.py
 ```
 
-Three unittest methods execute eight subprocess cases: one actual Chromium
-selftest positive; six actual filesystem fault cases (`log-directory`:
+Four unittest methods execute eleven subprocess cases: one actual Chromium
+selftest positive; three actual DOM view-fault cases; six actual filesystem
+fault cases (`log-directory`:
 EISDIR, `/dev/full` log write: ENOSPC, `/dev/full` log/post-publication fsync:
 EINVAL, same-inode same-size byte rewrite, unrelated replacement directory);
 and a missing-Chromium ENOENT followed by real fsync failure to verify first
 cause retention. The fsync device cases exercise real kernel I/O errors at
 their named finalization stages, not a claim of storage-device failure on 3FS.
-The selftest still performs its existing ten checks, captures real PNGs and
-downloads a fixture; its HTML is only a harness fixture, not product output.
+The successful selftest performs its existing ten checks plus one view-binding
+check, captures real PNGs and downloads a fixture; its HTML is only a harness
+fixture, not product output. View faults must return actual rc=1 and a durable
+FAIL report, not persistence rc=2, skip or expectedFailure.
 
 Every invocation owns an ephemeral loopback fixture server and Chromium.
 The test retains stdout/stderr, provisional/final/failure artifacts and
@@ -85,6 +89,39 @@ per-case summaries under
 Negative fixtures are accepted only with `--selftest`, never a target URL.
 No installation, production mutation, old full-product run or FEM run is
 part of this focused validation. Final candidate integration belongs to the chair.
+
+## Selected View Binding
+
+The product exposes independent `#view-field` and `#view-mesh` toggles, not
+mutually exclusive tabs. `selectView` reads their actual `aria-pressed` values,
+uses existing real pointer/touch or keyboard activation only when a toggle
+differs from its desired value, and confirms the result after rendering frames.
+It never assigns product DOM state. Re-selecting an already correct view must
+not switch it off. Core flow selects field before its baseline canvas, selects mesh
+before mesh capture, and selects field again after reset before field capture.
+The named mesh screenshot probe follows the same contract.
+
+`screenshot(name, expectedView)` checks the actual state before capture, before
+and after each real PNG capture, and after scroll restoration. Explicit field
+requires field=true and mesh=false; mesh requires the inverse. Missing,
+duplicate or invalid controls and unexpected selection throw `BROWSER-VIEW`
+with expected/actual state. No differently named capture is substituted.
+Every capture manifest, report capture entry and PNG entry includes actual
+`selected_view` (`field`, `mesh`, `field+mesh`, `none`, or `unavailable` when both
+controls are absent on a diagnostic/non-product page). Explicit view captures
+never accept `unavailable`. Generic diagnostics record state without claiming
+field/mesh. View changes fail even for generic captures.
+
+The real DOM selftest proves touch selection of mesh, keyboard selection of
+field, repeated-selection stability, rejection of wrong/both/none/invalid
+states and no artifact creation for an initial wrong view. Three subprocess
+faults (`--view-fixture wrong-selection`, `stuck-toggle`, `capture-change`)
+prove rc=1, first-cause state and no misleading completed manifest. For a
+later segment failure, earlier valid PNGs remain as partial evidence and the
+run is FAIL. These samples check DOM state binding, not the physical meaning
+of fixture pixels, human device use, or product FEM correctness. State sampling
+is not atomic against hostile page code toggling away and back during capture;
+no malicious same-UID or page-code sandbox claim is made.
 
 ## Validation Handoff (2026-10-10)
 
@@ -117,3 +154,31 @@ bytes remain; `finalize-test-1791622231020243125/summary.json` verifies only
 exact-owned report revocation after actual EINVAL fsync. The suite links every
 case report. Syntax and diff-whitespace checks passed; no full-product or FEM
 acceptance was run. The chair must test the final integrated candidate.
+
+## Focused P3 Validation (2026-10-10)
+
+`finalize-suite-1791625719834987312/summary.json` and `unittest.log` were
+read after actual rc=0: PASS, four unittest methods, eleven subprocess cases,
+zero failures/errors, 77.600 seconds. Tool SHA256 before/after every case and
+in the actual reports matches
+`d2448e302347da7b7eddb89105c46c78496b48f2899ab2a9e43a47f0de174862`.
+The seven existing persistence/first-cause negatives still return rc=2.
+Positive `finalize-test-1791625766902867909` returns rc=0, eleven checks,
+five hashed PNGs; field/mesh manifests and PNG entries have matching actual
+`selected_view`. Its final complete log is 1,334 bytes with SHA256
+`4a5b2e1df08c6fee9b507d2f178a32660a0f86c2a8ad406175d580a54ba04ba8`.
+
+All three new DOM faults return actual rc=1 with durable FAIL and
+`BROWSER-VIEW` as the original failure: `finalize-test-1791625774750171951`
+(wrong-selection), `finalize-test-1791625782154252794` (stuck-toggle),
+`finalize-test-1791625789386789949` (capture-change). The first writes no
+wrong-view capture; the last preserves earlier valid PNGs but creates no
+completed field manifest. Test assertions verify complete terminal log hashes
+and failure details. No original red evidence was overwritten.
+
+The clean browser worktree lacked the integrated finalization test/docs.
+Its three-file baseline commit `0c8ee8d` is byte-equivalent to frozen main
+`75beb17` for those paths, and is NOT an integration request. Only the subsequent
+focused P3 commit is for chair review/integration; its test diff appends view
+coverage while retaining the main finalization cases. Syntax and diff-whitespace
+checks pass. Full browser, product FEM and human device validation were NOT_RUN.
