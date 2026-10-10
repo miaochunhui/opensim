@@ -31,6 +31,13 @@
  * Fix without editor commands: run-2026-10-10T06-40-07-574Z-54493e51/report.json
  * Selftest: run-2026-10-10T06-40-07-537Z-405adf44/report.json
  * These narrow probes do not certify the full viewport matrix or release gates.
+ *
+ * DIAGNOSIS readiness: run-2026-10-10T06-41-48-685Z-663c96b9 failed
+ * text-200 configuration because navigation waited for DOM/fonts but not
+ * automatic FEM completion. Reset also previously checked only input values.
+ * Navigation now requires enabled form controls and aria-busy=false; if an
+ * auto-solve was observed it must finish successfully. Reset requires its new
+ * HTTP result, enabled export, non-stale metrics and completed form state.
  */
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -473,6 +480,7 @@ class Harness {
     await this.waitFor('Visible nonempty page', async () => this.evaluate(() =>
       document.readyState === 'complete' && document.body?.innerText.trim().length > 30));
     await this.evaluate(async () => { await document.fonts.ready; });
+    if (!this.options.selftest) await this.waitFormReady('Navigation form readiness');
     if (this.options.probe_input) await this.evaluate(() => {
       window.__opensimInputEvents = [];
       for (const type of ['touchstart', 'touchend', 'mousedown', 'mouseup', 'click', 'focusin',
@@ -488,6 +496,59 @@ class Harness {
         }, true);
       }
     });
+  }
+  async formState() {
+    return this.evaluate(() => {
+      const form = document.querySelector('#case-form');
+      if (!form) throw new Error('Missing #case-form readiness contract');
+      const selectors = ['#geometry', '#solve-button', '#reset-button', '#import-input'];
+      const controls = [...new Set([...form.querySelectorAll('input,select,textarea,button'),
+        ...selectors.map(selector => {
+          const element = document.querySelector(selector);
+          if (!element) throw new Error(`Missing readiness control ${selector}`);
+          return element;
+        })])];
+      const error = document.querySelector('#error');
+      if (!error) throw new Error('Missing #error readiness contract');
+      const exportButton = document.querySelector('#export-button');
+      const metric = document.querySelector('#metric-flow_rate_m3_s');
+      const box = error.getBoundingClientRect();
+      return {
+        busy: form.getAttribute('aria-busy'),
+        disabled: controls.filter(element => element.disabled).map(element => element.id || element.name),
+        error: !error.hidden && box.width > 0 && box.height > 0 &&
+          getComputedStyle(error).visibility !== 'hidden' ? error.textContent.trim() : '',
+        export_enabled: !!exportButton && !exportButton.disabled,
+        metric_text: metric?.textContent.trim() ?? '',
+        status: document.querySelector('#status')?.textContent.trim() ?? '',
+      };
+    });
+  }
+  async waitFormReady(label, { requireResult = false, marker = null } = {}) {
+    let initial, observedBusy = false;
+    const started = Date.now();
+    const outcome = await this.waitFor(label, async () => {
+      const state = await this.formState();
+      initial ??= state;
+      observedBusy ||= state.busy === 'true' || state.disabled.length > 0;
+      requireCheck(!state.error, 'FEM-UI-ERROR', `${label}: ${state.error}`, { state });
+      const candidates = marker === null ? [] : this.responses.slice(marker);
+      const response = candidates.at(-1);
+      if (response) requireCheck(response.status === 200, 'FEM-HTTP',
+        `${label}: HTTP ${response.status}`, { artifact: response.artifact, error: response.result.error });
+      if (state.busy !== 'false' || state.disabled.length > 0) return false;
+      if (marker !== null && !response) return false;
+      if ((requireResult || observedBusy) && (!state.export_enabled ||
+        !/[0-9]/.test(state.metric_text) || /未计算|旧结果/.test(state.metric_text))) return false;
+      return { state, response };
+    });
+    this.report.readiness ??= [];
+    this.report.readiness.push({
+      label, coordinate: this.coordinate, initial, final: outcome.state,
+      elapsed_ms: Date.now() - started, observed_busy: observedBusy,
+      new_response_artifact: outcome.response?.artifact ?? null,
+    });
+    return outcome;
   }
   async key(key, code, modifiers = 0) {
     const definition = {
@@ -689,11 +750,10 @@ class Harness {
       const current = candidates.at(-1);
       requireCheck(current.status === 200, 'FEM-HTTP', 'Solver HTTP failure',
         { status: current.status, artifact: current.artifact, response: current.result });
-      const ready = await this.evaluate(() =>
-        !document.querySelector('#solve-button').disabled &&
-        !document.querySelector('#export-button').disabled &&
-        /[0-9]/.test(document.querySelector('#metric-flow_rate_m3_s').textContent));
-      return ready ? current : false;
+      const state = await this.formState();
+      requireCheck(!state.error, 'FEM-UI-ERROR', state.error, { state });
+      return state.busy === 'false' && state.disabled.length === 0 && state.export_enabled &&
+        /[0-9]/.test(state.metric_text) && !/未计算|旧结果/.test(state.metric_text) ? current : false;
     });
     const metrics = validateResult(response.result, config);
     const displayed = await this.evaluate(keys => Object.fromEntries(keys.map(key => {
@@ -748,6 +808,7 @@ class Harness {
     return { guid: download.guid, filename: download.suggestedFilename, bytes: bytes.length, sha256: digest(bytes) };
   }
   async coreFlow(name, keyboard = false) {
+    await this.waitFormReady(`${name}: form ready before configuration`);
     await this.check('DOM-CONTRACT', `${name}: configure default case`, () => this.config(DEFAULT_CONFIG, keyboard));
     const baseline = await this.check('FEM-METRICS', `${name}: real solve and all FEM metrics`,
       () => this.solve(DEFAULT_CONFIG, keyboard));
@@ -803,12 +864,17 @@ class Harness {
     await this.input('#pressure_pa', 1, keyboard);
     await this.check('FEM-RECOVERY', `${name}: recover without refresh`, () => this.solve(DEFAULT_CONFIG, keyboard));
     await this.check('FEM-RESET', `${name}: actual reset control`, async () => {
+      const marker = this.responses.length;
       await this.activate('#reset-button', keyboard);
+      const completed = await this.waitFormReady(`${name}: reset solve completed`,
+        { requireResult: true, marker });
+      const metrics = validateResult(completed.response.result, DEFAULT_CONFIG);
       const actual = await this.evaluate(keys => Object.fromEntries(keys.map(key =>
         [key, key === 'geometry' ? document.querySelector(`#${key}`).value : Number(document.querySelector(`#${key}`).value)])),
       Object.keys(DEFAULT_CONFIG));
       requireCheck(JSON.stringify(actual) === JSON.stringify(DEFAULT_CONFIG), 'FEM-RESET', 'Reset did not restore defaults', { actual });
-      return actual;
+      return { actual, metrics, response_artifact: completed.response.artifact,
+        state: completed.state };
     });
     await this.screenshot(`${name}-field`);
     return { baseline: baseline.metrics, doubled: doubled.metrics, field, mesh };
@@ -1042,6 +1108,7 @@ class Harness {
       await this.send('DOM.setFileInputFiles', { nodeId, files: [path.join(this.run, 'downloads', exported.guid)] });
       const response = await this.waitFor('Import actual solver recomputation', () =>
         this.responses.slice(marker).find(item => item.status === 200));
+      await this.waitFormReady('Imported result UI completed', { requireResult: true, marker });
       return { source: exported, metrics: validateResult(response.result, rectangular),
         method: 'CDP native file input selection; operating-system file chooser not human-tested' };
     });
@@ -1057,8 +1124,6 @@ class Harness {
     this.coordinate = 'probe-mobile-wide';
     await this.viewport(390, 844, true);
     await this.navigate();
-    await this.waitFor('Initial actual solve releases form controls', () => this.evaluate(() =>
-      !document.querySelector('#geometry').disabled && !document.querySelector('#solve-button').disabled));
     await this.config(DEFAULT_CONFIG);
     await this.solve(DEFAULT_CONFIG);
     await this.input('#pressure_pa', 2);
@@ -1337,6 +1402,57 @@ document.getElementById('save').addEventListener('click',()=>{
         error => error.rule === 'FEM-CURRENT-CONFIG');
       return { integrated, wrong_flow_rejected: true, malformed_mesh_rejected: true,
         no_slip_violation_rejected: true, stale_config_rejected: true, fixture_is_solver: false };
+    });
+    await harness.check('HARNESS-READINESS', 'enabled controls do not bypass aria-busy completion', async () => {
+      await harness.evaluate(() => {
+        const form = document.createElement('form');
+        form.id = 'case-form';
+        form.setAttribute('aria-busy', 'true');
+        document.querySelector('#workspace').append(form);
+        for (const id of ['geometry', 'probe']) form.append(document.getElementById(id));
+        for (const id of ['solve-button', 'reset-button', 'import-input', 'export-button']) {
+          const element = document.createElement(id === 'import-input' ? 'input' : 'button');
+          element.id = id;
+          element.textContent = id;
+          (id === 'export-button' ? document.querySelector('#workspace') : form).append(element);
+        }
+        document.querySelector('#export-button').disabled = true;
+        const metric = document.createElement('p');
+        metric.id = 'metric-flow_rate_m3_s';
+        metric.textContent = '未计算';
+        form.append(metric);
+        document.querySelector('#draw').addEventListener('click', () => {
+          metric.textContent = '0.01';
+          document.querySelector('#export-button').disabled = false;
+          form.setAttribute('aria-busy', 'false');
+        }, { once: true });
+      });
+      let settled = false;
+      const pending = harness.waitFormReady('Selftest actual form completion', { requireResult: true })
+        .then(outcome => { settled = true; return { outcome }; }, error => ({ error }));
+      let before, result;
+      try {
+        before = await harness.formState();
+        requireCheck(before.busy === 'true' && before.disabled.length === 0 && !settled,
+          'HARNESS-READINESS', 'Enabled controls prematurely released a busy form', { before, settled });
+        await harness.activate('#draw', true);
+        result = await pending;
+      } finally {
+        // Even a failed fixture assertion must settle its outstanding waiter.
+        if (!result) {
+          await harness.evaluate(() => {
+            document.querySelector('#case-form').setAttribute('aria-busy', 'false');
+            document.querySelector('#export-button').disabled = false;
+            document.querySelector('#metric-flow_rate_m3_s').textContent = '0.01';
+          });
+          result = await pending;
+        }
+      }
+      if (result.error) throw result.error;
+      const completed = result.outcome;
+      requireCheck(completed.state.busy === 'false' && completed.state.export_enabled,
+        'HARNESS-READINESS', 'Actual completion state did not release readiness');
+      return { before, completed: completed.state, release: 'real keyboard activation of fixture completion control' };
     });
     requireCheck(harness.errors.length === 0, 'HARNESS-RUNTIME', 'Selftest browser errors', { errors: harness.errors });
   } finally {
