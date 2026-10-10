@@ -133,6 +133,17 @@ class ApplicationServer(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     server_version = "OpenSim/1"
 
+    def parse_request(self) -> bool:
+        # Capture the target before the standard parser folds leading slashes.
+        words = self.raw_requestline.decode("iso-8859-1").split()
+        leading_slashes = len(words) >= 2 and words[1].startswith("//")
+        if not super().parse_request():
+            return False
+        if leading_slashes:
+            self.error_response(400, "BAD_PATH", "请求路径格式错误。")
+            return False
+        return True
+
     def log_message(self, fmt: str, *args: object) -> None:
         logging.info("%s %s", self.client_address[0], fmt % args)
 
@@ -250,7 +261,11 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/api/solve":
             self.error_response(404, "NOT_FOUND", "路径不存在。")
             return
-        content_type = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        content_types = self.headers.get_all("Content-Type", [])
+        if len(content_types) != 1:
+            self.error_response(415, "CONTENT_TYPE", "请使用唯一的 application/json 提交参数。")
+            return
+        content_type = content_types[0].split(";")[0].strip().lower()
         if content_type != "application/json":
             self.error_response(415, "CONTENT_TYPE", "请使用 application/json 提交参数。")
             return
@@ -277,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.error_response(403, "ORIGIN", "不接受跨站计算请求。")
                 return
         raw_length = self.headers.get("Content-Length")
-        if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
+        if self.headers.get_all("Transfer-Encoding", []) or len(self.headers.get_all("Content-Length", [])) != 1:
             self.error_response(400, "BODY_LENGTH", "不接受分块传输或重复的 Content-Length。")
             return
         if raw_length is None or not raw_length.isascii() or not raw_length.isdecimal():
