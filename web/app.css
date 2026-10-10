@@ -214,7 +214,11 @@ pre {
 .header-meta label { display: grid; gap: var(--space-1); }
 .version-control { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); min-inline-size: 0; }
 #version-menu { inline-size: auto; max-inline-size: 100%; font-size: var(--text-sm); }
-#workspace { padding-block: var(--space-8) var(--space-10); }
+#workspace {
+  padding-block: var(--space-8) var(--space-10);
+  container-type: inline-size;
+  container-name: workspace;
+}
 #workspace > * + * { margin-block-start: var(--space-6); }
 .intro {
   display: grid;
@@ -487,17 +491,23 @@ noscript {
   .canvas-toolbar { padding: var(--space-5) var(--space-6); }
 }
 @media (min-width: 64rem) {
-  .workspace-grid { grid-template-columns: minmax(18rem, 22rem) minmax(0, 1fr); }
-  .workspace-grid > :not(.parameter-panel):not(.canvas-panel) { grid-column: 1 / -1; }
   .parameter-panel .form-grid {
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 8.5rem), 1fr));
   }
   #flow-canvas { block-size: clamp(24rem, 38vw, 36rem); }
 }
 @media (min-width: 80rem) {
-  .workspace-grid { grid-template-columns: minmax(20rem, 24rem) minmax(0, 1fr); gap: var(--space-8); }
   .parameter-panel, .results-panel, .evidence-panel, .model-panel { padding: var(--space-6); }
   #flow-canvas { block-size: clamp(30rem, 36vw, 42rem); }
+}
+
+/* Split only when the workspace itself fits both panels, including embedded views. */
+@container workspace (inline-size >= 58rem) {
+  .workspace-grid { grid-template-columns: minmax(18rem, 22rem) minmax(0, 1fr); }
+  .workspace-grid > :not(.parameter-panel):not(.canvas-panel) { grid-column: 1 / -1; }
+}
+@container workspace (inline-size >= 74rem) {
+  .workspace-grid { grid-template-columns: minmax(20rem, 24rem) minmax(0, 1fr); gap: var(--space-8); }
 }
 
 @media (hover: hover) and (pointer: fine) {

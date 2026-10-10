@@ -18,8 +18,9 @@
     force_balance_relative_error: ["力平衡相对误差", ""],
   };
   const RESULT_KEYS = ["schema_version", "config", "model", "mesh", "fields", "metrics", "reference", "warnings"];
+  const SOURCE_KEYS = ["tools/render_page.py", "web/app.js", "web/app.css", "solver.py", "server.py"];
   const COLORS = [[23, 56, 117], [20, 143, 169], [65, 192, 161], [246, 210, 89], [213, 71, 42]];
-  const state = { busy: false, phase: "idle", result: null, dirty: true, revision: 0 };
+  const state = { busy: false, phase: "idle", result: null, dirty: true, revision: 0, sources: null };
   let ui, defaults, observer;
   class CaseError extends Error {
     constructor(message, field, options) {
@@ -95,29 +96,50 @@
       throw new CaseError(`${label}必须是有界文字列表。`);
     }
   }
-  function validateResult(result, requested) {
+  function validateTime(value) {
+    const parts = typeof value === "string" && value.match(
+      /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$/);
+    if (!parts) throw new CaseError("计算时间格式无效。");
+    const [, year, month, day, hour, minute, second, zone] = parts;
+    const calendar = new Date(`${year}-${month}-01T00:00:00Z`);
+    calendar.setUTCMonth(calendar.getUTCMonth() + 1, 0);
+    const offset = zone === "Z" ? [0, 0] : zone.slice(1).split(":").map(Number);
+    if (Number(year) < 1 || Number(month) < 1 || Number(month) > 12 ||
+        Number(day) < 1 || Number(day) > calendar.getUTCDate() ||
+        Number(hour) > 23 || Number(minute) > 59 || Number(second) > 59 ||
+        offset[0] > 23 || offset[1] > 59 || !Number.isFinite(Date.parse(value)) ||
+        Date.parse(value) > Date.now() + 60000) throw new CaseError("计算时间无效或位于未来。");
+  }
+  function validateSources(sources) {
+    exactKeys(sources, SOURCE_KEYS, "运行源码");
+    for (const value of Object.values(sources)) {
+      if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
+        throw new CaseError("运行源码中的 SHA-256 格式无效。");
+      }
+    }
+  }
+  function validateResult(result, requested, legacyImport = false) {
     const hasStamp = result && Object.hasOwn(result, "reproducibility");
+    if (!hasStamp && !legacyImport) throw new CaseError("在线求解结果缺少复现信息，不可采用或导出。");
     exactKeys(result, hasStamp ? [...RESULT_KEYS, "reproducibility"] : RESULT_KEYS, "求解结果");
     if (hasStamp) {
       const stamp = result.reproducibility;
-      const hasSources = Object.hasOwn(stamp, "source_sha256");
+      const hasSources = stamp && typeof stamp === "object" && Object.hasOwn(stamp, "source_sha256");
       const stampKeys = ["computed_at", "config_sha256", "solver_sha256", "python", "numpy", "scipy"];
       exactKeys(stamp, hasSources ? [...stampKeys, "source_sha256"] : stampKeys, "复现信息");
+      if (!hasSources && !legacyImport) throw new CaseError("在线求解结果缺少完整运行源码身份。");
       if (hasSources) {
         const sources = stamp.source_sha256;
-        exactKeys(sources, ["solver.py", "server.py", "tools/render_page.py", "web/app.js", "web/app.css"], "运行源码");
-        for (const value of Object.values(sources)) {
-          if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
-            throw new CaseError("运行源码中的 SHA-256 格式无效。");
-          }
-        }
+        validateSources(sources);
         if (sources["solver.py"] !== stamp.solver_sha256) {
           throw new CaseError("运行源码与求解器身份不一致。");
         }
+        if (!legacyImport && (!state.sources ||
+            SOURCE_KEYS.some((key) => sources[key] !== state.sources[key]))) {
+          throw new CaseError("求解结果与当前页面运行源码身份不一致，请重新载入页面。");
+        }
       }
-      if (typeof stamp.computed_at !== "string" ||
-          !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(stamp.computed_at) ||
-          !Number.isFinite(Date.parse(stamp.computed_at))) throw new CaseError("计算时间格式无效。");
+      validateTime(stamp.computed_at);
       for (const key of ["config_sha256", "solver_sha256"]) {
         if (typeof stamp[key] !== "string" || !/^[a-f0-9]{64}$/i.test(stamp[key])) {
           throw new CaseError("复现信息中的 SHA-256 格式无效。");
@@ -181,6 +203,58 @@
     finite(range[1] - range[0], "速度范围跨度");
     return result;
   }
+  async function digest(bytes) {
+    if (!globalThis.crypto?.subtle) throw new CaseError("浏览器不支持 SHA-256，无法核验复现身份。");
+    return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
+      .map((value) => value.toString(16).padStart(2, "0")).join("");
+  }
+  async function verifyPageSources() {
+    let response, health;
+    try {
+      response = await fetch("api/health", { cache: "no-store", headers: { Accept: "application/json" } });
+      health = await response.json();
+    } catch (cause) {
+      throw new CaseError("无法核验当前服务源码身份，请检查连接后重试。", undefined, { cause });
+    }
+    if (!response.ok || health?.status !== "ok" || health.schema_version !== 1) {
+      throw new CaseError("服务源码身份核验失败。");
+    }
+    validateSources(health.source_sha256);
+    for (const [key, elements, attribute] of [
+      ["web/app.js", [...document.scripts].filter((node) => node.src), "src"],
+      ["web/app.css", [...document.querySelectorAll('link[rel="stylesheet"]')], "href"],
+    ]) {
+      if (elements.length !== 1) throw new CaseError("页面资源入口不唯一，无法核验源码。");
+      const url = new URL(elements[0][attribute], location.href);
+      const extension = key.split(".").at(-1);
+      if (url.origin !== location.origin ||
+          url.pathname !== `/web/app.${health.source_sha256[key]}.${extension}` ||
+          url.search || url.hash) throw new CaseError("页面资源指纹与当前服务源码不一致，请重新载入。");
+      const asset = await fetch(url, { cache: "no-store" });
+      if (!asset.ok || await digest(await asset.arrayBuffer()) !== health.source_sha256[key]) {
+        throw new CaseError("页面资源内容与完整 SHA-256 不一致。");
+      }
+    }
+    state.sources = health.source_sha256;
+  }
+  async function verifyConfigDigest(result) {
+    // Python serializes normalized physical quantities as floats, resolution as int.
+    const number = (value) => {
+      if (value < 0.0001) {
+        return value.toExponential().replace(/e([+-])(\d+)$/, (_, sign, exponent) =>
+          `e${sign}${exponent.padStart(2, "0")}`);
+      }
+      return Number.isInteger(value) ? `${value}.0` : String(value);
+    };
+    const canonical = `{${[...KEYS].sort().map((key) => {
+      const value = result.config[key];
+      return `${JSON.stringify(key)}:${key === "geometry" ? JSON.stringify(value)
+        : key === "resolution" ? String(value) : number(value)}`;
+    }).join(",")}}`;
+    if (await digest(new TextEncoder().encode(canonical)) !== result.reproducibility.config_sha256) {
+      throw new CaseError("配置 SHA-256 与实际求解参数不一致。");
+    }
+  }
   function setStatus(message) {
     ui.status.textContent = message;
     ui.status.dataset.state = state.phase;
@@ -202,7 +276,7 @@
   function reportError(error, terminal = true) {
     if (error instanceof CaseError) console.warn("OpenSim input/action rejected:", error);
     else console.error("OpenSim unexpected interaction failure:", error);
-    if (terminal) { state.phase = "failed"; state.dirty = true; }
+    if (terminal) { state.phase = "failed"; state.dirty = true; state.result = null; }
     const message = error instanceof Error ? error.message : "未知交互错误。";
     ui.error.textContent = message;
     ui.error.hidden = false;
@@ -217,6 +291,7 @@
     ui.error.focus();
     setStatus(terminal ? "操作失败；请查看错误并修正后重试。" : "本次操作未执行：已有任务正在进行。");
     refreshResults();
+    if (terminal) draw();
     updateControls();
   }
   function syncGeometry() {
@@ -252,6 +327,7 @@
     state.busy = true;
     state.phase = "working";
     state.dirty = true;
+    state.result = null;
     clearError();
     updateControls();
     setStatus(message);
@@ -455,6 +531,8 @@
   }
   async function calculate(config) {
     const revision = state.revision;
+    if (!state.sources) await verifyPageSources();
+    const started = Date.now();
     setStatus("正在执行实际有限元求解，请稍候。");
     let response;
     try {
@@ -472,6 +550,10 @@
     }
     if (!response.ok) throw backendError(response, payload);
     const result = validateResult(payload, config);
+    await verifyConfigDigest(result);
+    if (Date.parse(result.reproducibility.computed_at) < started - 60000) {
+      throw new CaseError("在线结果计算时间早于本次请求，不采用旧结果。");
+    }
     if (revision !== state.revision || !sameConfig(readConfig(), config)) {
       throw new CaseError("求解期间参数发生变化，本次结果未采用，请重新计算。");
     }
@@ -500,8 +582,13 @@
     });
   }
   async function importCase() {
+    if (state.busy) {
+      reportError(new CaseError("已有求解或导入任务，本次导入未执行。"), false);
+      return;
+    }
     const files = ui.importInput.files;
     await operate("正在校验导入文件；导入后将重新求解。", async () => {
+      const revision = state.revision;
       if (!files || files.length !== 1) throw new CaseError("请选择一个 JSON 文件。");
       const file = files[0];
       if (!Number.isFinite(file.size) || file.size <= 0 || file.size > LIMIT_BYTES) {
@@ -518,8 +605,11 @@
       if (data && typeof data === "object" && Object.hasOwn(data, "config")) {
         config = validateConfig(data.config);
         if (Object.keys(data).length === 1) exactKeys(data, ["config"], "导入对象");
-        else validateResult(data, config);
+        else validateResult(data, config, true);
       } else config = validateConfig(data);
+      if (state.revision !== revision) {
+        throw new CaseError("导入读取期间参数发生变化，本次文件未采用，请重新导入。");
+      }
       writeConfig(config);
       refreshResults();
       draw();
