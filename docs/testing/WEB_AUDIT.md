@@ -123,6 +123,83 @@ unittest 使用实际 Python renderer、app 和 solver 的临时 HTTP 服务。
 服务健康身份需匹配指定工作树源码，数值证据需匹配 solver 摘要。
 负例须实测检出相应规则和低对比焦点，不能只断言退出码。
 
+### 指纹资源夹具兼容
+
+夹具直接使用当前 server 的 `request_path()` 与 `FINGERPRINT_PATH`，
+不以旧 server 回退静默补件。只接受 legacy `web/app.js/css` alias 和
+完整 SHA256 文件名；指纹必须等于该工作树的实际源码摘要及运行摘要。
+未知指纹返回真实 404/NOT_FOUND，不通过宽匹配提供测试资产。
+预检从真实 renderer HTML 提取唯一资源引用，逐项请求实际引用、alias、
+正确指纹和错误指纹；覆盖字节、原文回读、错误响应 body 都保存并记摘要。
+`fixture_assets` 是这些 HTTP 内容验收坐标，不是浏览器已执行的证明。
+`fixture_requests` 另记录 Chromium 的 script/style 实际请求及
+`/__audit_fixture_marker` 204，标记请求只由实际执行的附加脚本触发。
+全矩阵正负尺子仍必须在实际浏览器中检出规定规则、间距、焦点和恢复状态。
+
+最新 UI 会主动按完整 SHA256 回读页面资源。测试夹具依据
+`Sec-Fetch-Dest`，在 script/style 加载时提供明确附加的对比尺/标记，
+在正确指纹的 fetch 回读时提供未修改原文。false health 阴性夹具依据
+`Accept`，保留 UI 的 application/json 启动读取，向审计/default 读侧
+注入 solver 摘要错误。两种请求头分流只是测试夹具能力，既不是安全边界，
+也不证明产品被修改后的资产具有原始源码身份。覆盖资产与原文必须分别
+记录；fixture scope 绝不计入产品来源或发布通过。未修改产品的主动校验。
+
+身份阴性必须先完成实际 smoke ready 与 PNG，再在 audit 的 before 来源
+比对以 `Served health source drift solver.py` 拒绝，记录
+`identity_rejection.stage=before-source-comparison-after-smoke`；不得以
+marker 缺失、资源加载失败或后续 fsync 故障冒充身份拒绝首因。
+
+2026-10-10 修前首因保留在外置
+`seat-audit/fixture-positive-1791622584757645322/logs/browser.stderr.log`：
+`Fixture did not attest test-only renderer output`，实际 rc2，0 checks/PNG。
+同目录 server.log 显示页面请求
+`/web/app.ac73a0a8fcd8347229d3d00378a89eceb3cf377b6a47ea3ed72b8b3de2f7339e.css`
+与 `/web/app.bd5dfab9fb6a073fefaca896c1b4b26239b24b753e9b08a9aa69b90aab7337e3.js`
+均 200，但旧夹具只覆盖 legacy alias，故 marker 未执行。这是完整
+内容寻址文件名漏匹配，不是 query 参数问题。旧 FAIL 不删除、不追认。
+本次专项使用独立 `/data/dev/opensim-audit-fixture-v1`、
+`codex/audit-fixture-v1`，完整主仓源码基线
+`1bb38a5238a31a77063fa9ea85865778b7c7599c`；未修改主树或产品源码。
+
+路由修通后的先行正例也保留 FAIL：
+`seat-audit/fixture-positive-1791622957967981906/run-1791622958113-Q0PLDs/report.json`
+实际 rc1，8 条 `WEB-CONTENT-006`，均为 320/768/1064/1440 的 error/empty。
+实际 canvas 有 211 色，但 description/summary/全部数值为“未计算”；
+最新 UI 清除结果后会清画布并绘制“未计算：等待实际 FEM 求解”文字，
+颜色数包含文字抗锯齿，不能当作当前结果证据。原 `auditGraphics` 对非 ready
+且非 loading-empty 状态仍取历史成功 POST（首例 http-solve-001.json），
+因此把正确清空的指标误当作当前结果缺失。不是以调整颜色阈值修复。
+
+审计现按实际状态绑定：ready 只读取本次导航的最新实际 solve 请求对应
+响应，核请求/响应/当前表单配置一致、全部数值、模型摘要与导出状态；
+非 ready 只允许当前 UI 的 idle/working/failed，未知状态失败；不读取历史
+成功响应，核明确无结果说明、全部13项“未计算”、
+禁用导出和非空命名画布。原内容检查仍输出，不画假图、不补旧值。
+正例另用真实 ready/failed 观测和实际 HTTP 产物执行定向纯判据尺子：
+两项正控与六项阴性（非 ready 残留数值、ready 空结果、无当前响应、
+配置漂移、非 ready 可导出、未知状态）。该尺子明确标
+`PURE_GRAPHICS_RULER_ON_REAL_OBSERVATIONS_NOT_BROWSER_MUTANTS`，
+不冒称六项阴性是在浏览器里篡改产品；全矩阵正负夹具仍为真实 Chromium。
+
+最终专项已现读 `seat-audit/suite-1791623397637805725/summary.json`
+与 unittest.log：7 方法 PASS、0 failures/errors，212.392s；11 次实际
+Chromium 子运行与6项 CLI 拒绝，另有上述纯尺子2正控/6阴性。
+工具 SHA256 为
+`5b64fd765af00682943dc36672be262d9c19e567fd246609f96000f3c25de853`，
+测试 SHA256 为
+`0a5a1b0fcf4727db67eaff2906d9c585ea98e4ada2827b6ad077f08a8f543778`。
+正例 `seat-audit/fixture-positive-1791623494441596738/summary.json`
+实际 rc0、261检查、403分段PNG、4视口、16注入、556 focus/hover各样本、
+3720间距对、0发现；不是403个独立用例。负例
+`seat-audit/fixture-negative-1791623404010180471/summary.json` 实际rc1，
+检出全部要求规则及真实0px间距/低焦点对比。身份阴性
+`seat-audit/fixture-identity-negative-1791623400590228267/summary.json`
+实际rc2，先完成smoke，再正确拒绝false health。六项真实I/O负例与更早
+身份首因保留均通过；suite链接全部子报告、字节与stderr证据。
+语法、diff与三文件敏感信息模式扫描通过（零命中）。只验证该完整基线
+的专项兼容；未重跑完整产品/FEM，不追认两轮旧FAIL，不改变真人读屏
+NOT_TESTED与G3实质PARTIAL。最终候选由主席整合后统一验收。
+
 各次运行、包括失败，保留独立目录、源码/工具摘要和日志。
 2026-10-10 初次 smoke 的 Chromium 正常退出误判、关闭 details 误纳入、
 文字/滚动区边框误分类、Enter 字符事件及负例焦点样本漏记已经诊断修复；

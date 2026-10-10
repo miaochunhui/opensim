@@ -261,6 +261,8 @@ export class Browser {
     this.phase = 'startup';
     this.requests = new Map();
     this.responses = [];
+    this.solveSequence = 0;
+    this.navigation = 0;
     this.injectedNetwork = new Map();
   }
   async wait(label, action, exiting = false) {
@@ -326,7 +328,8 @@ export class Browser {
       if (session === this.session && event.request.method === 'POST' &&
           new URL(event.request.url).pathname === new URL('api/solve', this.url).pathname) {
         this.requests.set(event.requestId, { url: event.request.url,
-          config: JSON.parse(event.request.postData), state: this.phase });
+          config: JSON.parse(event.request.postData), state: this.phase,
+          sequence: ++this.solveSequence, navigation: this.navigation });
       }
     });
     this.cdp.on('Network.responseReceived', (event, session) => {
@@ -433,6 +436,7 @@ export class Browser {
     });
   }
   async navigate(waitReady = true) {
+    this.navigation++;
     const result = await this.send('Page.navigate', { url: this.url });
     assert(!result.errorText, result.errorText);
     await this.wait('nonempty rendered page', () => this.evaluate(() =>
@@ -947,6 +951,35 @@ export async function auditSnapshot(browser, report, label, keyboard = true) {
   return observation;
 }
 
+export function graphicsAlternative(state, visual, reference = null) {
+  const keys = ["node_count", "element_count", "dof_count", "max_velocity_m_s", "mean_velocity_m_s",
+    "flow_rate_m3_s", "reynolds", "hydraulic_diameter_mm", "relative_residual", "relative_l2_error",
+    "reference_flow_rate_m3_s", "relative_flow_error", "force_balance_relative_error"];
+  const named = visual.canvas.role === "img" && !!visual.canvas.name &&
+    (visual.canvas.describedby ?? "").split(/\s+/).includes("plot-description") && visual.adjacent_visible;
+  if (state.phase !== "ready") {
+    const allowed = ["idle", "working", "failed"].includes(state.phase);
+    const uncleared = keys.filter(key => visual.metrics[key]?.trim() !== "\u672a\u8ba1\u7b97");
+    return { valid: !!(allowed && named && !state.export_enabled && visual.canvas.colors > 0 && !uncleared.length &&
+      visual.description.includes("\u672a\u8ba1\u7b97") && visual.summary.includes("\u672a\u8ba1\u7b97")),
+    binding: "CURRENT_NO_RESULT_NOT_HISTORICAL_POST", known_no_result_state: allowed, uncleared_metrics: uncleared };
+  }
+  const expected = reference?.payload?.metrics, config = reference?.payload?.config;
+  const configMatches = config && visual.config && Object.keys(config).length === Object.keys(visual.config).length &&
+    Object.entries(config).every(([key, value]) => visual.config[key] === value && reference.config?.[key] === value);
+  const mismatches = keys.filter(key => {
+    const value = expected?.[key], actual = Number.parseFloat(visual.metrics[key]);
+    return !Number.isFinite(value) || !Number.isFinite(actual) ||
+      Math.abs(actual - value) > Math.max(1e-12, Math.abs(value) * 1e-5);
+  });
+  return { valid: !!(named && state.busy === "false" && state.export_enabled && reference?.status === 200 &&
+    configMatches && expected && visual.canvas.colors > 1 && !mismatches.length &&
+    visual.description.includes("P1") && visual.summary.includes("FEM") &&
+    visual.description.includes(String(expected.node_count)) && visual.description.includes(String(expected.element_count))),
+  binding: "CURRENT_NAVIGATION_LATEST_SOLVE_AND_CONFIG", mismatched_metrics: mismatches,
+  config_matches: !!configMatches, reference_artifact: reference?.artifact ?? null };
+}
+
 export async function auditGraphics(browser, report) {
   const visual = await browser.evaluate(() => {
     const canvas = document.querySelector('#flow-canvas'), description = document.querySelector('#plot-description');
@@ -968,6 +1001,11 @@ export async function auditGraphics(browser, report) {
     adjacent_visible: visible(description) && visible(summary),
     metrics: Object.fromEntries(Array.from(document.querySelectorAll('[id^="metric-"]'))
       .map(el => [el.id.slice(7), el.textContent])),
+    config: Object.fromEntries(["geometry", "width_mm", "height_mm", "length_mm", "pressure_pa",
+      "viscosity_pa_s", "density_kg_m3", "resolution"].map(id => {
+      const value = document.getElementById(id)?.value;
+      return [id, id === "geometry" ? value : Number(value)];
+    })),
     toggles: ['view-field', 'view-mesh'].map(id => {
       const el = document.getElementById(id);
       return { id, pressed: el.getAttribute('aria-pressed'), text: el.textContent,
@@ -983,29 +1021,18 @@ export async function auditGraphics(browser, report) {
   let reference;
   if (state.phase === 'ready') {
     reference = await browser.wait('recorded real HTTP result for graphics alternative', async () =>
-      browser.responses.findLast(entry => entry.status === 200 && entry.payload?.metrics));
-  } else if (!browser.phase.includes('loading-empty')) {
-    reference = browser.responses.findLast(entry => entry.status === 200 && entry.payload?.metrics);
+      browser.responses.find(entry => entry.navigation === browser.navigation && entry.sequence === browser.solveSequence));
   }
-  const named = visual.canvas.role === 'img' && visual.canvas.name &&
-    visual.canvas.describedby.split(/\s+/).includes('plot-description') && visual.adjacent_visible;
-  if (reference) {
-    const mismatches = Object.entries(reference.payload.metrics).filter(([key, expected]) => {
-      const actual = Number.parseFloat(visual.metrics[key]);
-      return !Number.isFinite(actual) || Math.abs(actual - expected) > Math.max(1e-12, Math.abs(expected) * 1e-5);
-    }).map(([key]) => key);
-    const valid = named && visual.canvas.colors > 1 && mismatches.length === 0 &&
-      visual.description.includes('P1') && visual.summary.includes('FEM') &&
-      visual.description.includes(String(reference.payload.metrics.node_count)) &&
-      visual.description.includes(String(reference.payload.metrics.element_count));
-    record(report, browser, 'WEB-CONTENT-006', valid ? 'PASS' : 'FAIL',
+  const alternative = graphicsAlternative(state, visual, reference);
+  if (state.phase === "ready") {
+    record(report, browser, 'WEB-CONTENT-006', alternative.valid ? 'PASS' : 'FAIL',
       'Information canvas has named adjacent summary and independently matched real HTTP numerical metrics',
-      { visual, mismatched_metrics: mismatches, reference_artifact: reference.artifact,
+      { visual, state, ...alternative,
         limit: 'Numerical/model/range summary alternative; no claim all nodal spatial values are exposed as an in-page table' });
   } else {
-    record(report, browser, 'WEB-CONTENT-006', named && visual.canvas.colors > 0 &&
-      visual.description.includes('\u672a\u8ba1\u7b97') ? 'PASS' : 'FAIL',
-      'Empty information canvas has explicit adjacent no-result alternative', visual);
+    record(report, browser, 'WEB-CONTENT-006', alternative.valid ? 'PASS' : 'FAIL',
+      "Empty information canvas has explicit adjacent no-result alternative, cleared metrics and disabled export",
+      { visual, state, ...alternative });
   }
   const encoded = visual.toggles.every(toggle => ['true', 'false'].includes(toggle.pressed) &&
     toggle.text.trim() && (toggle.pressed === 'false' || toggle.decoration.includes('underline')));
