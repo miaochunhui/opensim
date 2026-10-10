@@ -426,16 +426,215 @@ def binding(report: dict, expected: dict, tool: str, now: datetime) -> None:
             sources = expected["source_sha256"]
         page = expected["page_build"]
     elif tool == "tools/browser_audit.mjs":
-        # Native partial audit has no source map/page DOM field. The mandatory
-        # launcher pins its whole checkout and bytes; coverage still stays PARTIAL.
-        if sources is None:
-            sources = expected["source_sha256"]
-        page = report.get("page_build", expected["page_build"])
+        page_record = report.get("page_build")
+        require(isinstance(page_record, dict) and set(page_record) == {"id", "footer"},
+                "Audit page_build must contain native id/footer")
+        page = page_record["id"]
+        require(isinstance(page_record["footer"], str) and
+                re.search(r"(?<![a-f0-9]){}(?![a-f0-9])".format(expected["page_build"]),
+                          page_record["footer"]), "Audit observed footer/build differs")
     else:
         page = report.get("page_build")
     require(sources == expected["source_sha256"], f"Report must bind all five sources: {tool}")
     require(page == expected["page_build"], f"Report page_build mismatch: {tool}")
     fresh(report, now)
+
+
+def audit_coordinates(row: dict, report: dict) -> dict:
+    """Read native coordinates without adding fields to the producer report."""
+    url, viewport, steps = row.get("url"), row.get("viewport"), row.get("reproduce")
+    require(isinstance(url, str) and url == report.get("url"), "Audit check URL differs")
+    require(isinstance(viewport, dict) and set(viewport) == {"width", "height"} and
+            all(type(viewport[k]) is int and viewport[k] > 0 for k in viewport),
+            "Audit check missing native viewport")
+    require(isinstance(steps, list) and steps and
+            all(isinstance(step, str) and step.strip() for step in steps) and
+            isinstance(row.get("state"), str) and row["state"].strip(),
+            "Audit check missing native reproduction/state")
+    return {"url": url, "viewport": dict(viewport), "state": row["state"], "reproduce": list(steps)}
+
+
+def selected_checks(report: dict, chosen: object, kind: str) -> list[dict]:
+    require(isinstance(chosen, list) and bool(chosen), "Empty/duplicate gate check selection")
+    rows = report.get("checks", [])
+    require(isinstance(rows, list) and all(isinstance(row, dict) for row in rows),
+            "Invalid producer check rows")
+    if kind == "audit" and all(isinstance(pin, dict) for pin in chosen):
+        indices, result = set(), []
+        for pin in chosen:
+            require(set(pin) == {"pointer", "sha256"} and
+                    isinstance(pin["pointer"], str) and
+                    re.fullmatch(r"/checks/(0|[1-9][0-9]*)", pin["pointer"]),
+                    "Invalid native audit check pointer")
+            index = int(pin["pointer"].rsplit("/", 1)[1])
+            require(index < len(rows) and index not in indices, "Unknown/duplicate audit check pointer")
+            row = rows[index]
+            require(sha(encode(row)) == pin["sha256"], "Native audit check hash drift")
+            audit_coordinates(row, report)
+            indices.add(index)
+            result.append(row)
+        return result
+    require(all(isinstance(name, str) and name for name in chosen) and
+            len(set(chosen)) == len(chosen), "Empty/duplicate gate check selection")
+    result = []
+    for name in chosen:
+        matches = [row for row in rows if row.get("name") == name]
+        require(len(matches) == 1, "Unknown/ambiguous gate checks")
+        result.append(matches[0])
+    return result
+
+
+def _audit_file(path: Path, links: int) -> tuple[bytes, tuple]:
+    external(path)
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+        before = os.fstat(stream.fileno())
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink == links,
+                "Unsafe native audit file/link count")
+        body = stream.read(LIMIT + 1)
+        after = os.fstat(stream.fileno())
+    def stamp(s):
+        return (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_nlink)
+    require(0 < len(body) <= LIMIT and stamp(before) == stamp(after) == stamp(path.lstat()),
+            "Native audit file changed during readback")
+    return body, stamp(after)
+
+
+def audit_reference(pin: dict) -> tuple[dict, Path]:
+    """Only the native final/candidate pair may have two links; generic pins stay strict."""
+    require(isinstance(pin, dict) and set(pin) == {"path", "sha256"}, "Invalid audit report pin")
+    require(isinstance(pin["sha256"], str) and re.fullmatch(r"[a-f0-9]{64}", pin["sha256"]),
+            "Full audit SHA256 required")
+    path = external(Path(pin["path"]))
+    require(path.name == "report.json", "Native audit final filename required")
+    require(not os.path.lexists(path.parent / "report.failure.json"), "Audit failure sidecar present")
+    if path.lstat().st_nlink == 1:
+        return reference(pin)
+    body, stamp = _audit_file(path, 2)
+    candidate, other = _audit_file(path.with_name("report.candidate.json"), 2)
+    require(stamp == other and body == candidate and sha(body) == pin["sha256"],
+            "Native audit final/candidate identity/hash mismatch")
+    value = decode(body)
+    completion = value.get("completion", {})
+    require(completion.get("protocol") == "durable-final-v2" and completion.get("status") == "FINAL",
+            "Native audit final/candidate protocol missing")
+    return value, path
+
+
+def read_audit_scope(pin: dict, expected: dict, process_rc: int,
+                     now: datetime | None = None) -> dict:
+    """Read automatic evidence only, never certify, approve NA, or authorize deployment."""
+    now = now or datetime.now(timezone.utc)
+    require(isinstance(expected, dict) and isinstance(expected.get("commit"), str) and
+            re.fullmatch(r"[a-f0-9]{40}", expected["commit"]) and
+            isinstance(expected.get("source_sha256"), dict) and
+            set(expected["source_sha256"]) == set(SOURCES) and
+            all(isinstance(v, str) and re.fullmatch(r"[a-f0-9]{64}", v)
+                for v in expected["source_sha256"].values()) and
+            isinstance(expected.get("page_build"), str) and
+            re.fullmatch(r"[a-f0-9]{12}", expected["page_build"]) and
+            isinstance(expected.get("tool_sha256"), dict) and
+            isinstance(expected["tool_sha256"].get("tools/browser_audit.mjs"), str) and
+            re.fullmatch(r"[a-f0-9]{64}", expected["tool_sha256"]["tools/browser_audit.mjs"]),
+            "Missing independently pinned audit identity")
+    report, path = audit_reference(pin)
+    before = encode(report)
+    require(type(process_rc) is int and process_rc == 0 and
+            type(report.get("exit_code")) is int and report["exit_code"] == process_rc,
+            "Audit actual process/report rc mismatch")
+    require(report.get("schema_version") == 1 and report.get("tool") == "opensim-browser-audit" and
+            report.get("standard") == "shared-r41" and
+            report.get("mode") == "G3_G6_AUTOMATIC_EXTENSION_NOT_RELEASE" and
+            report.get("verdict") == "AUTOMATED_SCOPE_PASS" and
+            report.get("release_verdict") == "NOT_CERTIFIED", "Unknown/forged native audit scope")
+    require(not any(report.get(key) for key in
+                    ("first_failure", "harness_failure", "cleanup_failure", "finalization_failure")),
+            "Native audit contains failure")
+    binding(report, expected, "tools/browser_audit.mjs", now)
+    identities = report.get("identity_checks")
+    require(isinstance(identities, list) and len(identities) == 2 and
+            all(isinstance(row, dict) for row in identities) and
+            [row.get("stage") for row in identities] == ["before", "after"],
+            "Audit missing before/after actual identity")
+    for row in identities:
+        require(row.get("verdict") == "PASS" and row.get("fixture_asset_override") is False and
+                row.get("url") == report.get("url") and row.get("footer") == report["page_build"]["footer"],
+                "Audit failed/fixture actual identity")
+        for field in ("local_source_sha256", "committed_source_sha256"):
+            require(row.get(field) == expected["source_sha256"], "Audit actual five-source mismatch")
+        health = row.get("health", {})
+        require(health.get("status") == "ok" and health.get("source_sha256") == expected["source_sha256"] and
+                health.get("page_build") == expected["page_build"], "Audit actual health identity differs")
+        assets = row.get("served_byte_sha256", {})
+        require(set(assets) == {"health", "/", "/web/app.js", "/web/app.css"} and
+                all(isinstance(v, str) and re.fullmatch(r"[a-f0-9]{64}", v) for v in assets.values()) and
+                all(assets["/" + name] == expected["source_sha256"][name] for name in ("web/app.js", "web/app.css")),
+                "Audit served asset identity differs")
+    require(identities[0]["served_byte_sha256"] == identities[1]["served_byte_sha256"],
+            "Audit served bytes drift")
+    checks = report.get("checks")
+    require(isinstance(checks, list) and checks and all(isinstance(row, dict) and
+            row.get("status") in {"PASS", "NOT_TESTED"} for row in checks), "Audit failed/unknown checks")
+    observed = []
+    for index, row in enumerate(checks):
+        observed.append({"pointer": f"/checks/{index}", "sha256": sha(encode(row)),
+                         "status": row["status"], "rule": row.get("rule"),
+                         **audit_coordinates(row, report)})
+    coverage, gates = report.get("coverage"), report.get("gates")
+    require(isinstance(coverage, list) and coverage and isinstance(gates, dict) and
+            set(gates) == {"G3-accessibility", "G6-content"}, "Audit coverage/gates missing")
+    require(gates["G3-accessibility"].get("status") in {"PARTIAL", "AUTOMATED_SCOPE_PASS"},
+            "Native audit G3 cannot claim full PASS")
+    untested = {"WEB-A11Y-009", "PHYSICAL-TOUCH", "SCREENSHOT-REVIEW",
+                "FULL-STANDARD-MATRIX", "G5-performance"}
+    for rule in untested:
+        matches = [row for row in coverage if isinstance(row, dict) and
+                   (row.get("rule") or row.get("gate")) == rule]
+        require(len(matches) == 1 and matches[0].get("status") == "NOT_TESTED",
+                f"Native audit cannot claim human/full-matrix/public PASS or NA: {rule}")
+    remaining, na = [], []
+    for row in [*coverage, *gates.values()]:
+        require(isinstance(row, dict) and row.get("status") in
+                {"PASS", "AUTOMATED_SCOPE_PASS", "PARTIAL", "NOT_TESTED", "NOT_APPLICABLE"},
+                "Audit failed/unknown coverage")
+        if row["status"] in {"PARTIAL", "NOT_TESTED"}:
+            remaining.append(row)
+        if row["status"] == "NOT_APPLICABLE":
+            capability = {"WEB-A11Y-008": "dialogs", "WEB-NAV-004": "mobile_menus"}.get(row.get("rule"))
+            require(capability is not None and type(row.get("actual_count")) is int and
+                    row["actual_count"] == 0 and
+                    type(report.get("page_capabilities", {}).get(capability)) is int and
+                    report["page_capabilities"][capability] == 0, "Unproved audit NA cannot turn green")
+            na.append(row)
+    remaining.extend(row for row in checks if row["status"] == "NOT_TESTED")
+    for gate in gates.values():
+        require(gate.get("release_status") == "NOT_CERTIFIED", "Audit gate forged certification")
+    completion = report.get("completion", {})
+    require(completion.get("protocol") == "durable-final-v2" and completion.get("status") == "FINAL" and
+            completion.get("receipt") == "completion.json" and completion.get("log") == "logs/audit.log",
+            "Audit missing final completion")
+    require(not os.path.lexists(path.parent / "report.failure.json"), "Audit failure sidecar present")
+    receipt_path, log_path = path.parent / "completion.json", path.parent / "logs/audit.log"
+    receipt_body, log_body = read_file(receipt_path), read_file(log_path)
+    receipt = decode(receipt_body)
+    require(receipt.get("protocol") == "durable-final-v2" and receipt.get("status") == "COMPLETE" and
+            type(receipt.get("exit_code")) is int and receipt["exit_code"] == process_rc and
+            receipt.get("report") == "report.json" and receipt.get("report_sha256") == pin["sha256"] and
+            receipt.get("log_sha256") == completion.get("log_sha256") == sha(log_body),
+            "Audit actual receipt/report/log mismatch")
+    prefix = "AUDIT candidate_verdict={} candidate_rc={} report=".format(report["verdict"], process_rc)
+    text = log_body.decode("utf-8")
+    require(text.startswith(prefix) and text.endswith("\n") and text.count("\n") == 1 and
+            external(Path(text[len(prefix):-1])).resolve() == path.resolve(), "Audit candidate log differs")
+    screenshots(report, path)
+    require(encode(audit_reference(pin)[0]) == before and read_file(receipt_path) == receipt_body and
+            read_file(log_path) == log_body and not os.path.lexists(path.parent / "report.failure.json"),
+            "Audit terminal dependency drift")
+    return {"state": "AUTOMATIC_SCOPE_OBSERVED", "scope": "AUDIT_AUTOMATION_NOT_RELEASE",
+            "release_verdict": "NOT_CERTIFIED", "production_changes": False, "report": dict(pin),
+            "commit": report["commit"], "page_build": report["page_build"]["id"],
+            "process_rc": process_rc, "native_verdict": report["verdict"], "checks": observed,
+            "remaining": remaining, "not_applicable": na, "native_gates": gates,
+            "coverage_status": "AUTOMATED_PARTIAL" if remaining or na else "AUTOMATED_SCOPE_PASS"}
 
 
 def approvals(root: Path, commit: str, record: dict | None, now: datetime) -> dict:
@@ -482,6 +681,10 @@ def execution(pin: dict, report_pin: dict, expected: dict, tool: str, now: datet
             "Launcher argv does not identify required producer")
     log_artifact(value["stdout"])
     log_artifact(value["stderr"])
+    if tool == "tools/browser_audit.mjs":
+        audit_reference(report_pin)
+    else:
+        reference(report_pin)
     fresh(value, now)
     return value
 
@@ -639,7 +842,8 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
     require(isinstance(evidence, dict) and set(evidence) ==
             {"local", "numerics", "browser", "audit", "performance", "public", "page"},
             "Required actual local/browser/audit/perf/public evidence missing")
-    reports = {kind: reference(record) for kind, record in evidence.items()}
+    reports = {kind: (audit_reference(record) if kind == "audit" else reference(record))
+               for kind, record in evidence.items()}
     executions = ledger["executions"]
     producer_tools = {"local": "tools/acceptance.py", "numerics": "tools/validate_numerics.py",
                       "browser": "tools/browser_check.mjs", "audit": "tools/browser_audit.mjs",
@@ -647,8 +851,9 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
                       "page": "tools/render_page.py"}
     require(isinstance(executions, dict) and set(executions) == set(producer_tools),
             "Missing required producer launcher receipts")
-    for kind, tool in producer_tools.items():
-        execution(executions[kind], evidence[kind], expected, tool, now)
+    execution_values = {kind: execution(executions[kind], evidence[kind], expected, tool, now)
+                        for kind, tool in producer_tools.items()}
+    audit_scope = read_audit_scope(evidence["audit"], expected, execution_values["audit"]["rc"], now)
     page = reports["page"][0]
     require(set(page) == {"schema", "commit", "source_sha256", "page_build", "html",
                          "page_check", "timestamp_origin", "source_epoch"},
@@ -708,8 +913,8 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
                        ("performance", "tools/browser_performance.mjs")):
         report, path = reports[kind]
         binding(report, expected, tool, now)
-        require("exit_code" not in report or
-                (type(report["exit_code"]) is int and report["exit_code"] == 0),
+        require((kind != "audit" and "exit_code" not in report) or
+                (type(report.get("exit_code")) is int and report["exit_code"] == 0),
                 f"Failed producer exit code: {kind}")
         if kind != "performance":
             require(report.get("standard") == "shared-r41", "Unknown web standard")
@@ -733,7 +938,7 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
             "Browser matrix missing required viewports")
     audit = reports["audit"][0]
     require(audit.get("mode") == "G3_G6_AUTOMATIC_EXTENSION_NOT_RELEASE" and
-            audit.get("verdict") in {"AUTOMATED_SCOPE_PASS", "AUTOMATED_PASS"},
+            audit.get("verdict") == "AUTOMATED_SCOPE_PASS",
             "Audit smoke/fixture is not product acceptance")
     performance(reports["performance"][0])
     public = reports["public"][0]
@@ -777,21 +982,18 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
                          "G5-performance": "performance", "G6-content": "audit"}[gate],
                 "Gate attributed to wrong producer")
         report = reports[kind][0]
+        selected = selected_checks(report, record["checks"], kind)
         if kind == "audit":
             require(report.get("gates", {}).get(gate, {}).get("status") == "PASS",
                     f"PARTIAL audit cannot certify {gate}")
-        chosen = record["checks"]
-        require(isinstance(chosen, list) and chosen and len(set(chosen)) == len(chosen),
-                f"Empty/duplicate gate check selection: {gate}")
-        available = {row.get("name") for row in report["checks"]}
-        require(set(chosen) <= available, f"Unknown gate checks: {gate}")
-        require(all((row.get("status") or row.get("verdict")) == "PASS"
-                    for row in report["checks"] if row.get("name") in chosen),
+        require(all((row.get("status") or row.get("verdict")) == "PASS" for row in selected),
                 f"NOT_TESTED checks cannot certify {gate}")
-        selected = [row for row in report["checks"] if row.get("name") in chosen]
         require(REQUIRED_RULES[gate] <= {row.get("rule") for row in selected},
                 f"Gate missing required rule coverage: {gate}")
         for row in selected:
+            if kind == "audit":
+                audit_coordinates(row, report)
+                continue
             url = row.get("url") or report.get("target_url") or report.get("url")
             viewport = row.get("viewport")
             if viewport is None and row.get("coordinate"):
@@ -827,7 +1029,11 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
         manual_refs[rule] = record
     require(identity(root, commit) == expected, "Checkout changed during release gate")
     for kind, pin in evidence.items():
-        reference(pin)
+        if kind == "audit":
+            require(read_audit_scope(pin, expected, execution_values[kind]["rc"], now) == audit_scope,
+                    "Audit automatic scope drift during gate")
+        else:
+            reference(pin)
         execution(executions[kind], pin, expected, producer_tools[kind], now)
     artifact(page["html"])
     reference(page["page_check"])

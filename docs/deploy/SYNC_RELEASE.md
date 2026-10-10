@@ -105,6 +105,44 @@ approved_by/approved_at/approval_record_id`。
 `PARTIAL + legacy AUTOMATED_PASS` 不等于完整 PASS。
 目前工具只消费经 producer 实测报告，不实现任意证据合并升格器。
 
+### S2 原生 Audit 消费
+
+冻结主仓 `75beb17` 的 audit 使用 `page_build={id,footer}`，不是字符串。
+必须实有五源 `source_sha256`，并核 before/after 的 local/committed/health
+五源、footer 与实际服务 JS/CSS 摘要；缺字段不补 expected。
+`evaluate()` 首次及末次实际调用 `read_audit_scope()`，不只在测试调用。
+helper 只返回 `AUTOMATIC_SCOPE_OBSERVED / AUDIT_AUTOMATION_NOT_RELEASE`，
+有 PARTIAL、NOT_TESTED 或 NA 时保持 `AUTOMATED_PARTIAL / NOT_CERTIFIED`。
+真人、完整矩阵及公网 G5 在此 extension 内必须保持 NOT_TESTED；
+dialog/menu 的实际零计数 NA 仅如实回读，不是例外许可或 PASS。
+
+原生 checks 无 name，ledger 可用
+`{pointer:"/checks/N",sha256:SHA256(encode(original_row))}` 逐项选择。
+`encode` 是本工具排序、ASCII、缩进 2 加末尾换行的序列化，
+位置、原行摘要、URL、`viewport={width,height}`、state 和非空 reproduce
+数组都核验，拒旧名字虚构匹配、重复及未知坐标。不重写 producer 报告。
+
+仅 audit 的终态 `report.json` 可与同目录 `report.candidate.json` 同 inode、
+恰好双链接，且两者 bytes/hash/stat 与 durable-final-v2 FINAL 一致。
+launcher、首次及末次回读均走这一窄入口；其它 evidence 仍拒硬链接。
+实际 `completion.json`、`logs/audit.log`、report hash/rc 和 PNG 必须吻合，
+`report.failure.json` 存在即 veto。可编辑回执只绑定材料，不证明用户身份；
+最终可信人验拒绝未删除，G3/G6 发布门未放宽。
+
+定向离线复跑，不启动 FEM、浏览器或服务：
+
+```bash
+sudo -n -u infra python3 -B /data/dev/opensim-sync-v1/tests/test_release_gate.py --native-audit --out /hf3fs-jd/data/tmp/opensim-fluid-v1/seat-sync/audit-native-new
+```
+
+真实 v2 回读入口为测试文件的 `--audit-readback WORKBENCH_JSON`
+及独立 `--workbench-sha256/--source-root/--commit/--out`；从 committed blob
+计算 expected，核既有实际 launcher 记录，再实际启动只读 reader 子进程。
+这不是重新执行 audit，也不是可信用户来源或完整 workbench 认证。
+本轮 v2 回读 261 checks/408 PNG、2 NA、9 个 remaining 保留，
+原 workbench 仍 FAIL/rc1（perf G5-IDENTITY），不是组合 PASS。
+五源 byte build 不变不等于工具 inventory 不变，主席整合后须重新冻结候选。
+
 ## 固定 Release API 与同步边界
 
 只读对接第1席：
