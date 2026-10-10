@@ -91,6 +91,170 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const digest = data => createHash('sha256').update(data).digest('hex');
 const json = value => JSON.stringify(value, null, 2) + '\n';
 
+function persistenceCause(error, step) {
+  return { rule: "BROWSER-PERSISTENCE", message: error.message, stack: error.stack,
+    code: error.code ?? null, syscall: error.syscall ?? null,
+    path: error.path ?? step.path, stage: step.stage,
+    close_failures: error.closeFailures ?? [] };
+}
+
+async function useHandle(handle, action) {
+  let first;
+  try { return await action(handle); }
+  catch (error) { first = error; throw error; }
+  finally {
+    try { await handle.close(); }
+    catch (error) {
+      if (!first) throw error;
+      (first.closeFailures ??= []).push({ message: error.message, code: error.code ?? null,
+        syscall: error.syscall ?? null, path: error.path ?? null });
+    }
+  }
+}
+
+async function syncDirectory(directory, step) {
+  step.stage = "directory-fsync"; step.path = directory;
+  const handle = await fs.open(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  await useHandle(handle, file => file.sync());
+}
+
+async function readDescriptor(handle, target, step) {
+  step.stage = "exact-readback"; step.path = target;
+  const before = await handle.stat();
+  assert(before.isFile() && Number.isSafeInteger(before.size) && before.size <= 16 * 1024 * 1024,
+    `Evidence is not a bounded regular file: ${target}`);
+  const bytes = Buffer.alloc(before.size + 1);
+  let size = 0;
+  while (size < bytes.length) {
+    const result = await handle.read(bytes, size, bytes.length - size, size);
+    if (!result.bytesRead) break;
+    size += result.bytesRead;
+  }
+  const after = await handle.stat(), named = await fs.lstat(target);
+  const same = info => info.isFile() && info.dev === before.dev && info.ino === before.ino &&
+    info.birthtimeMs === before.birthtimeMs && info.size === before.size &&
+    info.mtimeMs === before.mtimeMs && info.ctimeMs === before.ctimeMs;
+  assert(same(after) && same(named) && size === before.size, `Evidence changed during readback: ${target}`);
+  return { stat: after, bytes: bytes.subarray(0, size) };
+}
+
+async function exactRead(target, entry, step) {
+  step.stage = "exact-readback"; step.path = target;
+  const expected = Buffer.from(entry.bytes);
+  assert(expected.length <= 16 * 1024 * 1024, "Final evidence exceeds bounded readback limit");
+  const handle = await fs.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  await useHandle(handle, async file => {
+    const actual = await readDescriptor(file, target, step);
+    assert(actual.stat.dev === entry.stat.dev && actual.stat.ino === entry.stat.ino &&
+      actual.stat.birthtimeMs === entry.stat.birthtimeMs && actual.bytes.equals(expected),
+    `Evidence exact inode/bytes changed: ${target}`);
+  });
+}
+
+async function createDurable(target, bytes, owned, step) {
+  step.stage = "exclusive-open"; step.path = target;
+  const handle = await fs.open(target, fs.constants.O_WRONLY | fs.constants.O_CREAT |
+    fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  await useHandle(handle, async file => {
+    owned.set(target, { stat: await file.stat(), bytes });
+    step.stage = "file-write";
+    await file.writeFile(bytes);
+    step.stage = "file-fsync";
+    await file.sync();
+  });
+  await syncDirectory(path.dirname(target), step);
+  await exactRead(target, owned.get(target), step);
+}
+
+export async function finalizeBrowser(run, report, rc, fixture = null) {
+  const step = {}, owned = new Map(), target = path.join(run, "report.json");
+  const log = path.join(run, "run.log"), protocol = "browser-durable-final-v1";
+  try {
+    await createDurable(path.join(run, "report.provisional.json"), json({ ...report,
+      verdict: "PROVISIONAL_NOT_FINAL", exit_code: 2,
+      durability: { protocol, state: "PROVISIONAL_NOT_CONSUMABLE", candidate_exit_code: rc } }), owned, step);
+    if (fixture === "log-directory") {
+      await fs.rename(log, path.join(run, "preserved-run.log"));
+      await fs.mkdir(log);
+    }
+    step.stage = "log-open"; step.path = fixture === "log-enospc" ? "/dev/full" : log;
+    const handle = await fs.open(fixture === "log-enospc" ? "/dev/full" : log,
+      fs.constants.O_RDWR | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const logEntry = await useHandle(handle, async file => {
+      step.stage = "log-write"; step.path = fixture === "log-enospc" ? "/dev/full" : log;
+      await file.writeFile(`${report.finished_at} BROWSER_CHECK candidate_verdict=${report.verdict} candidate_rc=${rc} report=${target}\n`);
+      step.stage = "log-fsync";
+      if (fixture === "log-fsync") {
+        step.path = "/dev/full";
+        const device = await fs.open("/dev/full", "r");
+        await useHandle(device, item => item.sync());
+      }
+      await file.sync();
+      return readDescriptor(file, log, step);
+    });
+    await syncDirectory(run, step);
+    await exactRead(log, logEntry, step);
+    report.exit_code = rc;
+    report.durability = { protocol, state: "FINAL_AFTER_DURABLE_LOG",
+      log: { file: "run.log", bytes: logEntry.bytes.length, sha256: digest(logEntry.bytes) } };
+    await createDurable(target, json(report), owned, step);
+    if (fixture === "post-publish-fsync") {
+      step.stage = "post-publish-fsync"; step.path = "/dev/full";
+      const device = await fs.open("/dev/full", "r");
+      await useHandle(device, item => item.sync());
+    }
+    if (fixture === "same-inode") {
+      const before = await fs.lstat(target), entry = owned.get(target);
+      const bytes = entry.bytes.replace(/"exit_code": 0/, "\"exit_code\": 9");
+      assert.notEqual(bytes, entry.bytes, "Same-inode fixture needs a successful candidate");
+      await fs.writeFile(target, bytes);
+      const after = await fs.lstat(target);
+      assert.equal(before.ino, after.ino); assert.equal(before.size, after.size);
+      report.same_inode_fixture = { before_ino: before.ino, after_ino: after.ino,
+        preserved_sha256: digest(bytes), bytes: after.size };
+    }
+    if (fixture === "replaced-directory") {
+      await fs.rename(target, path.join(run, "preserved-report.json"));
+      await fs.mkdir(target);
+      await fs.writeFile(path.join(target, "unrelated.txt"), "unknown bytes preserved\n", { flag: "wx" });
+    }
+    await exactRead(log, logEntry, step);
+    await exactRead(target, owned.get(target), step);
+    return { rc, path: target };
+  } catch (error) {
+    const failure = persistenceCause(error, step);
+    report.first_failure ??= report.failure ?? report.cleanup_failure ?? failure;
+    report.persistence_failure = failure;
+    report.verdict = "FAIL"; report.exit_code = 2;
+    report.durability = { protocol, state: "FAILED_NOT_CONSUMABLE", revocations: [], secondary_failures: [] };
+    if (owned.has(target)) {
+      try {
+        await exactRead(target, owned.get(target), step);
+        // POSIX lacks compare-and-rename; unique run ownership is required.
+        const preserved = path.join(run, `revoked-owned-${randomUUID()}.json`);
+        await fs.link(target, preserved);
+        await exactRead(target, owned.get(target), step);
+        await fs.unlink(target);
+        report.durability.revocations.push({ status: "EXACT_OWNED_REVOKED", path: target, preserved,
+          sha256: digest(owned.get(target).bytes) });
+        await syncDirectory(run, step);
+      } catch (secondary) {
+        report.durability.revocations.push({ status: "UNKNOWN_OR_CHANGED_NOT_REMOVED", path: target });
+        report.durability.secondary_failures.push(persistenceCause(secondary, step));
+      }
+    }
+    const marker = path.join(run, "report.failure.json");
+    let markerWritten = false;
+    try { await createDurable(marker, json(report), new Map(), step); markerWritten = true; }
+    catch (secondary) {
+      report.durability.secondary_failures.push(persistenceCause(secondary, step));
+      console.error(`BROWSER_CHECK FAILURE_MARKER_UNAVAILABLE ${json(report)}`);
+    }
+    console.error(`BROWSER_CHECK FAIL stage=${failure.stage} code=${failure.code} path=${failure.path} ${failure.message}`);
+    return { rc: 2, path: markerWritten ? marker : null };
+  }
+}
+
 class CheckFailure extends Error {
   constructor(rule, message, detail = {}) {
     super(message);
@@ -239,7 +403,7 @@ function parseArgs(argv) {
     if (['--selftest', '--help', '--no-sandbox', '--probe-input', '--probe-screenshot'].includes(argument)) {
       options[argument.slice(2).replaceAll('-', '_')] = true;
     } else {
-      requireCheck(['--url', '--out', '--chrome', '--timeout-ms'].includes(argument),
+      requireCheck(['--url', '--out', '--chrome', '--timeout-ms', '--finalize-fixture'].includes(argument),
         'CLI', `Unknown argument ${argument}`);
       requireCheck(argv[index + 1] && !argv[index + 1].startsWith('--'), 'CLI', `Missing ${argument}`);
       options[argument === '--timeout-ms' ? 'timeout' : argument.slice(2)] = argv[++index];
@@ -256,6 +420,9 @@ function parseArgs(argv) {
   options.out = out;
   requireCheck(options.selftest || options.url, 'CLI', '--url is required unless --selftest');
   requireCheck(!(options.selftest && options.url), 'CLI', '--selftest cannot claim a target URL');
+  requireCheck(!options["finalize-fixture"] || options.selftest &&
+    ["log-directory", "log-enospc", "log-fsync", "post-publish-fsync", "same-inode", "replaced-directory"].includes(options["finalize-fixture"]),
+  "CLI", "Finalization fixtures require --selftest and a known real filesystem fault");
   requireCheck(!(options.selftest && options.probe_input), 'CLI', '--selftest and --probe-input are exclusive');
   requireCheck([options.selftest, options.probe_input, options.probe_screenshot].filter(Boolean).length <= 1,
     'CLI', 'Selftest and narrow probes are mutually exclusive');
@@ -1705,16 +1872,19 @@ async function main() {
     report.finished_at = new Date().toISOString();
     report.exit_code = exitCode;
     if (run) {
-      await fs.writeFile(path.join(run, 'report.json'), json(report), { flag: 'wx' });
-      const reread = JSON.parse(await fs.readFile(path.join(run, 'report.json'), 'utf8'));
-      assert.equal(reread.verdict, report.verdict);
-      assert.equal(reread.exit_code, exitCode);
-      await fs.appendFile(path.join(run, 'run.log'),
-        `${report.finished_at} BROWSER_CHECK verdict=${report.verdict} rc=${exitCode} report=${path.join(run, 'report.json')}\n`);
-      console.log(`BROWSER_CHECK verdict=${report.verdict} rc=${exitCode} checks=${report.checks.length} screenshots=${report.screenshots.length} report=${path.join(run, 'report.json')}`);
+      if (harness?.logTask) {
+        try { await harness.logTask; }
+        catch (error) {
+          report.first_failure ??= report.failure ?? persistenceCause(error, { stage: "queued-log", path: path.join(run, "run.log") });
+          report.verdict = "FAIL"; exitCode = 2;
+        }
+      }
+      const completed = await finalizeBrowser(run, report, exitCode, options?.["finalize-fixture"]);
+      exitCode = completed.rc;
+      console.log(`BROWSER_CHECK verdict=${report.verdict} rc=${exitCode} checks=${report.checks.length} screenshots=${report.screenshots.length} report=${completed.path}`);
     }
     process.exitCode = exitCode;
   }
 }
 
-await main();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();
