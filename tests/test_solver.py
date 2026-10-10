@@ -15,6 +15,7 @@ import importlib.util
 import math
 import os
 from pathlib import Path
+import subprocess
 import sys
 import unittest
 import uuid
@@ -102,6 +103,61 @@ class OracleAndGateTests(unittest.TestCase):
             numerics.report_summary({"verdict": "PASS", "cases": [], "convergence": {},
                                      "rejections": []})
 
+    def failed_readback_report(self, exit_code):
+        """Diagnostic-only report, never numerical acceptance evidence."""
+        return {
+            "verdict": "FAIL", "state": "FAILED", "collected_at": numerics.timestamp(),
+            "cases": [], "convergence": {}, "rejections": [], "checks_executed": 0,
+            "exit_code": exit_code,
+            "failure": {"type": "DiagnosticFixture", "message": "FIRST_FAILURE"},
+        }
+
+    def test_fail_summary_requires_portable_nonzero_integer_exit(self):
+        for code in (0, False, True, None, 1.0, "1", -1, 256, 512):
+            with self.subTest(exit_code=code):
+                with self.assertRaisesRegex(numerics.AcceptanceError, "integer exit_code in 1..255"):
+                    numerics.report_summary(self.failed_readback_report(code))
+        report = self.failed_readback_report(1)
+        del report["exit_code"]
+        with self.assertRaisesRegex(numerics.AcceptanceError, "integer exit_code in 1..255"):
+            numerics.report_summary(report)
+
+    def test_fail_readback_cli_cannot_exit_successfully(self):
+        for code in (0, 256):
+            with self.subTest(exit_code=code):
+                directory = TEST_ARTIFACT_ROOT / f"fail-rc-{uuid.uuid4().hex}"
+                directory.mkdir()
+                report = self.failed_readback_report(code)
+                path = directory / "report.json"
+                source = numerics.json_bytes(report)
+                with path.open("xb") as stream:
+                    stream.write(source)
+                with (directory / "stdout.log").open("xb") as out:
+                    with (directory / "stderr.log").open("xb") as err:
+                        result = subprocess.run(
+                            [sys.executable, "-B", str(ROOT / "tools/validate_numerics.py"),
+                             "--read-report", str(path)], stdout=out, stderr=err)
+                with (directory / "launcher.json").open("xb") as stream:
+                    stream.write(numerics.json_bytes({"rc": result.returncode,
+                                                     "report_sha256": numerics.digest(source)}))
+                self.assertEqual(path.read_bytes(), source)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("integer exit_code in 1..255",
+                              (directory / "stderr.log").read_text())
+
+    def test_fail_readback_preserves_nonzero_and_running_diagnostics(self):
+        for state, code in (("FAILED", 1), ("FAILED", 2), ("FAILED", 255), ("RUNNING", 2)):
+            with self.subTest(state=state, exit_code=code):
+                report = self.failed_readback_report(code)
+                report["state"] = state
+                path = TEST_ARTIFACT_ROOT / f"fail-diagnostic-{uuid.uuid4().hex}.json"
+                source = numerics.json_bytes(report)
+                with path.open("xb") as stream:
+                    stream.write(source)
+                self.assertIn("NUMERICS verdict=FAIL", numerics.report_summary(report))
+                self.assertEqual(numerics.read_report(path), code)
+                self.assertEqual(path.read_bytes(), source)
+
     def test_raw_json_rejects_nan(self):
         with self.assertRaises(ValueError):
             numerics.json_bytes({"velocity": [float("nan")]})
@@ -140,7 +196,8 @@ class OracleAndGateTests(unittest.TestCase):
 
     def test_report_writer_rejects_existing_file(self):
         report = {"verdict": "FAIL", "collected_at": numerics.timestamp(),
-                  "cases": [], "convergence": {}, "rejections": [], "checks_executed": 0}
+                  "cases": [], "convergence": {}, "rejections": [], "checks_executed": 0,
+                  "exit_code": 2}
         out = TEST_ARTIFACT_ROOT / f"gate-existing-{uuid.uuid4().hex}.json"
         first = numerics.ReportWriter(out, copy.deepcopy(report))
         first.checkpoint()

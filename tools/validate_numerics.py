@@ -513,6 +513,9 @@ def external_path(path):
 def report_summary(report):
     require(isinstance(report, dict) and report.get("verdict") in ("PASS", "FAIL"),
             "invalid report")
+    if report["verdict"] == "FAIL":
+        require(type(report.get("exit_code")) is int and 1 <= report["exit_code"] <= 255,
+                "FAIL report requires integer exit_code in 1..255")
     if report["verdict"] == "PASS":
         require(report.get("state") == "COMPLETE" and
                 type(report.get("exit_code")) is int and report["exit_code"] == 0,
