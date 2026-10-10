@@ -22,15 +22,18 @@ import time
 import unittest
 import uuid
 from datetime import datetime, timezone
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import dns_release as dns
 
 OUT = dns.ARTIFACTS / "seat-dns"
 RUN = None
+REAL_RUN = subprocess.run
 
 
 def dump(path: Path, value):
@@ -120,6 +123,46 @@ def fake_signer() -> int:
     dump(directory / "state.json", state)
     print(json.dumps(response, ensure_ascii=True))
     return 0
+
+
+class OfflineProductionTransport:
+    """Record attempted production transport; execute only the offline fixture."""
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.attempts = []
+
+    def __call__(self, argv, **kwargs):
+        self.attempts.append({"kind": "ssh" if argv[0] == "ssh" else "signer",
+                              "action": "read_credentials" if argv[0] == "ssh" else argv[4]})
+        if argv[0] == "ssh":
+            body = (dns.SAVED + "SecretId='OFFLINE_FIXTURE_ID'\n"
+                    + dns.SAVED + "SecretKey='OFFLINE_FIXTURE_KEY'\n")
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if (len(argv) != 8 or Path(argv[2]) != dns.SIGNER
+                or argv[3] != "dnspod" or argv[5:] != [dns.VERSION, "-d", "-"]):
+            raise AssertionError("Unexpected offline production transport argv")
+        env = {**kwargs["env"], "OPENSIM_DNS_FIXTURE_DIR": str(self.directory)}
+        return REAL_RUN([sys.executable, "-B", str(Path(__file__).resolve()), *argv[3:]],
+                        input=kwargs["input"], capture_output=True, text=True, env=env,
+                        timeout=20)
+
+
+def production_probe(argv, directory: Path) -> int:
+    output = io.StringIO()
+    transport = OfflineProductionTransport(directory)
+    with patch.object(dns.subprocess, "run", side_effect=transport), \
+            patch.object(dns.sys, "stdout", output), \
+            patch.object(dns, "ARTIFACTS", directory), \
+            patch.object(socket, "socket", side_effect=AssertionError("network forbidden")):
+        rc = dns.main(argv)
+    receipt = dns.strict_json(output.getvalue())
+    dump(directory / "production-probe.json", {
+        "rc": rc, "receipt": receipt, "transport_attempts": transport.attempts,
+        "state": dns.strict_json((directory / "state.json").read_text()),
+        "scope": "PRODUCTION_BRANCH_OFFLINE_TRANSPORT_NO_LIVE_CREDENTIALS"})
+    print(output.getvalue(), end="")
+    return rc
 
 
 class DNSReleaseTests(unittest.TestCase):
@@ -384,7 +427,7 @@ class DNSReleaseTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         proc.assert_not_called()
         self.assertEqual(json.loads(output.getvalue())["failure"]["reason"],
-                         "ledger_schema_or_release_mismatch")
+                         dns.MUTATION_DISABLED)
         self.assertEqual(self.ledger.read_bytes(), original)
 
     def test_ledger_write_failure_prevents_api_and_keeps_errno(self):
@@ -405,7 +448,325 @@ class DNSReleaseTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         proc.assert_not_called()
         self.assertEqual(json.loads(output.getvalue())["failure"]["reason"],
-                         "production_mutation_not_authorized")
+                         dns.MUTATION_DISABLED)
+
+    def forged_ledger(self, backend="production"):
+        ledger = dns.Ledger(self.ledger, "seat-dns-test", backend)
+        ledger.before = []
+        ledger.append("apply", "CREATE_INTENT")
+        ledger.created_record_id = 9001
+        ledger.append("apply", "CREATE_ACK")
+        ledger.append("apply", "FINAL", outcome="APPLIED")
+        return ledger
+
+    def run_production_probe(self, mode, extra=(), expect_rc=2):
+        argv = [sys.executable, "-B", str(Path(__file__).resolve()),
+                "--production-probe", str(self.directory), mode,
+                "--release-id", "seat-dns-test", "--ledger", str(self.ledger), *extra]
+        result = REAL_RUN(argv, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, expect_rc, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        report = json.loads((self.directory / "production-probe.json").read_text())
+        self.assertEqual(report["rc"], result.returncode)
+        self.assertEqual(report["receipt"], json.loads(result.stdout))
+        return report
+
+    def test_production_forged_ledger_cannot_delete_foreign_record(self):
+        self.forged_ledger()
+        foreign = {"RecordId": 9001, **dns.DESIRED}
+        self.arrange([foreign])
+        original = self.ledger.read_bytes()
+        report = self.run_production_probe("revert", ["--authorized"])
+        self.assertEqual(report["receipt"]["failure"]["reason"], dns.MUTATION_DISABLED)
+        self.assertEqual(report["transport_attempts"], [])
+        self.assertEqual(report["state"]["records"], [foreign])
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.ledger.read_bytes(), original)
+        self.assertEqual(dns.Ledger(self.ledger, "seat-dns-test").ownership(), None)
+
+    def test_production_relabelled_fixture_cannot_delete(self):
+        self.run_cli()
+        events = self.events()
+        for entry in events:
+            entry["backend"] = "production"
+        self.ledger.write_bytes(b"".join(
+            (json.dumps(e, sort_keys=True) + "\n").encode() for e in events))
+        original = self.ledger.read_bytes()
+        previous_calls = self.calls()
+        previous_state = self.state.read_bytes()
+        report = self.run_production_probe("revert", ["--authorized"])
+        self.assertEqual(report["receipt"]["failure"]["reason"], dns.MUTATION_DISABLED)
+        self.assertEqual(report["transport_attempts"], [])
+        self.assertEqual(self.calls(), previous_calls)
+        self.assertEqual(self.state.read_bytes(), previous_state)
+        self.assertEqual(self.ledger.read_bytes(), original)
+
+    def test_production_apply_and_revert_cannot_self_authorize(self):
+        for mode in ("apply", "revert"):
+            for extra in ([], ["--authorized"]):
+                with self.subTest(mode=mode, authorized=bool(extra)):
+                    report = self.run_production_probe(mode, extra)
+                    self.assertEqual(report["receipt"]["failure"]["reason"], dns.MUTATION_DISABLED)
+                    self.assertEqual(report["transport_attempts"], [])
+                    self.assertIsNone(report["receipt"]["created_record_id"])
+                    self.assertFalse(self.ledger.exists())
+                    self.assertEqual(self.calls(), [])
+
+    def test_production_dryrun_fake_transport_is_readonly_and_not_owned(self):
+        self.forged_ledger()
+        self.arrange([{"RecordId": 9001, **dns.DESIRED}])
+        report = self.run_production_probe("dryrun", expect_rc=0)
+        self.assertEqual(report["receipt"]["outcome"], "NO_CHANGE")
+        self.assertIsNone(report["receipt"]["created_record_id"])
+        self.assertEqual([c["action"] for c in self.calls()],
+                         ["DescribeRecordList", "DescribeRecordList"])
+        self.assertEqual([a["kind"] for a in report["transport_attempts"]],
+                         ["ssh", "signer", "signer"])
+
+    def test_direct_execute_and_production_api_mutations_fail_closed(self):
+        with patch.object(dns, "API") as api:
+            with self.assertRaises(dns.Refuse) as raised:
+                dns.execute(argparse.Namespace(mode="revert", fixture_dir=None), None)
+            self.assertEqual(raised.exception.failure["reason"], dns.MUTATION_DISABLED)
+            api.assert_not_called()
+        api = object.__new__(dns.API)
+        api.fixture = False
+        with patch.object(dns.subprocess, "run") as proc:
+            for action in ("CreateRecord", "DeleteRecord", "ModifyRecord"):
+                with self.assertRaises(dns.Refuse) as raised:
+                    api.call(action, {})
+                self.assertEqual(raised.exception.failure["reason"], dns.MUTATION_DISABLED)
+            proc.assert_not_called()
+
+    def test_hardlinked_ledger_read_is_refused_before_append_or_api(self):
+        self.forged_ledger("fixture:" + str(self.directory))
+        other = self.directory / "other-owner.jsonl"
+        os.link(self.ledger, other)
+        original = other.read_bytes()
+        receipt = self.run_cli("dryrun", 2)
+        self.assertEqual(receipt["failure"]["reason"], "ledger_hardlink_refused")
+        self.assertEqual(other.read_bytes(), original)
+        self.assertEqual(self.ledger.read_bytes(), original)
+        self.assertEqual(self.calls(), [])
+        dump(self.directory / "hardlink-proof.json",
+             {"nlink": other.stat().st_nlink, "unchanged": other.read_bytes() == original,
+              "rc": 2, "api_calls": self.calls()})
+
+    def test_hardlink_introduced_after_read_cannot_append(self):
+        ledger = self.forged_ledger("fixture:" + str(self.directory))
+        original = self.ledger.read_bytes()
+        os.link(self.ledger, self.directory / "other-owner.jsonl")
+        with self.assertRaises(dns.Refuse) as raised:
+            ledger.append("dryrun", "BEGIN")
+        self.assertEqual(raised.exception.failure["reason"], "ledger_hardlink_refused")
+        self.assertEqual(self.ledger.read_bytes(), original)
+
+    def test_parent_and_child_symlinks_refused_without_touching_target(self):
+        self.forged_ledger()
+        original = self.ledger.read_bytes()
+        child = self.directory / "child-link.jsonl"
+        child.symlink_to(self.ledger)
+        parent = self.directory / "parent-link"
+        parent.symlink_to(self.directory, target_is_directory=True)
+        for path in (child, parent / self.ledger.name):
+            with self.subTest(path=path):
+                with self.assertRaises(dns.Refuse) as raised:
+                    dns.Ledger(path, "seat-dns-test")
+                self.assertEqual(raised.exception.failure["reason"], "ledger_symlink_path")
+        self.assertEqual(self.ledger.read_bytes(), original)
+
+    def test_nonregular_ledger_is_refused_without_blocking(self):
+        path = self.directory / "directory"
+        path.mkdir()
+        with self.assertRaises(dns.Refuse) as raised:
+            dns.Ledger(path, "seat-dns-test")
+        self.assertEqual(raised.exception.failure["reason"], "ledger_not_regular_file")
+        # 3FS cannot create named FIFOs (errno 38); validate a real pipe fd instead.
+        read_fd, write_fd = os.pipe()
+        try:
+            with self.assertRaises(dns.Refuse) as raised:
+                dns.regular(os.fstat(read_fd))
+            self.assertEqual(raised.exception.failure["reason"], "ledger_not_regular_file")
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+        dump(self.directory / "nonregular-proof.json",
+             {"directory_refused": True, "real_pipe_fd_refused": True,
+              "named_fifo_on_3fs": "UNSUPPORTED_ERRNO_38_PREVIOUS_RUN_PRESERVED"})
+
+    def test_ledger_replacement_after_read_is_preserved(self):
+        ledger = self.forged_ledger()
+        original = self.ledger.read_bytes()
+        moved = self.directory / "original.jsonl"
+        self.ledger.rename(moved)
+        self.ledger.write_bytes(original)
+        with self.assertRaises(dns.Refuse) as raised:
+            ledger.append("dryrun", "BEGIN")
+        self.assertEqual(raised.exception.failure["reason"], "ledger_changed_before_append")
+        self.assertEqual(moved.read_bytes(), original)
+        self.assertEqual(self.ledger.read_bytes(), original)
+
+    def test_parent_replacement_after_missing_read_cannot_create_ledger(self):
+        parent = self.directory / "parent"
+        parent.mkdir()
+        path = parent / "receipt.jsonl"
+        ledger = dns.Ledger(path, "seat-dns-test")
+        parent.rename(self.directory / "original-parent")
+        parent.mkdir()
+        with self.assertRaises(dns.Refuse) as raised:
+            ledger.append("dryrun", "BEGIN")
+        self.assertEqual(raised.exception.failure["reason"], "ledger_parent_changed")
+        self.assertFalse(path.exists())
+        self.assertFalse((self.directory / "original-parent/receipt.jsonl").exists())
+
+    def test_read_open_symlink_swap_refused_and_original_preserved(self):
+        self.forged_ledger()
+        original = self.ledger.read_bytes()
+        moved = self.directory / "original.jsonl"
+        real_open = os.open
+        attacked = False
+
+        def swap(path, flags, *args, **kwargs):
+            nonlocal attacked
+            if path == self.ledger.name and not attacked:
+                attacked = True
+                self.ledger.rename(moved)
+                self.ledger.symlink_to(moved)
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(dns.os, "open", side_effect=swap):
+            with self.assertRaises(dns.Refuse) as raised:
+                dns.Ledger(self.ledger, "seat-dns-test")
+        self.assertTrue(attacked)
+        self.assertEqual(raised.exception.failure["reason"], "ledger_symlink_or_non_directory")
+        self.assertEqual(raised.exception.failure["errno"], errno.ELOOP)
+        self.assertEqual(moved.read_bytes(), original)
+
+    def test_append_open_symlink_swap_refused_without_write(self):
+        ledger = self.forged_ledger()
+        original = self.ledger.read_bytes()
+        moved = self.directory / "original.jsonl"
+        real_open = os.open
+        attacked = False
+
+        def swap(path, flags, *args, **kwargs):
+            nonlocal attacked
+            if path == self.ledger.name and flags & os.O_APPEND and not attacked:
+                attacked = True
+                self.ledger.rename(moved)
+                self.ledger.symlink_to(moved)
+            return real_open(path, flags, *args, **kwargs)
+
+        with patch.object(dns.os, "open", side_effect=swap):
+            with self.assertRaises(dns.Refuse) as raised:
+                ledger.append("dryrun", "BEGIN")
+        self.assertTrue(attacked)
+        self.assertEqual(raised.exception.failure["reason"], "ledger_symlink_or_non_directory")
+        self.assertEqual(raised.exception.failure["errno"], errno.ELOOP)
+        self.assertEqual(moved.read_bytes(), original)
+
+    def test_hardlink_introduced_at_append_open_is_refused(self):
+        ledger = self.forged_ledger()
+        original = self.ledger.read_bytes()
+        other = self.directory / "other-owner.jsonl"
+        real_open = os.open
+        attacked = False
+
+        def link(path, flags, *args, **kwargs):
+            nonlocal attacked
+            fd = real_open(path, flags, *args, **kwargs)
+            if path == self.ledger.name and flags & os.O_APPEND and not attacked:
+                attacked = True
+                os.link(self.ledger, other)
+            return fd
+
+        with patch.object(dns.os, "open", side_effect=link):
+            with self.assertRaises(dns.Refuse) as raised:
+                ledger.append("dryrun", "BEGIN")
+        self.assertTrue(attacked)
+        self.assertEqual(raised.exception.failure["reason"], "ledger_hardlink_refused")
+        self.assertEqual(other.read_bytes(), original)
+
+    def test_content_changed_after_read_is_not_repaired_or_appended(self):
+        ledger = self.forged_ledger()
+        with self.ledger.open("ab") as stream:
+            stream.write(b"attacker\n")
+        changed = self.ledger.read_bytes()
+        with self.assertRaises(dns.Refuse) as raised:
+            ledger.append("dryrun", "BEGIN")
+        self.assertEqual(raised.exception.failure["reason"], "ledger_changed_before_append")
+        self.assertEqual(self.ledger.read_bytes(), changed)
+
+    def test_parent_swapped_after_directory_open_is_refused(self):
+        parent = self.directory / "parent"
+        parent.mkdir()
+        path = parent / "receipt.jsonl"
+        ledger = dns.Ledger(path, "seat-dns-test")
+        ledger.append("dryrun", "BEGIN")
+        original = path.read_bytes()
+        moved = self.directory / "original-parent"
+        real_open = os.open
+        attacked = False
+
+        def swap(name, flags, *args, **kwargs):
+            nonlocal attacked
+            fd = real_open(name, flags, *args, **kwargs)
+            if name == "parent" and flags & os.O_DIRECTORY and not attacked:
+                attacked = True
+                parent.rename(moved)
+                parent.symlink_to(moved, target_is_directory=True)
+            return fd
+
+        with patch.object(dns.os, "open", side_effect=swap):
+            with self.assertRaises(dns.Refuse) as raised:
+                ledger.append("dryrun", "BEGIN")
+        self.assertTrue(attacked)
+        self.assertEqual(raised.exception.failure["reason"], "ledger_parent_changed")
+        self.assertEqual((moved / path.name).read_bytes(), original)
+
+    def test_ledger_changed_during_read_is_refused(self):
+        self.forged_ledger()
+        real_read = os.read
+        attacked = False
+
+        def mutate(fd, size):
+            nonlocal attacked
+            body = real_read(fd, size)
+            if body and not attacked:
+                attacked = True
+                with self.ledger.open("ab") as stream:
+                    stream.write(b"attacker\n")
+            return body
+
+        with patch.object(dns.os, "read", side_effect=mutate):
+            with self.assertRaises(dns.Refuse) as raised:
+                dns.Ledger(self.ledger, "seat-dns-test")
+        self.assertTrue(attacked)
+        self.assertEqual(raised.exception.failure["reason"], "ledger_changed_during_read")
+        self.assertTrue(self.ledger.read_bytes().endswith(b"attacker\n"))
+
+    def test_append_failure_keeps_firstcause_and_evidence_failure(self):
+        failed = subprocess.CompletedProcess([], 17, "sensitive", "sensitive")
+        real_write = os.write
+
+        def fail_final(fd, body):
+            if b'"step": "FINAL"' in body:
+                raise OSError(errno.ENOSPC, "untrusted-append-detail")
+            return real_write(fd, body)
+
+        output = io.StringIO()
+        with patch.object(dns.subprocess, "run", return_value=failed), \
+                patch.object(dns.os, "write", side_effect=fail_final), \
+                patch.object(dns.sys, "stdout", output):
+            rc = dns.main(["apply", "--release-id", "seat-dns-test", "--ledger", str(self.ledger),
+                           "--fixture-dir", str(self.directory)])
+        self.assertEqual(rc, 2)
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(receipt["failure"], {"reason": "subprocess_failed",
+                                             "action": "DescribeRecordList", "rc": 17})
+        self.assertEqual(receipt["evidence_failure"]["errno"], errno.ENOSPC)
+        self.assertNotIn("untrusted-append-detail", output.getvalue())
+        dump(self.directory / "firstcause-proof.json", {"rc": rc, "receipt": receipt})
 
     def test_ssh_failure_drops_raw_streams(self):
         fake = subprocess.CompletedProcess([], 23, "credential-sensitive",
@@ -467,41 +828,63 @@ class DNSReleaseTests(unittest.TestCase):
         matches = [{"file": path, "pattern": name}
                    for path, text in texts.items() for name, rx in patterns.items() if rx.search(text)]
         self.assertEqual(matches, [])
-        needles = []
-        for name in (dns.ENV_ID, dns.ENV_KEY):
-            value = os.environ.get(name)
-            if value:
-                needles.append(value)
+        # This seat must not read live credentials, including inherited values.
+        needles = ["offline-" + "dns-scan-canary"]
         hits, _ = engine.scan_literal([str(p) for p in paths], needles)
         self.assertEqual(hits, 0)
         canary = self.directory / "scan-canary.txt"
-        canary.write_text("fixture-value-only\n")
-        count, rendered = engine.scan_literal([str(canary)], ["fixture-value-only"])
+        canary.write_text(needles[0] + "\n")
+        count, rendered = engine.scan_literal([str(canary)], needles)
         self.assertEqual(count, 1)
-        self.assertNotIn("fixture-value-only", "\n".join(rendered))
+        self.assertNotIn(needles[0], "\n".join(rendered))
+        absent = self.directory / "scan-absent.txt"
+        absent.write_text("public-evidence\n")
+        absent_hits, _ = engine.scan_literal([str(absent)], needles)
+        self.assertEqual(absent_hits, 0)
         dump(self.directory / "secret-scan.json", {
-            "verdict": "PASS", "files": len(paths), "shape_hits": len(matches),
-            "environment_literal_hits": hits, "environment_needles": len(needles),
-            "live_credentials_read": False, "redaction_negative_control": "PASS"})
+            "verdict": "PASS",
+            "files": [{"path": str(p.relative_to(ROOT)), "bytes": p.stat().st_size,
+                       "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in paths],
+            "shape_hits": len(matches), "synthetic_positive_hits": count,
+            "synthetic_negative_hits": absent_hits, "explicit_file_literal_hits": hits,
+            "live_credentials_read": False, "redaction_negative_control": "PASS",
+            "scope": "EXPLICIT_THREE_FILES_SHAPES_SYNTHETIC_CONTROLS_NOT_LIVE_SECRET_SCAN"})
 
 
 def run_tests(argv=None) -> int:
     global RUN
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=OUT / ("test-" + uuid.uuid4().hex))
+    parser.add_argument("--all", action="store_true", help="Run all repository unittests")
     args = parser.parse_args(argv)
     RUN = dns.external(args.out / "report.json").parent
     RUN.mkdir(parents=True, exist_ok=False)
     started = datetime.now(timezone.utc).isoformat()
     timer = time.monotonic()
     stream = io.StringIO()
-    result = unittest.TextTestRunner(stream=stream, verbosity=2).run(
-        unittest.defaultTestLoader.loadTestsFromTestCase(DNSReleaseTests))
+    if args.all:
+        suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"))
+        sys.modules["test_dns_release"].RUN = RUN
+    else:
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(DNSReleaseTests)
+    with ExitStack() as stack:
+        if args.all:
+            auxiliary = RUN / "auxiliary-tests"
+            auxiliary.mkdir()
+            stack.enter_context(patch.object(sys.modules["test_page"], "ARTIFACTS", auxiliary))
+            stack.enter_context(patch.object(sys.modules["test_solver"].numerics,
+                                            "ARTIFACT_ROOT", auxiliary))
+        stack.enter_context(redirect_stdout(stream))
+        stack.enter_context(redirect_stderr(stream))
+        result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)
     report = {"schema": "opensim.dns-tests.v1", "verdict": "PASS" if result.wasSuccessful() else "FAIL",
               "started_at": started, "collected_at": datetime.now(timezone.utc).isoformat(),
               "tests": result.testsRun, "failures": len(result.failures), "errors": len(result.errors),
+              "skips": len(result.skipped), "all_repository_unittests": args.all,
               "elapsed_seconds": round(time.monotonic() - timer, 3),
-              "scope": "OFFLINE_SUBPROCESS_ONLY", "production_mutations": 0,
+              "scope": "REAL_EXTERNAL_FS_OFFLINE_SUBPROCESS_AND_PRODUCTION_FAKE_TRANSPORT",
+              "production_mutations": 0, "live_credentials_read": False,
+              "unresolved": ["DNS-OWNERSHIP-01: trusted controller, root-managed ownership and bootstrap"],
               "source_sha256": {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
                                 for path in (ROOT / "tools/dns_release.py",
                                              ROOT / "tests/test_dns_release.py",
@@ -515,6 +898,9 @@ def run_tests(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--production-probe"]:
+        directory = dns.external(Path(sys.argv[2]) / "state.json").parent
+        raise SystemExit(production_probe(sys.argv[3:], directory))
     if sys.argv[1:2] == ["dnspod"]:
         # Hard network denial is applied inside the actual fixture subprocess,
         # not merely in the unittest parent.

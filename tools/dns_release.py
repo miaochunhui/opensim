@@ -1,22 +1,24 @@
 """Strict, fixed-target OpenSim DNS release; credentials never leave subprocess memory.
 
-Only dryrun/apply/revert are supported. Production uses the established infra
-SSH/account.conf and the read-only infra tc-api signer. --fixture-dir selects
-the in-repository, network-free subprocess fixture, never a production signer.
-JSONL evidence is external, append-only and fsynced before each mutation.
+Production supports read-only dryrun only; apply/revert fail closed even with
+--authorized (DNS-OWNERSHIP-01). Only the network-free fixture may mutate.
+External JSONL is evidence, never a production ownership or authorization source.
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import pwd
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +38,10 @@ DESIRED = {"Name": "opensim", "Type": "A", "Value": "43.135.70.136",
 TARGET = {"Domain": ZONE, **DESIRED}
 SCHEMA = "opensim.dns-release.v1"
 RELEASE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
+STORAGE_ALIAS = Path("/hf3fs-jd")
+STORAGE_ROOT = Path("/3fs/research3fs")
+MAX_LEDGER_BYTES = 16 * 1024 * 1024
+MUTATION_DISABLED = "production_mutation_disabled_missing_trusted_controller"
 
 
 class Refuse(Exception):
@@ -116,13 +122,120 @@ def same_zone(left: list[dict], right: list[dict]) -> bool:
         right, key=lambda item: item["RecordId"])
 
 
+def storage_path(path: Path) -> Path:
+    # This one deployment alias is fixed, not a user-selected symlink to follow.
+    if path == STORAGE_ALIAS or STORAGE_ALIAS in path.parents:
+        info = STORAGE_ALIAS.lstat()
+        if (not stat.S_ISLNK(info.st_mode) or info.st_uid != 0
+                or os.readlink(STORAGE_ALIAS) != str(STORAGE_ROOT)):
+            raise Refuse("storage_alias_drift")
+        return STORAGE_ROOT / path.relative_to(STORAGE_ALIAS)
+    return path
+
+
 def external(path: Path) -> Path:
-    if not path.is_absolute() or path.is_symlink():
+    if not path.is_absolute() or ".." in path.parts:
         raise Refuse("ledger_not_external_regular_path")
-    resolved = path.resolve()
-    if ARTIFACTS.resolve() not in resolved.parents or ROOT in resolved.parents:
+    physical = storage_path(path)
+    if storage_path(ARTIFACTS) not in physical.parents or ROOT in physical.parents:
         raise Refuse("ledger_outside_opensim_evidence")
-    return resolved
+    for index in range(1, len(physical.parts)):
+        part = Path(*physical.parts[:index + 1])
+        try:
+            info = part.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(info.st_mode):
+            raise Refuse("ledger_symlink_path")
+        if index < len(physical.parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            raise Refuse("ledger_parent_not_directory")
+    return physical
+
+
+def signature(info) -> tuple:
+    return (info.st_dev, info.st_ino, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def regular(info):
+    if not stat.S_ISREG(info.st_mode):
+        raise Refuse("ledger_not_regular_file")
+    if info.st_nlink != 1:
+        raise Refuse("ledger_hardlink_refused")
+    if info.st_size > MAX_LEDGER_BYTES:
+        raise Refuse("ledger_invalid_file_or_size")
+
+
+@contextmanager
+def ledger_parent(path: Path, *, create=False):
+    """Pin every directory, then recheck its binding before any ledger I/O."""
+    fds = []
+    bindings = []
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open("/", flags)
+        fds.append(fd)
+        for part in path.parts[1:-1]:
+            try:
+                child_fd = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, dir_fd=fd)
+                except FileExistsError:
+                    pass  # The competing entry must still pass no-follow open.
+                child_fd = os.open(part, flags, dir_fd=fd)
+            bindings.append((fd, part, child_fd))
+            fds.append(child_fd)
+            fd = child_fd
+
+        def verify(file_fd=None):
+            identities = []
+            try:
+                for parent_fd, name, bound_fd in bindings:
+                    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    bound = os.fstat(bound_fd)
+                    if (not stat.S_ISDIR(named.st_mode)
+                            or (named.st_dev, named.st_ino) != (bound.st_dev, bound.st_ino)):
+                        raise Refuse("ledger_parent_changed")
+                    identities.append((named.st_dev, named.st_ino))
+                if file_fd is not None:
+                    named = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+                    bound = os.fstat(file_fd)
+                    regular(named)
+                    regular(bound)
+                    if signature(named) != signature(bound):
+                        raise Refuse("ledger_path_changed")
+            except FileNotFoundError:
+                raise Refuse("ledger_path_changed") from None
+            return tuple(identities)
+
+        verify()
+        yield fd, verify
+    except OSError as exc:
+        reason = ("ledger_symlink_or_non_directory" if exc.errno in {errno.ELOOP, errno.ENOTDIR}
+                  else "ledger_io_failed")
+        raise Refuse(reason, os_errno=exc.errno) from None
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def file_bytes(fd: int) -> bytes:
+    body = bytearray()
+    while True:
+        chunk = os.read(fd, min(65536, MAX_LEDGER_BYTES + 1 - len(body)))
+        if not chunk:
+            return bytes(body)
+        body.extend(chunk)
+        if len(body) > MAX_LEDGER_BYTES:
+            raise Refuse("ledger_invalid_file_or_size")
+
+
+def fixture_mutation_only(mode: str, fixture_dir: Path | None):
+    if mode != "dryrun" and fixture_dir is None:
+        raise Refuse(MUTATION_DISABLED)
 
 
 class Ledger:
@@ -130,7 +243,9 @@ class Ledger:
         self.path = external(path)
         self.release_id = release_id
         self.backend = backend
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.signature = None
+        self.parent_binding = None
+        self.body = b""
         self.events = self.read()
         self.before = None
         self.after = None
@@ -138,11 +253,33 @@ class Ledger:
         self.verified_record_id = None
 
     def read(self) -> list[dict]:
-        if not self.path.exists():
-            return []
-        if not self.path.is_file() or self.path.stat().st_size > 16 * 1024 * 1024:
-            raise Refuse("ledger_invalid_file_or_size")
-        text = self.path.read_text(encoding="utf-8")
+        with ledger_parent(self.path, create=True) as (parent_fd, verify):
+            self.parent_binding = verify()
+            try:
+                named = os.stat(self.path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                verify()
+                return []
+            regular(named)
+            try:
+                fd = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW
+                             | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent_fd)
+            except FileNotFoundError:
+                raise Refuse("ledger_path_changed") from None
+            try:
+                info = os.fstat(fd)
+                regular(info)
+                verify(fd)
+                if signature(info) != signature(named):
+                    raise Refuse("ledger_path_changed")
+                body = file_bytes(fd)
+                verify(fd)
+                if signature(os.fstat(fd)) != signature(info):
+                    raise Refuse("ledger_changed_during_read")
+                self.signature, self.body = signature(info), body
+            finally:
+                os.close(fd)
+        text = body.decode("utf-8")
         if not text or not text.endswith("\n"):
             raise Refuse("ledger_empty_or_truncated")
         events = []
@@ -187,21 +324,43 @@ class Ledger:
                  "created_record_id": self.created_record_id,
                  "verified_record_id": self.verified_record_id, **extra}
         body = (json.dumps(entry, ensure_ascii=True, sort_keys=True) + "\n").encode()
-        # A separate exclusive lease serializes this fixed target, not an I/O
-        # flock held across external commands. Never repair/truncate old evidence.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
-        fd = os.open(self.path, flags, 0o666)
-        try:
-            with os.fdopen(fd, "ab") as stream:
-                stream.write(body)
-                stream.flush()
-                os.fsync(stream.fileno())
-            self.events.append(entry)
-        except OSError as exc:
-            raise Refuse("ledger_append_failed", os_errno=exc.errno) from None
+        if len(self.body) + len(body) > MAX_LEDGER_BYTES:
+            raise Refuse("ledger_invalid_file_or_size")
+        with ledger_parent(self.path) as (parent_fd, verify):
+            if verify() != self.parent_binding:
+                raise Refuse("ledger_parent_changed")
+            flags = os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+            if self.signature is None:
+                flags |= os.O_CREAT | os.O_EXCL
+            try:
+                fd = os.open(self.path.name, flags, 0o666, dir_fd=parent_fd)
+            except (FileExistsError, FileNotFoundError):
+                raise Refuse("ledger_path_changed") from None
+            try:
+                info = os.fstat(fd)
+                regular(info)
+                verify(fd)
+                if self.signature is not None and signature(info) != self.signature:
+                    raise Refuse("ledger_changed_before_append")
+                if file_bytes(fd) != self.body:
+                    raise Refuse("ledger_changed_before_append")
+                verify(fd)
+                if signature(os.fstat(fd)) != signature(info):
+                    raise Refuse("ledger_changed_before_append")
+                if os.write(fd, body) != len(body):
+                    raise Refuse("ledger_short_append")
+                os.fsync(fd)
+                verify(fd)
+                self.signature = signature(os.fstat(fd))
+                self.body += body
+            finally:
+                os.close(fd)
+        self.events.append(entry)
         return entry
 
     def ownership(self) -> int | None:
+        if self.backend == "production":
+            return None  # Untrusted external events cannot convey production ownership.
         intents = [e for e in self.events if e["step"] == "CREATE_INTENT"]
         acknowledgements = [e for e in self.events if e["step"] == "CREATE_ACK"]
         if not intents and not acknowledgements:
@@ -217,8 +376,10 @@ class Ledger:
 
 
 class Lease:
-    def __init__(self):
-        self.path = ARTIFACTS / "opensim-dns-release.active"
+    def __init__(self, fixture_dir: Path | None = None):
+        directory = (external(fixture_dir / "state.json").parent
+                     if fixture_dir is not None else ARTIFACTS)
+        self.path = directory / "opensim-dns-release.active"
         self.token = uuid.uuid4().hex
 
     def __enter__(self):
@@ -289,12 +450,15 @@ def credential_env(fixture_dir: Path | None) -> dict:
 
 class API:
     def __init__(self, fixture_dir: Path | None):
+        self.fixture = fixture_dir is not None
         self.signer = FIXTURE if fixture_dir is not None else SIGNER
         if not self.signer.is_file():
             raise Refuse("signer_missing")
         self.env = credential_env(fixture_dir)
 
     def call(self, action: str, payload: dict) -> dict:
+        if action != "DescribeRecordList" and not getattr(self, "fixture", False):
+            raise Refuse(MUTATION_DISABLED, action=action)
         output = child([sys.executable, "-B", str(self.signer), "dnspod", action,
                         VERSION, "-d", "-"], env=self.env, action=action,
                        body=json.dumps(payload, ensure_ascii=True))
@@ -337,6 +501,7 @@ class API:
 
 def execute(args, ledger: Ledger) -> str:
     mode = args.mode
+    fixture_mutation_only(mode, args.fixture_dir)
     ledger.created_record_id = ledger.ownership()
     api = API(args.fixture_dir)
     before = api.describe()
@@ -412,7 +577,7 @@ def main(argv=None) -> int:
     parser.add_argument("--release-id", required=True)
     parser.add_argument("--ledger", required=True, type=Path)
     parser.add_argument("--authorized", action="store_true",
-                        help="Confirm separate production authorization for this fixed DNS operation")
+                        help="Legacy flag; cannot enable disabled production apply/revert")
     parser.add_argument("--fixture-dir", type=Path,
                         help="Offline only: use in-repository fake signer, never SSH/network")
     args = parser.parse_args(argv)
@@ -426,13 +591,12 @@ def main(argv=None) -> int:
         receipt["release_id"] = args.release_id
         if pwd.getpwuid(os.geteuid()).pw_name != "infra":
             raise Refuse("requires_established_infra_identity")
-        if args.mode != "dryrun" and args.fixture_dir is None and not args.authorized:
-            raise Refuse("production_mutation_not_authorized")
+        fixture_mutation_only(args.mode, args.fixture_dir)
         external(args.ledger)
         backend = ("fixture:" + str(external(args.fixture_dir / "state.json").parent)
                    if args.fixture_dir is not None else "production")
         receipt["backend"] = backend
-        with Lease():
+        with Lease(args.fixture_dir):
             ledger = Ledger(args.ledger, args.release_id, backend)
             ledger.append(args.mode, "BEGIN")
             try:
