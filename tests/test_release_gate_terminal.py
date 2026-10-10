@@ -148,9 +148,17 @@ class FileOnlyTerminalTests(unittest.TestCase):
         dependencies = observation["artifact_validation"]
         self.assertEqual(dependencies["validator_sha256"],
                          gate.sha(gate.read_file(ROOT / "tools/workbench_acceptance.py")))
+        # These are this synthetic fixture geometry, not product coverage counts.
         self.assertEqual((dependencies["successful_posts"], dependencies["post_artifacts"],
                           dependencies["coverage_artifacts"], dependencies["pngs"]), (1, 3, 44, 88))
-        self.assertEqual(len(dependencies["dependencies"]), 135)
+        directory = self.f.directory / "audit"
+        actual = set(directory.glob("http-solve-*.json")) | set(directory.glob("*.coverage.json"))
+        actual.update(directory / row["file"] for row in self.f.reports["audit"]["screenshots"])
+        recorded = dependencies["dependencies"]
+        self.assertEqual(len(recorded), len(actual))
+        self.assertEqual({Path(row["path"]) for row in recorded}, actual)
+        for row in recorded:
+            self.assertEqual(row["sha256"], gate.sha(gate.read_file(Path(row["path"]))))
         self.assertTrue(observation["remaining"])
         self.stable(before)
 
@@ -166,14 +174,20 @@ class FileOnlyTerminalTests(unittest.TestCase):
         argv = [sys.executable, "-B", str(self.f.repo / "tools/release_gate.py"),
                 "--source-root", str(self.f.repo), "--commit", self.f.commit,
                 "--ledger", str(self.f.ledger_path), "--out", str(out)]
-        process = subprocess.run(argv, cwd=self.f.repo, capture_output=True, text=True,
+        process = subprocess.run(argv, cwd=self.f.repo, capture_output=True,
                                  env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
-        put(self.case / "launcher.stdout", process.stdout.encode())
-        put(self.case / "launcher.stderr", process.stderr.encode())
+        streams = {}
+        for name in ("stdout", "stderr"):
+            body = getattr(process, name)
+            path = self.case / ("launcher." + name)
+            put(path, body)
+            self.assertEqual(path.read_bytes(), body)
+            self.assertEqual(path.stat().st_size, len(body))
+            streams[name] = {"path": str(path), "bytes": len(body), "sha256": gate.sha(body)}
         report = gate.decode(gate.read_file(out))
         gate.write_new(self.case / "launcher.json", gate.encode({
             "scope": SCOPE, "argv": argv, "rc": process.returncode,
-            "stdout_sha256": gate.sha(process.stdout.encode()), "stderr_sha256": gate.sha(process.stderr.encode()),
+            "streams": streams,
             "report_sha256": gate.sha(gate.read_file(out)), "first_cause": report.get("failure"),
             "final_human_sentinel": "NOT_TESTED", "collected_at": datetime.now(timezone.utc).isoformat()}))
         self.assertEqual(process.returncode, 1, process.stderr)
@@ -186,7 +200,7 @@ class FileOnlyTerminalTests(unittest.TestCase):
         log = gate.read_file(out.with_suffix(".log"))
         self.assertEqual(report["execution_log"]["sha256"], gate.sha(log))
         self.assertIn(CAUSE.encode(), log)
-        self.assertIn("verdict=BLOCKED rc=1", process.stdout)
+        self.assertIn(b"verdict=BLOCKED rc=1", process.stdout)
         self.assertNotIn("trusted human-acceptance verifier unavailable", log.decode())
         self.assertFalse(list(self.case.glob("*.failure-*.json")))
         self.assertEqual(set(path.name for path in self.case.iterdir()), {

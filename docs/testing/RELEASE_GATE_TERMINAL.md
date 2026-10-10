@@ -25,6 +25,9 @@ before consumption. All five source files and every required tool must match
 the candidate bytes. Four viewports each include eleven whole/tile states:
 44 coverage files, 88 PNGs, three POST metadata files, sixteen injections.
 The real reader validates these dependencies, including hashes and dimensions.
+Those numbers are fixed synthetic fixture geometry, not product coverage counts.
+The reader dependency list is checked against the actual complete file set and
+each stored SHA; its count is derived from that inventory, not a hardcoded 135.
 
 Only two new tests are retained: a complete AUTOMATED_SCOPE_PASS reader positive
 control (AUTOMATIC_SCOPE_OBSERVED / NOT_CERTIFIED), and a complete real gate CLI
@@ -60,6 +63,10 @@ mtime, compares them afterwards and rechecks the clean fixture Git identity.
 Real CLI argv/rc/stdout/stderr, first cause, gate report and durable log hash are
 retained. The candidate tool/test/document SHA and HEAD are compared before and
 after the suite. Only expected observation files may appear in each CLI case.
+CLI stdout/stderr are captured as bytes without text newline conversion. Empty
+streams remain actual zero-byte files, not EMPTY placeholders. launcher.json
+records each stream path, actual byte count and SHA, and the test reads every
+file back against the original subprocess bytes and size.
 This proves file-input stability and no fixture publication side effects; it is
 not a sandbox proof against arbitrary malicious code or a production rollback.
 
