@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -29,7 +30,7 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from solver import solve_case
-from tools.render_page import SOURCE_PATHS, _source_metadata
+from tools.render_page import SOURCE_PATHS, _source_metadata, render_page
 
 PUBLIC_URL = "https://opensim.ai4everyone.top"
 ARTIFACT_ROOT = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1")
@@ -92,6 +93,42 @@ def fetch(base: str, path: str, payload: dict | None = None) -> tuple[bytes, dic
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise GateError(message)
+
+
+class AssetReferences(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.references = []
+
+    def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        if tag == "script":
+            self.references.append(("js", values.get("src")))
+        elif tag == "link" and values.get("rel") == "stylesheet":
+            self.references.append(("css", values.get("href")))
+
+
+def page_assets(html: str) -> list[tuple[str, str]]:
+    """Check the assets browsers actually load, not unrelated legacy aliases."""
+    actual = AssetReferences()
+    actual.feed(html)
+    desired = AssetReferences()
+    desired.feed(render_page())
+    require(len(desired.references) == 2
+            and {kind for kind, _ in desired.references} == {"js", "css"},
+            "Local generated asset contract is incomplete")
+    require(actual.references == desired.references,
+            "Page asset references differ from the desired generated page")
+    result = []
+    for kind, relative in actual.references:
+        require(isinstance(relative, str), "Page asset reference missing")
+        parsed = urlsplit(relative)
+        require(not parsed.scheme and not parsed.netloc and not parsed.query
+                and not parsed.fragment and relative.startswith("web/app.")
+                and relative.endswith("." + kind) and ".." not in relative,
+                "Page asset reference is not a bounded same-origin resource")
+        result.append((f"web/app.{kind}", "/" + relative))
+    return result
 
 
 def compare_solution(actual: object, config: dict, sources: dict, started: float) -> dict:
@@ -171,11 +208,13 @@ def check_endpoint(base: str = PUBLIC_URL, *, public: bool = True) -> dict:
         html = fetch(base, "/")[0].decode("utf-8")
         require(report["page_build"] in html and 'id="case-form"' in html
                 and 'id="workspace"' in html, "Page is missing the desired workbench")
-        for relative in ("web/app.js", "web/app.css"):
-            asset = fetch(base, "/" + relative)[0]
+        references = page_assets(html)
+        for relative, asset_path in references:
+            asset = fetch(base, asset_path)[0]
             require(hashlib.sha256(asset).hexdigest() == sources[relative],
                     f"Wrong asset: {relative}")
-        report["checks"].append({"name": "page_and_assets", "verdict": "PASS"})
+        report["checks"].append({"name": "page_and_assets", "verdict": "PASS",
+                                 "references": dict(references)})
         # A new pressure for every observation makes an old canned result detectable.
         pressure = 0.5 + secrets.randbelow(500_000) / 1_000_000
         for geometry, height in (("circle", 4.0), ("rectangle", 2.0)):

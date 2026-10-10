@@ -9,8 +9,10 @@ from unittest.mock import patch
 
 from server import ApplicationServer
 from tools.public_gate import (
-    GateError, PUBLIC_URL, check_endpoint, compare_solution, source_hashes, strict_json,
+    GateError, PUBLIC_URL, check_endpoint, compare_solution, page_assets,
+    source_hashes, strict_json,
 )
+from tools.render_page import render_page
 from solver import solve_case
 from tools.snapshot import read_public_report
 
@@ -66,7 +68,7 @@ class PublicGateTests(unittest.TestCase):
         from tools.public_gate import fetch as real_fetch
 
         def fetch(base, path, payload=None):
-            if path == "/web/app.css":
+            if path.startswith("/web/app.") and path.endswith(".css"):
                 return b"", {}
             return real_fetch(base, path, payload)
 
@@ -74,6 +76,21 @@ class PublicGateTests(unittest.TestCase):
             report = check_endpoint(self.url, public=False)
         self.assertEqual(report["verdict"], "FAIL")
         self.assertIn("Wrong asset", report["failure"]["reason"])
+
+    def test_page_references_are_real_generated_bounded_assets(self):
+        html = render_page()
+        references = page_assets(html)
+        self.assertEqual({source for source, _ in references},
+                         {"web/app.js", "web/app.css"})
+        for mutant in (
+            html.replace('rel="stylesheet"', 'rel="alternate"'),
+            html.replace('src="web/app.', 'src="https://other.invalid/web/app.'),
+            html.replace('href="web/app.', 'href="../web/app.'),
+            html.replace("</head>", '<script src="web/extra.js"></script></head>'),
+            "<html><head></head></html>",
+        ):
+            with self.subTest(mutant=mutant[:40]), self.assertRaises(GateError):
+                page_assets(mutant)
 
     def test_field_metric_and_provenance_mutants(self):
         from datetime import datetime, timezone
