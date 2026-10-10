@@ -77,6 +77,40 @@ def health_at(url: str) -> dict:
         return {"status": "FAILED", "error_type": type(exc).__name__, "error": str(exc)}
 
 
+def read_public_report(file: Path) -> dict:
+    file = file.resolve(strict=True)
+    content = file.read_bytes()
+    value = json.loads(content)
+    if (not isinstance(value, dict) or value.get("scope") != "PUBLIC_CODE_AND_FEM"
+            or value.get("url") != f"https://{DOMAIN}"
+            or value.get("verdict") not in ("PASS", "FAIL")):
+        raise ValueError("public snapshot requires a terminal real public code/FEM observation")
+    if value["verdict"] == "PASS":
+        from tools.render_page import SOURCE_PATHS
+        if set(value.get("source_sha256", {})) != set(SOURCE_PATHS):
+            raise ValueError("public gate source set is incomplete")
+        for relative, expected in value["source_sha256"].items():
+            if hashlib.sha256((ROOT / relative).read_bytes()).hexdigest() != expected:
+                raise ValueError(f"passing public gate is stale: {relative}")
+        checks = value.get("checks")
+        expected_checks = {"runtime_identity", "page_and_assets",
+                           "real_fem_circle", "real_fem_rectangle"}
+        if (not isinstance(checks, list) or len(checks) != 4
+                or any(not isinstance(item, dict) or item.get("verdict") != "PASS" for item in checks)
+                or {item.get("name") for item in checks} != expected_checks):
+            raise ValueError("passing public gate lacks successful real FEM checks")
+        collected = datetime.fromisoformat(value["collected_at"])
+        if (collected.tzinfo is None
+                or not 0 <= (datetime.now(timezone.utc) - collected).total_seconds() <= 600):
+            raise ValueError("passing public gate observation is not fresh within 10 minutes")
+    return {
+        "status": value["verdict"], "path": str(file),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "collected_at": value["collected_at"], "failure": value.get("failure"),
+        "release_certification": value.get("release_certification", "NOT_ASSESSED"),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
@@ -84,6 +118,8 @@ def main() -> int:
     parser.add_argument("--local", type=Path, required=True)
     parser.add_argument("--browser", type=Path, required=True)
     parser.add_argument("--local-url", default="http://127.0.0.1:8772")
+    parser.add_argument("--public-report", type=Path,
+                        help="Real code/FEM gate report; health alone is not public delivery")
     parser.add_argument("--production-changes", choices=("not-assessed", "none", "applied"),
                         default="not-assessed",
                         help="Operator declaration, not automatically verified deployment evidence")
@@ -96,6 +132,9 @@ def main() -> int:
         parser.error("use a new snapshot path; previous evidence is preserved")
     evidence = {kind: read_report(getattr(args, kind), kind)
                 for kind in ("numerics", "local", "browser")}
+    public_report = {"status": "NOT_COLLECTED"}
+    if args.public_report:
+        public_report = read_public_report(args.public_report)
     try:
         addresses = sorted({entry[4][0] for entry in socket.getaddrinfo(DOMAIN, 443)})
         dns = {"status": "resolved", "addresses": addresses}
@@ -110,6 +149,7 @@ def main() -> int:
         "head": git("rev-parse", "HEAD"), "branch": git("branch", "--show-current"),
         "git_status": git("status", "--short"), "evidence": evidence,
         "public_dns": dns, "public_health": health,
+        "public_code_and_fem": public_report,
         "local_health": health_at(args.local_url.rstrip("/") + "/api/health"),
         "production_changes": {"operator_declaration": args.production_changes,
                                "verification": "NOT_AUTOMATICALLY_VERIFIED"},

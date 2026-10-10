@@ -37,5 +37,7 @@ JavaScript 语法及页面生成；第二条为真实 Chromium 自动化，不�
 开发契约见 `docs/CONTRACT.md`，范围与迭代门见 `docs/ROADMAP.md`，
 跨仓提案见 `docs/INTEGRATION.md`，待授权发布与回退见 `docs/DEPLOYMENT.md`。
 所有实验结果与浏览器证据外置。
+公网同版本交付门、专属持续巡检和当前欠账见 `docs/PUBLIC_SYNC.md`；
+巡检不自动发布，公网检查尚未通过时不能称交付完成。
 本地验收与当前实例的断点见 `docs/handoff/20261010-fluid-v1-local.md`。
 本仓未指定开源许可证，需由权利人决定后再声明授权条款。

@@ -11,6 +11,12 @@
 - OpenCAD 与 openopt 仅经版本化文件契约协作，不修改两仓资产或代签接口共识。
 - 生产发布只针对 `opensim.ai4everyone.top`；修改共享网络入口前确认授权、
   当前目标与回退路径。不改凭据，不提交 secret，不自动 push。
+- 产品更新的交付必须包含公网同版本回读与真实计算。运行
+  `tools/public_gate.py` 的公网终判为 PASS 才能称“公网同步”；
+  本地测试、健康 200、巡检安装和仅文档承诺都不能代替。发布还须满足
+  `docs/PUBLIC_SYNC.md` 的完整发布门，不能自动发布未验或共享树在制品。
+- `opensim-public-watch.timer` 只持续发现和通知公网不同步，不拥有部署权限。
+  首次上线、自动发布链和恢复实证尚未通过时必须明确记为未完成。
 - 实现席使用独立 worktree、`codex/` 分支和独占文件；主席整合、测试与提交。
 
 接口见 `docs/CONTRACT.md`；运行入口与已验证范围见 `README.md`。

@@ -100,7 +100,21 @@
     exactKeys(result, hasStamp ? [...RESULT_KEYS, "reproducibility"] : RESULT_KEYS, "求解结果");
     if (hasStamp) {
       const stamp = result.reproducibility;
-      exactKeys(stamp, ["computed_at", "config_sha256", "solver_sha256", "python", "numpy", "scipy"], "复现信息");
+      const hasSources = Object.hasOwn(stamp, "source_sha256");
+      const stampKeys = ["computed_at", "config_sha256", "solver_sha256", "python", "numpy", "scipy"];
+      exactKeys(stamp, hasSources ? [...stampKeys, "source_sha256"] : stampKeys, "复现信息");
+      if (hasSources) {
+        const sources = stamp.source_sha256;
+        exactKeys(sources, ["solver.py", "server.py", "tools/render_page.py", "web/app.js", "web/app.css"], "运行源码");
+        for (const value of Object.values(sources)) {
+          if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
+            throw new CaseError("运行源码中的 SHA-256 格式无效。");
+          }
+        }
+        if (sources["solver.py"] !== stamp.solver_sha256) {
+          throw new CaseError("运行源码与求解器身份不一致。");
+        }
+      }
       if (typeof stamp.computed_at !== "string" ||
           !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(stamp.computed_at) ||
           !Number.isFinite(Date.parse(stamp.computed_at))) throw new CaseError("计算时间格式无效。");

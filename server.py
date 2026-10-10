@@ -20,14 +20,13 @@ import numpy
 import scipy
 
 from solver import InputError, SolverError, solve_case
-from tools.render_page import render_page
+from tools.render_page import SOURCE_PATHS, _source_metadata, render_page
 
 ROOT = Path(__file__).resolve().parent
 MAX_BODY = 16384
 RUNTIME_SOURCES = {
     relative: hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
-    for relative in ("solver.py", "server.py", "tools/render_page.py",
-                     "web/app.js", "web/app.css")
+    for relative in SOURCE_PATHS
 }
 
 
@@ -148,7 +147,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlsplit(self.path).path
         if path == "/api/health":
-            self.json_response(200, {"status": "ok", "schema_version": 1})
+            self.json_response(200, {
+                "status": "ok", "schema_version": 1,
+                "source_sha256": RUNTIME_SOURCES,
+                "page_build": _source_metadata()[2],
+            })
             return
         if path in ("/", "/index-v1.html"):
             try:
@@ -241,6 +244,7 @@ class Handler(BaseHTTPRequestHandler):
                 "computed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "config_sha256": hashlib.sha256(canonical).hexdigest(),
                 "solver_sha256": RUNTIME_SOURCES["solver.py"],
+                "source_sha256": RUNTIME_SOURCES,
                 "python": platform.python_version(),
                 "numpy": numpy.__version__,
                 "scipy": scipy.__version__,

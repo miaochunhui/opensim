@@ -66,10 +66,7 @@ def _source_metadata() -> tuple[str, str, str]:
     fingerprint = sha256()
     for relative in SOURCE_PATHS:
         source = root / relative
-        try:
-            modified = source.stat().st_mtime_ns
-        except FileNotFoundError:
-            continue
+        modified = source.stat().st_mtime_ns
         modified_times.append(modified)
         fingerprint.update(relative.encode("ascii") + b"\0" + source.read_bytes() + b"\0")
     if not modified_times:
@@ -261,7 +258,7 @@ def render_page(evidence: Path | None = None) -> str:
 
     None displays 未采集. Explicit missing, unreadable, malformed, duplicate-key,
     empty or non-finite evidence raises rather than claiming verification.
-    Editing time is the maximum mtime of existing application sources.
+    Editing time is the maximum mtime of all required application sources.
     """
     edited_iso, edited_text, fingerprint = _source_metadata()
     evidence_html = _evidence_html(evidence)

@@ -1,0 +1,11 @@
+[Unit]
+Description=Observe OpenSim public synchronization every two minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=120s
+AccuracySec=5s
+Unit=opensim-public-watch.service
+
+[Install]
+WantedBy=timers.target

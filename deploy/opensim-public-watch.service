@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenSim public source and real FEM delivery gate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=infra
+Group=infra
+WorkingDirectory=/data/dev/opensim
+ExecStart=/usr/bin/python3 -B /data/dev/opensim/tools/public_watch.py
+StateDirectory=opensim-public-watch
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/hf3fs-jd/data/tmp/opensim-fluid-v1/public-watch
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+MemoryMax=512M
+TasksMax=32
+UMask=0027

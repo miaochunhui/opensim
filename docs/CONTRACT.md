@@ -51,11 +51,16 @@ warnings = [str]
 ```
 
 `tools/validate_numerics.py` 独占数值报告生成，运行后写入指定外置 `--out`。
-HTTP `GET /api/health` 返回 `{status:"ok",schema_version:1}`。
+HTTP `GET /api/health` 返回 `{status:"ok",schema_version:1,source_sha256,page_build}`；
+`source_sha256` 是五份应用运行源码的完整 SHA256 映射，`page_build` 是页面构建摘要。
 `POST /api/solve` 只收以上 config，不接文件、任意表达式或执行指令；
 成功返回 solver 结果，失败返回 `{error:{code,message,field?}}`，400/422/503/500
 区分坏 JSON、非法配置、忙和内部错误。单次计算有界，浏览器无共享文档。
 GET `/` 及 `/index-v1.html` 由 Python 生成；assets 只读允许目录。
+HTTP 成功结果另带 `reproducibility`，包含 `computed_at`、`config_sha256`、
+`solver_sha256`、`python`、`numpy`、`scipy` 和 `source_sha256`。
+前端兼容旧导出结果缺少 `source_sha256` 的格式；新字段存在则必须包含
+五份源码且求解器摘要一致。旧格式仍须导入重算，不能作为公网版本证据。
 
 ## DOM 契约
 
