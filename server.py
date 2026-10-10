@@ -202,6 +202,9 @@ class Handler(BaseHTTPRequestHandler):
                 "page_build": _source_metadata()[2],
             })
             return
+        if path == "/favicon.ico":
+            self.respond(204, b"", "image/x-icon", "public, max-age=86400")
+            return
         if path in ("/", "/index-v1.html"):
             try:
                 html = render_page(evidence=self.server.evidence)

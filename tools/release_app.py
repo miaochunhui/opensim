@@ -421,11 +421,26 @@ def validate_live(layout: Layout, receipt: dict) -> dict:
     require(read_file(layout.unit) == unit_bytes(layout, release) and
             sha(read_file(layout.unit)) == receipt["unit_sha256"], "Live unit byte drift")
     require(stat.S_IMODE(layout.unit.stat().st_mode) == 0o644, "Live unit mode drift")
+    validate_log_directory(layout)
     if layout.fixture is None:
         for path in (layout.unit, layout.state, release, *release.rglob("*")):
             root_owned(path)
         validate_unit_locations(layout)
     return manifest
+
+
+def validate_log_directory(layout: Layout) -> None:
+    no_symlinks(layout.logs)
+    require(layout.logs.is_dir(), "Application log directory is missing or not a directory")
+    if layout.fixture is None:
+        import pwd
+        info = layout.logs.stat()
+        require(info.st_uid == pwd.getpwnam("infra").pw_uid and
+                info.st_mode & 0o300 == 0o300,
+                "Application log directory must be owned and writable/searchable by infra")
+    else:
+        require(os.access(layout.logs, os.W_OK | os.X_OK),
+                "Application log directory is not writable/searchable")
 
 
 def validate_unit_locations(layout: Layout) -> None:
@@ -543,10 +558,7 @@ def install(layout: Layout, bundle: Path, digest: str, commit: str,
         require_controller()
         for path in (layout.releases, layout.unit, layout.state):
             root_owned(path)
-        import pwd
-        require(layout.logs.is_dir() and
-                layout.logs.stat().st_uid == pwd.getpwnam("infra").pw_uid,
-                "Application log directory must already exist and be owned by infra")
+        validate_log_directory(layout)
     else:
         require(os.geteuid() != 0 and not authorize_restart,
                 "Fixture must be non-root with no service authorization")
@@ -792,8 +804,9 @@ def main(argv: list[str] | None = None) -> int:
                 "Service authorization applies only to --apply/--revert")
         if os.geteuid() == 0:
             require_controller()
-        out = external(args.out)
-        out.mkdir(parents=True, exist_ok=False)
+        candidate_out = external(args.out)
+        candidate_out.mkdir(parents=True, exist_ok=False)
+        out = candidate_out
         if args.prepare:
             require(args.source_root is not None and args.evidence is not None and
                     args.bundle is not None, "Preparation requires source-root/evidence/bundle")
@@ -816,19 +829,52 @@ def main(argv: list[str] | None = None) -> int:
         report["failure"] = {"type": type(exc).__name__, "reason": str(exc)}
     report["commands"] = COMMANDS.copy()
     report["exit_code"] = 1 if report["state"] == "FAILED" else 0
-    line = (f"OPENSIM_APP_RELEASE state={report['state']} rc={report['exit_code']} "
-            f"collected_at={report['collected_at']} out={out or args.out}")
+    def result_line() -> str:
+        return (f"OPENSIM_APP_RELEASE state={report['state']} rc={report['exit_code']} "
+                f"collected_at={report['collected_at']} out={out or args.out}")
+
     if out is not None:
+        # The action result is provisional until both evidence writes succeed.
+        initial = {"state": report["state"], "exit_code": report["exit_code"],
+                   "failure": report.get("failure")}
         try:
-            write_new(out / "report.json", encode(report), 0o644)
             write_new(out / "execution.log",
-                      (line + "\n" + report.get("failure", {}).get("reason", "") + "\n").
+                      (result_line() + " evidence_pending=1\n" +
+                       report.get("failure", {}).get("reason", "") + "\n").
                       encode("utf-8"), 0o644)
         except Exception as exc:
-            print(f"Evidence failure: {type(exc).__name__}: {exc}; first result={line}",
+            report["action_result"] = initial
+            report["evidence_failure"] = {"type": type(exc).__name__, "reason": str(exc),
+                                          "path": str(out / "execution.log")}
+            report["state"], report["exit_code"] = "FAILED", 1
+            if not report.get("failure"):
+                report["failure"] = report["evidence_failure"]
+        try:
+            write_new(out / "report.json", encode(report), 0o644)
+        except Exception as exc:
+            prior_body = encode(report)
+            report["action_result"] = initial
+            report["evidence_failure"] = {"type": type(exc).__name__, "reason": str(exc),
+                                          "path": str(out / "report.json")}
+            report["state"], report["exit_code"] = "FAILED", 1
+            if not report.get("failure"):
+                report["failure"] = report["evidence_failure"]
+            # A late fsync/readback failure may leave all bytes on disk.
+            # Revoke only our exact provisional report, never unknown evidence.
+            try:
+                if optional_file(out / "report.json") == prior_body:
+                    replace_guarded(out / "report.json", prior_body, encode(report), 0o644)
+            except Exception as recovery:
+                print(f"Failed evidence revocation: {type(recovery).__name__}: {recovery}; "
+                      "invocation unverified; never accept report without successful process rc",
+                      file=sys.stderr)
+            print(f"Evidence failure: {type(exc).__name__}: {exc}; "
+                  f"first action={initial}; no final success report",
                   file=sys.stderr)
             return 1
-    print(line)
+    print(result_line())
+    if report.get("evidence_failure"):
+        print("Evidence cause: " + report["evidence_failure"]["reason"], file=sys.stderr)
     if report.get("failure"):
         print("First cause: " + report["failure"]["reason"], file=sys.stderr)
     return report["exit_code"]

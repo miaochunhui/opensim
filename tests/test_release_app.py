@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import errno
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -209,6 +210,19 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(app.ReleaseError, "unit mode drift"):
             app.check(self.layout)
 
+    def test_missing_non_directory_or_unwritable_logs_blocks_check(self):
+        self.install()
+        self.layout.logs.rmdir()
+        with self.assertRaisesRegex(app.ReleaseError, "log directory"):
+            app.check(self.layout)
+        self.layout.logs.write_bytes(b"NOT A DIRECTORY\n")
+        with self.assertRaisesRegex(app.ReleaseError, "log directory"):
+            app.check(self.layout)
+        self.layout.logs.unlink()
+        self.layout.logs.mkdir(mode=0o500)
+        with self.assertRaisesRegex(app.ReleaseError, "not writable"):
+            app.check(self.layout)
+
     def test_same_release_not_reinstalled_or_receipt_overwritten(self):
         self.install()
         before = self.layout.state.read_bytes()
@@ -407,6 +421,85 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(failed["state"], "FAILED")
         self.assertIn("SHA drift", failed["failure"]["reason"])
         self.assertIn("rc=1", (self.case / "cli-fail/execution.log").read_text())
+
+    def test_log_write_failure_never_leaves_success_report(self):
+        for fail_action in (False, True):
+            with self.subTest(fail_action=fail_action):
+                out = self.case / ("log-fail-" + str(fail_action))
+                args = ["--bundle", str(self.bundle), "--commit", self.commit,
+                        "--manifest-sha256", "0" * 64 if fail_action else self.digest,
+                        "--fixture-root", str(self.case / "host"), "--out", str(out)]
+                original = app.write_new
+
+                def failing_write(path, body, mode=0o444):
+                    if path.name == "execution.log":
+                        raise OSError(errno.ENOSPC, "injected log disk full")
+                    return original(path, body, mode)
+
+                with patch.object(app, "write_new", side_effect=failing_write):
+                    self.assertEqual(app.main(args), 1)
+                report = app.decode((out / "report.json").read_bytes())
+                self.assertEqual((report["state"], report["exit_code"]), ("FAILED", 1))
+                self.assertIn("injected log disk full", report["evidence_failure"]["reason"])
+                self.assertEqual(report["action_result"]["exit_code"], int(fail_action))
+                if fail_action:
+                    self.assertIn("SHA drift", report["failure"]["reason"])
+
+    def test_report_write_failure_does_not_print_final_success(self):
+        out = self.case / "report-fail"
+        args = ["--bundle", str(self.bundle), "--commit", self.commit,
+                "--manifest-sha256", self.digest, "--fixture-root", str(self.case / "host"),
+                "--out", str(out)]
+        original = app.write_new
+
+        def failing_write(path, body, mode=0o444):
+            if path.name == "report.json":
+                raise OSError(errno.ENOSPC, "injected report disk full")
+            return original(path, body, mode)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(app, "write_new", side_effect=failing_write), \
+                patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            self.assertEqual(app.main(args), 1)
+        self.assertFalse((out / "report.json").exists())
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("injected report disk full", stderr.getvalue())
+        self.assertIn("evidence_pending=1", (out / "execution.log").read_text())
+
+    def test_existing_output_directory_is_not_written_into(self):
+        out = self.case / "existing-output"
+        out.mkdir()
+        sentinel = out / "owner.txt"
+        sentinel.write_bytes(b"OWNER BYTES\n")
+        args = ["--bundle", str(self.bundle), "--commit", self.commit,
+                "--manifest-sha256", self.digest, "--fixture-root", str(self.case / "host"),
+                "--out", str(out)]
+        self.assertEqual(app.main(args), 1)
+        self.assertEqual(list(out.iterdir()), [sentinel])
+        self.assertEqual(sentinel.read_bytes(), b"OWNER BYTES\n")
+
+    def test_late_report_persistence_failure_revokes_exact_success_bytes(self):
+        out = self.case / "late-report-fail"
+        args = ["--bundle", str(self.bundle), "--commit", self.commit,
+                "--manifest-sha256", self.digest, "--fixture-root", str(self.case / "host"),
+                "--out", str(out)]
+        original = app.sync_directory
+        injected = False
+
+        def failing_sync(path):
+            nonlocal injected
+            original(path)
+            if path == out and (out / "report.json").exists() and not injected:
+                injected = True
+                raise OSError(errno.EIO, "injected final report persistence failure")
+
+        with patch.object(app, "sync_directory", side_effect=failing_sync):
+            self.assertEqual(app.main(args), 1)
+        self.assertTrue(injected)
+        report = app.decode((out / "report.json").read_bytes())
+        self.assertEqual((report["state"], report["exit_code"]), ("FAILED", 1))
+        self.assertEqual(report["action_result"]["state"], "DRY_RUN")
+        self.assertIn("injected final report", report["evidence_failure"]["reason"])
 
     def test_probe_rejects_health_only_canned_results_no_false_pass(self):
         self.install()

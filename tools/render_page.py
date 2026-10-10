@@ -277,6 +277,7 @@ def render_page(evidence: Path | None = None) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="OpenSim 中文流体有限元工作台：圆管与矩形直管的充分发展稳态层流横截面求解，不是通用 CFD。">
   <title>OpenSim · 直管流体有限元工作台 v{VERSION}</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23164e63'/%3E%3Cpath d='M5 12Q11 6 17 12T29 12M5 20Q11 14 17 20T29 20' fill='none' stroke='%23ffffff' stroke-width='3'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="{resources['css']}">
   <script src="{resources['js']}" defer></script>
 </head>

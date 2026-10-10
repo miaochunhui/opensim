@@ -46,6 +46,17 @@ Every invocation requires a fresh `--out` directory below
 `/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-release/`. Reports and execution logs
 preserve first causes and subprocess exit codes. Existing evidence is not
 overwritten. A failed action exits 1, including evidence-write failure.
+`execution.log` records a provisional action result (`evidence_pending=1`).
+Only the subsequently written `report.json` and final console verdict confirm
+the invocation result. A log-write failure produces a failed report retaining
+the original action result and first cause; a report-write failure emits no
+final success verdict. Existing output directories are rejected without writes.
+If a late persistence check fails after the exact report bytes exist, the tool
+guardedly replaces only those bytes with a failed report. Revocation failure is
+explicit and unverified. Consumers must require a successful process exit as
+well as matching final evidence; no standalone JSON can prove disk durability
+after an interrupted process.
+Installed-file checks also reject missing, non-directory or unusable log paths.
 Paths resolving through the existing 3FS mount are accepted; other symlink
 parents, hardlinked inputs and unbounded payloads are rejected.
 

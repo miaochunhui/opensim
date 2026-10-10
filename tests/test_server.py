@@ -85,6 +85,16 @@ class HTTPTests(unittest.TestCase):
                 self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
                 self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
 
+    def test_explicit_empty_favicon_get_and_head(self):
+        for method in ("GET", "HEAD"):
+            with self.subTest(method=method):
+                status, headers, body = self.request("/favicon.ico", method=method)
+                self.assertEqual(status, 204)
+                self.assertEqual(body, b"")
+                self.assertEqual(headers["Content-Length"], "0")
+                self.assertEqual(headers["Content-Type"], "image/x-icon")
+                self.assertEqual(headers["Cache-Control"], "public, max-age=86400")
+
     def test_reject_json_and_config(self):
         for body, expected in [(b"{", 400), (b'{"x":NaN}', 400),
                                (b'{"x":1,"x":2}', 400), ({}, 422),

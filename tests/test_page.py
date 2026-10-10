@@ -51,6 +51,7 @@ class PageMetadataTests(unittest.TestCase):
         first = render_page()
         self.assertEqual(first.encode("utf-8"), render_page().encode("utf-8"))
         self.assertGreater(check_page(first)["checks"], 0)
+        self.assertIn('rel="icon" type="image/svg+xml" href="data:image/svg+xml,', first)
         self.assertEqual(SOURCE_PATHS, ("tools/render_page.py", "web/app.js", "web/app.css",
                                        "solver.py", "server.py"))
         (self.root / "web/app.css").unlink()
