@@ -7,6 +7,7 @@
  * node tools/browser_check.mjs --selftest \
  *   --out /hf3fs-jd/data/tmp/opensim-fluid-v1/browser
  * --probe-input with --url runs only the 390px solve/export/input regression.
+ * --probe-screenshot with --url tests only full 200% text screenshot coverage.
  *
  * Requires Node >= 22 (native WebSocket) or existing ws, and local Chromium.
  * Each invocation keeps an immutable run directory, including failed runs.
@@ -38,6 +39,18 @@
  * Navigation now requires enabled form controls and aria-busy=false; if an
  * auto-solve was observed it must finish successfully. Reset requires its new
  * HTTP result, enabled export, non-stale metrics and completed form state.
+ *
+ * DIAGNOSIS capture: run-2026-10-10T06-49-45-624Z-e5fa45c7 measured a
+ * finite 345x25463 CSS page. A hard-coded 20000px height cap incorrectly
+ * classified it as unbounded. Full coverage is now captured in bounded tiles
+ * without scaling, hiding content or changing layout. Tiles are sequential
+ * with a 16 MiB RGBA allocation bound, not a document-height guess.
+ * captureBeyondViewport also changed 345x25463 into 360x23597 in probe
+ * run-2026-10-10T06-52-45-825Z-fad77c29, so viewport crops now scroll through
+ * the unchanged page and restore the original scroll position in finally.
+ * Probe run-2026-10-10T06-53-51-103Z-235f11b5 captured 32 complete tiles.
+ * A coverage manifest verifies every original pixel; this is capture evidence
+ * only, not a text-layout PASS or a full viewport-matrix certification.
  */
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -52,6 +65,8 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OUTPUT_ROOT = '/hf3fs-jd/data/tmp/opensim-fluid-v1/browser';
 const DEFAULT_CHROME = '/home/mch/.cache/ms-playwright/chromium-1187/chrome-linux/chrome';
+const CAPTURE_TILE_BYTES = 16 * 1024 * 1024;
+const CAPTURE_TILE_AXIS = 16384;
 const MATRIX = [
   ['mobile-narrow', 320, 568, true], ['mobile-common', 360, 800, true],
   ['mobile-wide', 390, 844, true], ['tablet-portrait', 768, 1024, true],
@@ -97,6 +112,52 @@ function validatePng(buffer) {
   const dimensions = { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
   assert(dimensions.width > 0 && dimensions.height > 0, 'Empty screenshot dimensions');
   return { ...dimensions, bytes: buffer.length, sha256: digest(buffer) };
+}
+function capturePlan(content, dpr, viewport) {
+  requireCheck(content && ['x', 'y', 'width', 'height'].every(key => Number.isFinite(content[key])) &&
+    content.width > 0 && content.height > 0 && Number.isFinite(dpr) && dpr > 0,
+  'SCREENSHOT', 'Empty/nonfinite screenshot content or DPR', { content, dpr });
+  const width = Math.ceil(content.width), height = Math.ceil(content.height);
+  const pixelWidth = Math.ceil(width * dpr), pixelHeight = Math.ceil(height * dpr);
+  const rawBytes = pixelWidth * pixelHeight * 4;
+  requireCheck(Number.isSafeInteger(rawBytes) && rawBytes > 0,
+    'SCREENSHOT-BUDGET', 'Full-resolution screenshot has unsafe pixel dimensions',
+    { content, dpr, raw_bytes: rawBytes });
+  requireCheck(viewport && Number.isFinite(viewport.width) && viewport.width > 0 &&
+    Number.isFinite(viewport.height) && viewport.height > 0,
+  'SCREENSHOT', 'Empty/nonfinite capture viewport', { viewport });
+  const tileWidth = Math.min(width, Math.floor(viewport.width), Math.floor(CAPTURE_TILE_AXIS / dpr));
+  const tileHeight = Math.min(height, Math.floor(viewport.height), Math.floor(CAPTURE_TILE_AXIS / dpr),
+    Math.floor(CAPTURE_TILE_BYTES / (Math.ceil(tileWidth * dpr) * 4 * dpr)));
+  requireCheck(tileWidth > 0 && tileHeight > 0, 'SCREENSHOT-BUDGET', 'DPR leaves no valid screenshot tile');
+  const tiles = [];
+  for (let y = 0; y < height; y += tileHeight) {
+    for (let x = 0; x < width; x += tileWidth) {
+      tiles.push({ x: content.x + x, y: content.y + y,
+        width: Math.min(tileWidth, width - x), height: Math.min(tileHeight, height - y), scale: 1 });
+    }
+  }
+  return { content, width, height, dpr, viewport, raw_bytes: rawBytes, tiles,
+    budget: { tile_rgba_bytes: CAPTURE_TILE_BYTES, tile_pixel_axis: CAPTURE_TILE_AXIS,
+      storage: 'sequential tiles; no full-page bitmap allocated' } };
+}
+function validateCoverage(plan, artifacts) {
+  requireCheck(artifacts.length === plan.tiles.length && artifacts.length > 0,
+    'SCREENSHOT-COVERAGE', 'Missing screenshot tiles');
+  let area = 0;
+  for (let index = 0; index < artifacts.length; index++) {
+    const expected = plan.tiles[index], artifact = artifacts[index];
+    requireCheck(JSON.stringify(artifact.clip) === JSON.stringify(expected) &&
+      artifact.width === Math.ceil(expected.width * plan.dpr) &&
+      artifact.height === Math.ceil(expected.height * plan.dpr),
+    'SCREENSHOT-COVERAGE', 'Screenshot crop or PNG dimensions disagree with coverage plan',
+    { expected, artifact, dpr: plan.dpr });
+    area += expected.width * expected.height;
+  }
+  requireCheck(area === plan.width * plan.height, 'SCREENSHOT-COVERAGE', 'Incomplete screenshot area',
+    { area, expected: plan.width * plan.height });
+  return { status: 'PASS', source_css_pixels: area, tiles: artifacts.length, scaled: false,
+    gaps: 0, overlaps: 0 };
 }
 function validateResult(result, expected) {
   requireCheck(result && typeof result === 'object', 'FEM-CONTRACT', 'Empty solver result');
@@ -175,7 +236,7 @@ function parseArgs(argv) {
   const options = { chrome: process.env.OPENSIM_CHROME ?? DEFAULT_CHROME, timeout: 30000 };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
-    if (['--selftest', '--help', '--no-sandbox', '--probe-input'].includes(argument)) {
+    if (['--selftest', '--help', '--no-sandbox', '--probe-input', '--probe-screenshot'].includes(argument)) {
       options[argument.slice(2).replaceAll('-', '_')] = true;
     } else {
       requireCheck(['--url', '--out', '--chrome', '--timeout-ms'].includes(argument),
@@ -196,6 +257,8 @@ function parseArgs(argv) {
   requireCheck(options.selftest || options.url, 'CLI', '--url is required unless --selftest');
   requireCheck(!(options.selftest && options.url), 'CLI', '--selftest cannot claim a target URL');
   requireCheck(!(options.selftest && options.probe_input), 'CLI', '--selftest and --probe-input are exclusive');
+  requireCheck([options.selftest, options.probe_input, options.probe_screenshot].filter(Boolean).length <= 1,
+    'CLI', 'Selftest and narrow probes are mutually exclusive');
   if (options.url) {
     const url = new URL(options.url);
     requireCheck(url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) &&
@@ -706,17 +769,56 @@ class Harness {
     await this.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     const metrics = await this.send('Page.getLayoutMetrics');
     const content = metrics.cssContentSize ?? metrics.contentSize;
-    requireCheck(content.width > 0 && content.height > 0 && content.height <= 20000,
-      'SCREENSHOT', 'Empty/unbounded screenshot content', { content });
-    const response = await this.send('Page.captureScreenshot', {
-      format: 'png', captureBeyondViewport: true, fromSurface: true,
-    });
-    const buffer = Buffer.from(response.data, 'base64');
-    const file = `${name}.png`;
-    const artifact = { file, coordinate: this.coordinate, ...validatePng(buffer) };
-    await fs.writeFile(path.join(this.run, file), buffer, { flag: 'wx' });
-    this.report.screenshots.push(artifact);
-    return artifact;
+    const original = await this.evaluate(() => ({ dpr: devicePixelRatio, x: scrollX, y: scrollY,
+      width: document.documentElement.clientWidth, height: innerHeight }));
+    const plan = capturePlan(content, original.dpr, original);
+    const artifacts = [];
+    try {
+      for (let index = 0; index < plan.tiles.length; index++) {
+        const clip = plan.tiles[index];
+        const position = await this.evaluate(async crop => {
+          scrollTo({ left: crop.x, top: crop.y, behavior: 'instant' });
+          await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          return { x: scrollX, y: scrollY, width: document.documentElement.clientWidth, height: innerHeight };
+        }, clip);
+        requireCheck(clip.x >= position.x && clip.y >= position.y &&
+          clip.x + clip.width <= position.x + position.width + 1 &&
+          clip.y + clip.height <= position.y + position.height + 1,
+        'SCREENSHOT-COVERAGE', 'Planned crop is not visible at the actual scroll position', { clip, position });
+        const response = await this.send('Page.captureScreenshot', {
+          format: 'png', captureBeyondViewport: false, fromSurface: true, clip,
+        });
+        const buffer = Buffer.from(response.data, 'base64');
+        const file = plan.tiles.length === 1 ? `${name}.png` :
+          `${name}-tile-${String(index + 1).padStart(3, '0')}.png`;
+        const artifact = { file, capture: name, coordinate: this.coordinate, clip, scroll: position, ...validatePng(buffer) };
+        validateCoverage({ ...plan, tiles: [clip], width: clip.width, height: clip.height }, [artifact]);
+        await fs.writeFile(path.join(this.run, file), buffer, { flag: 'wx' });
+        const reread = await fs.readFile(path.join(this.run, file));
+        requireCheck(digest(reread) === artifact.sha256, 'SCREENSHOT', 'Screenshot read-back hash mismatch', { file });
+        artifacts.push(artifact);
+        this.report.screenshots.push(artifact);
+      }
+    } finally {
+      await this.evaluate(async position => {
+        scrollTo({ left: position.x, top: position.y, behavior: 'instant' });
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      }, original);
+    }
+    const after = await this.send('Page.getLayoutMetrics');
+    requireCheck(JSON.stringify(after.cssContentSize ?? after.contentSize) === JSON.stringify(content),
+      'SCREENSHOT-COVERAGE', 'Page geometry changed while capturing full coverage',
+      { before: content, after: after.cssContentSize ?? after.contentSize });
+    const coverage = validateCoverage(plan, artifacts);
+    const manifest = { name, coordinate: this.coordinate, ...plan, artifacts, coverage };
+    const manifestFile = `${name}-capture.json`;
+    await fs.writeFile(path.join(this.run, manifestFile), json(manifest), { flag: 'wx' });
+    const reread = JSON.parse(await fs.readFile(path.join(this.run, manifestFile), 'utf8'));
+    validateCoverage(reread, reread.artifacts);
+    this.report.captures ??= [];
+    this.report.captures.push({ name, manifest: manifestFile, width: plan.width, height: plan.height,
+      dpr: plan.dpr, ...coverage });
+    return plan.tiles.length === 1 ? artifacts[0] : { manifest: manifestFile, ...coverage };
   }
   async canvas() {
     const result = await this.evaluate(() => {
@@ -1073,11 +1175,7 @@ class Harness {
     // Browser default font preferences do not enlarge fixed px declarations.
     // Enlarge every computed font, not just rem text; record this as a text-only
     // stress simulation rather than claiming a browser-native text zoom feature.
-    await this.evaluate(() => {
-      const elements = [document.documentElement, ...document.querySelectorAll('body,body *')];
-      const sizes = elements.map(element => parseFloat(getComputedStyle(element).fontSize));
-      elements.forEach((element, index) => element.style.setProperty('font-size', `${sizes[index] * 2}px`, 'important'));
-    });
+    await this.textStress();
     await this.check('WEB-TYPE-004', '200% computed text-size stress and full main flow', async () => {
       await this.coreFlow('text-200');
       return this.layout('text-200');
@@ -1135,6 +1233,25 @@ class Harness {
       () => this.input('#pressure_pa', -1));
     await this.screenshot('probe-after-input');
     this.report.probe_events = await this.evaluate(() => window.__opensimInputEvents);
+  }
+  async textStress() {
+    await this.evaluate(() => {
+      const elements = [document.documentElement, ...document.querySelectorAll('body,body *')];
+      const sizes = elements.map(element => parseFloat(getComputedStyle(element).fontSize));
+      elements.forEach((element, index) => element.style.setProperty('font-size', `${sizes[index] * 2}px`, 'important'));
+    });
+  }
+  async probeScreenshot() {
+    this.coordinate = 'probe-text-200-capture';
+    await this.viewport(360, 800, true);
+    await this.navigate();
+    await this.textStress();
+    const solved = await this.solve(DEFAULT_CONFIG);
+    await this.activate('#view-mesh');
+    await this.check('SCREENSHOT-COVERAGE', '200% text full-resolution complete-page screenshot',
+      () => this.screenshot('probe-text-200-mesh'));
+    this.report.probe_metrics = solved.metrics;
+    this.report.probe_scope = 'Capture only; text layout and complete main flow remain independent acceptance gates';
   }
   async close() {
     if (!this.chrome) return;
@@ -1454,6 +1571,21 @@ document.getElementById('save').addEventListener('click',()=>{
         'HARNESS-READINESS', 'Actual completion state did not release readiness');
       return { before, completed: completed.state, release: 'real keyboard activation of fixture completion control' };
     });
+    await harness.check('HARNESS-CAPTURE-COVERAGE', 'long-page coverage and missing/corrupt tile rejection', async () => {
+      const plan = capturePlan({ x: 0, y: 0, width: 345, height: 25463 }, 1, { width: 345, height: 800 });
+      const artifacts = plan.tiles.map(clip => ({ clip, width: clip.width, height: clip.height }));
+      const coverage = validateCoverage(plan, artifacts);
+      requireCheck(plan.tiles.length === 32 && plan.tiles.every(clip => clip.width * clip.height * 4 <= CAPTURE_TILE_BYTES),
+        'HARNESS-CAPTURE-COVERAGE', 'Long-page tiles exceed viewport or bitmap budget');
+      assert.throws(() => validateCoverage(plan, artifacts.slice(1)),
+        error => error.rule === 'SCREENSHOT-COVERAGE');
+      const corrupt = structuredClone(artifacts);
+      corrupt[0].height--;
+      assert.throws(() => validateCoverage(plan, corrupt), error => error.rule === 'SCREENSHOT-COVERAGE');
+      assert.throws(() => capturePlan({ x: 0, y: 0, width: 345, height: Infinity }, 1, plan.viewport),
+        error => error.rule === 'SCREENSHOT');
+      return { coverage, missing_tile_rejected: true, wrong_png_size_rejected: true, nonfinite_content_rejected: true };
+    });
     requireCheck(harness.errors.length === 0, 'HARNESS-RUNTIME', 'Selftest browser errors', { errors: harness.errors });
   } finally {
     await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
@@ -1523,7 +1655,8 @@ async function main() {
     report.tool_sha256 = digest(await fs.readFile(fileURLToPath(import.meta.url)));
     report.target_url = options.url ?? null;
     report.mode = options.selftest ? 'HARNESS_SELFTEST_NOT_OPENSIM' :
-      options.probe_input ? 'INPUT_PROBE_NOT_FULL_ACCEPTANCE' : 'OPENSIM_ACCEPTANCE';
+      options.probe_input ? 'INPUT_PROBE_NOT_FULL_ACCEPTANCE' :
+        options.probe_screenshot ? 'SCREENSHOT_PROBE_NOT_FULL_ACCEPTANCE' : 'OPENSIM_ACCEPTANCE';
     report.contract = CONTRACT;
     report.output = run;
     harness = new Harness(options, run, report);
@@ -1532,10 +1665,12 @@ async function main() {
     else {
       await harness.launch();
       if (options.probe_input) await harness.probeInput();
+      else if (options.probe_screenshot) await harness.probeScreenshot();
       else await harness.runAcceptance();
     }
     report.verdict = options.selftest ? 'SELFTEST_PASS' :
-      options.probe_input ? 'INPUT_PROBE_PASS' : 'AUTOMATED_PASS';
+      options.probe_input ? 'INPUT_PROBE_PASS' :
+        options.probe_screenshot ? 'SCREENSHOT_PROBE_PASS' : 'AUTOMATED_PASS';
     exitCode = 0;
   } catch (error) {
     report.verdict = 'FAIL';
