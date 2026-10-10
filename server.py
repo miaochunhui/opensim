@@ -7,8 +7,8 @@ import gzip
 import hashlib
 import json
 import logging
-import mimetypes
 import platform
+import re
 import socket
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,6 +24,8 @@ from tools.render_page import SOURCE_PATHS, _source_metadata, render_page
 
 ROOT = Path(__file__).resolve().parent
 MAX_BODY = 16384
+ASSET_TYPES = {"js": "text/javascript", "css": "text/css"}
+FINGERPRINT_PATH = re.compile(r"/web/app\.([a-f0-9]{64})\.(js|css)")
 RUNTIME_SOURCES = {
     relative: hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
     for relative in SOURCE_PATHS
@@ -48,6 +50,46 @@ def unique_object(pairs: list[tuple[str, object]]) -> dict:
             raise ValueError(f"Duplicate JSON key: {key}")
         result[key] = value
     return result
+
+
+def authority_parts(authority: str) -> tuple[str, int | None]:
+    """Validate an HTTP authority without accepting userinfo or URL suffixes."""
+    if not re.fullmatch(
+        r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9.-]*)(?::[0-9]{1,5})?",
+        authority,
+    ):
+        raise ValueError("Invalid HTTP authority")
+    parsed = urlsplit("//" + authority)
+    port = parsed.port
+    if not parsed.hostname or port is not None and not 1 <= port <= 65535:
+        raise ValueError("Invalid HTTP host or port")
+    return parsed.hostname.lower(), port
+
+
+def accepts_gzip(value: str) -> bool:
+    weights = {}
+    for item in value.split(","):
+        parts = [part.strip().lower() for part in item.split(";")]
+        coding = parts[0]
+        if not coding:
+            continue
+        weight = 1.0
+        if len(parts) > 1:
+            parameter = parts[1].split("=", 1)
+            if (len(parts) != 2 or len(parameter) != 2 or parameter[0].strip() != "q"
+                    or not re.fullmatch(r"(?:0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?)",
+                                        parameter[1].strip())):
+                weight = 0.0
+            else:
+                weight = float(parameter[1].strip())
+        weights[coding] = min(weights.get(coding, 1.0), weight)
+    return weights.get("gzip", weights.get("*", 0.0)) > 0
+
+
+def etag_matches(value: str, etag: str) -> bool:
+    # If-None-Match uses weak comparison for GET and HEAD.
+    return any(item.strip().removeprefix("W/") == etag or item.strip() == "*"
+               for item in value.split(","))
 
 
 class ApplicationServer(ThreadingHTTPServer):
@@ -98,6 +140,15 @@ class Handler(BaseHTTPRequestHandler):
         self, status: int, body: bytes, content_type: str,
         cache: str = "no-store", etag: str | None = None,
     ) -> None:
+        compressible = len(body) > 512
+        compressed = compressible and accepts_gzip(
+            ",".join(self.headers.get_all("Accept-Encoding", [])))
+        if compressed:
+            body = gzip.compress(body, mtime=0)
+        if etag:
+            etag = etag[:-1] + ("-gzip\"" if compressed else "-identity\"")
+            if etag_matches(",".join(self.headers.get_all("If-None-Match", [])), etag):
+                status = 304
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", cache)
@@ -112,18 +163,14 @@ class Handler(BaseHTTPRequestHandler):
         )
         if etag:
             self.send_header("ETag", etag)
-        accepted = {
-            item.split(";")[0].strip()
-            for item in self.headers.get("Accept-Encoding", "").split(",")
-            if ";q=0" not in item
-        }
-        if len(body) > 512 and "gzip" in accepted:
-            body = gzip.compress(body, mtime=0)
+        if compressed:
             self.send_header("Content-Encoding", "gzip")
+        if compressible:
             self.send_header("Vary", "Accept-Encoding")
-        self.send_header("Content-Length", str(len(body)))
+        if status != 304:
+            self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        if self.command != "HEAD":
+        if self.command != "HEAD" and status != 304:
             self.wfile.write(body)
 
     def json_response(self, status: int, value: dict) -> None:
@@ -143,9 +190,11 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self) -> None:
+        path = self.request_path()
+        if path is None:
+            return
         if not self.runtime_ready():
             return
-        path = urlsplit(self.path).path
         if path == "/api/health":
             self.json_response(200, {
                 "status": "ok", "schema_version": 1,
@@ -157,49 +206,68 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 html = render_page(evidence=self.server.evidence)
                 body = html.encode("utf-8") if isinstance(html, str) else html
+                assert_runtime_sources()
             except Exception:
                 logging.exception("page generation failed")
+                if not self.runtime_ready():
+                    return
                 self.error_response(500, "PAGE_ERROR", "页面生成失败，请联系维护者。")
                 return
             self.respond(200, body, "text/html; charset=utf-8")
             return
-        assets = {"/web/app.js", "/web/app.css"}
-        if path in assets:
-            file = ROOT / path.lstrip("/")
+        fingerprint = FINGERPRINT_PATH.fullmatch(path)
+        if path in ("/web/app.js", "/web/app.css") or fingerprint:
+            extension = fingerprint[2] if fingerprint else path.rsplit(".", 1)[1]
+            file = ROOT / f"web/app.{extension}"
             try:
                 body = file.read_bytes()
             except OSError:
                 logging.exception("required static asset unavailable: %s", path)
                 self.error_response(500, "ASSET_MISSING", "应用资源缺失，请联系维护者。")
                 return
-            etag = '"' + hashlib.sha256(body).hexdigest() + '"'
-            if self.headers.get("If-None-Match") == etag:
-                self.respond(304, b"", "text/plain", "public, max-age=0, must-revalidate", etag)
+            digest = hashlib.sha256(body).hexdigest()
+            if fingerprint and fingerprint[1] != digest:
+                self.error_response(404, "NOT_FOUND", "资源指纹不存在。")
                 return
-            mime = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
-            self.respond(200, body, mime + "; charset=utf-8",
-                         "public, max-age=0, must-revalidate", etag)
+            if not self.runtime_ready():
+                return
+            cache = ("public, max-age=31536000, immutable" if fingerprint
+                     else "public, max-age=0, must-revalidate")
+            self.respond(200, body, ASSET_TYPES[extension] + "; charset=utf-8",
+                         cache, '"' + digest + '"')
             return
         self.error_response(404, "NOT_FOUND", "路径不存在。")
 
     def do_POST(self) -> None:
+        path = self.request_path()
+        if path is None:
+            return
         if not self.runtime_ready():
             return
-        if urlsplit(self.path).path != "/api/solve":
+        if path != "/api/solve":
             self.error_response(404, "NOT_FOUND", "路径不存在。")
             return
         content_type = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
         if content_type != "application/json":
             self.error_response(415, "CONTENT_TYPE", "请使用 application/json 提交参数。")
             return
-        # No cross-origin compute endpoint; self-hosted clients can omit Origin.
-        origin = self.headers.get("Origin")
-        if origin:
+        # The reverse proxy must preserve the public Host. Forwarded headers
+        # are not trusted; TLS can terminate upstream of this HTTP listener.
+        origins = self.headers.get_all("Origin", [])
+        if origins:
             try:
+                if len(origins) != 1:
+                    raise ValueError("Repeated Origin")
+                origin = origins[0]
                 parsed_origin = urlsplit(origin)
-                valid_origin = (parsed_origin.scheme in ("http", "https")
-                                and parsed_origin.netloc == self.headers.get("Host")
-                                and not parsed_origin.username and not parsed_origin.password)
+                if (parsed_origin.scheme not in ("http", "https")
+                        or origin != f"{parsed_origin.scheme}://{parsed_origin.netloc}"):
+                    raise ValueError("Origin must contain only scheme and authority")
+                hostname, port = authority_parts(parsed_origin.netloc)
+                host, host_port = authority_parts(self.headers["Host"])
+                default_port = 443 if parsed_origin.scheme == "https" else 80
+                valid_origin = (host == hostname and
+                                (host_port or default_port) == (port or default_port))
             except ValueError:
                 valid_origin = False
             if not valid_origin:
@@ -266,6 +334,30 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             self.server.solve_slot.release()
         self.respond(200, body, "application/json; charset=utf-8")
+
+    def request_path(self) -> str | None:
+        target = self.path
+        if (not target.startswith("/") or target.startswith("//")
+                or not target.isascii() or any(ord(char) < 33 or ord(char) == 127
+                                              for char in target)
+                or "\\" in target or "#" in target
+                or re.search(r"%(?![a-fA-F0-9]{2})", target)):
+            self.error_response(400, "BAD_PATH", "请求路径格式错误。")
+            return None
+        try:
+            path = urlsplit(target).path
+        except ValueError:
+            self.error_response(400, "BAD_PATH", "请求路径格式错误。")
+            return None
+        try:
+            hosts = self.headers.get_all("Host", [])
+            if len(hosts) != 1:
+                raise ValueError("Exactly one Host is required")
+            authority_parts(hosts[0])
+        except ValueError:
+            self.error_response(400, "BAD_HOST", "请求必须提供唯一且有效的 Host。")
+            return None
+        return path
 
     def runtime_ready(self) -> bool:
         try:

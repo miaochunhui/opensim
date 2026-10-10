@@ -77,6 +77,13 @@ def _source_metadata() -> tuple[str, str, str]:
             fingerprint.hexdigest()[:12])
 
 
+def asset_paths() -> dict[str, str]:
+    """Content-addressed relative URLs; legacy aliases remain server routes."""
+    root = Path(__file__).resolve().parent.parent
+    return {extension: f"web/app.{sha256((root / f'web/app.{extension}').read_bytes()).hexdigest()}.{extension}"
+            for extension in ("js", "css")}
+
+
 def _reject_constant(value: str) -> None:
     raise ValueError(f"numerics.json contains non-finite constant: {value}")
 
@@ -261,6 +268,7 @@ def render_page(evidence: Path | None = None) -> str:
     Editing time is the maximum mtime of all required application sources.
     """
     edited_iso, edited_text, fingerprint = _source_metadata()
+    resources = asset_paths()
     evidence_html = _evidence_html(evidence)
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -269,8 +277,8 @@ def render_page(evidence: Path | None = None) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="OpenSim 中文流体有限元工作台：圆管与矩形直管的充分发展稳态层流横截面求解，不是通用 CFD。">
   <title>OpenSim · 直管流体有限元工作台 v{VERSION}</title>
-  <link rel="stylesheet" href="web/app.css">
-  <script src="web/app.js" defer></script>
+  <link rel="stylesheet" href="{resources['css']}">
+  <script src="{resources['js']}" defer></script>
 </head>
 <body data-page-profile="data-canvas" data-page-shell="body"
       data-main-region="#workspace" data-secondary-region=".parameter-panel">
@@ -492,17 +500,18 @@ def check_page(page: str) -> dict:
     require(any(tag == "body" and attrs.get("data-page-profile") == "data-canvas"
                 for tag, attrs, _ in elements), "page profile")
     labels = {attrs.get("for") for tag, attrs, _ in elements if tag == "label"}
+    resources = asset_paths()
     for tag, attrs, _ in elements:
         if tag in {"input", "select"}:
             require(attrs.get("id") in labels, "persistent input label")
         require(not any(key.startswith("on") for key in attrs), "no inline events")
         require("style" not in attrs and tag != "style", "no inline styles")
         if tag == "script":
-            require(attrs.get("src") == "web/app.js" and "defer" in attrs,
-                    "only deferred relative script")
+            require(attrs.get("src") == resources["js"] and "defer" in attrs,
+                    "only deferred content-fingerprinted relative script")
     require(sum(tag == "script" for tag, _, _ in elements) == 1, "single external script")
-    require(any(tag == "link" and attrs.get("href") == "web/app.css"
-                for tag, attrs, _ in elements), "relative stylesheet")
+    require(any(tag == "link" and attrs.get("href") == resources["css"]
+                for tag, attrs, _ in elements), "content-fingerprinted relative stylesheet")
     require(any(tag == "fieldset" for tag, _, _ in elements) and
             any(tag == "legend" for tag, _, _ in elements), "fieldset and legend")
     require(any(tag == "noscript" for tag, _, _ in elements), "noscript fallback")
@@ -579,8 +588,7 @@ def _selftest(out: Path, evidence: Path | None) -> dict:
     else:
         raise ValueError("explicit missing evidence did not fail loudly")
     root = Path(__file__).resolve().parent.parent
-    expected_ns = max((root / relative).stat().st_mtime_ns
-                      for relative in SOURCE_PATHS if (root / relative).exists())
+    expected_ns = max((root / relative).stat().st_mtime_ns for relative in SOURCE_PATHS)
     expected_iso = datetime.fromtimestamp(expected_ns // 1_000_000_000,
                                           LOCAL_ZONE).isoformat(timespec="seconds")
     if report["edited_at"] != expected_iso:
