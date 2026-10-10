@@ -6,6 +6,7 @@
  *   --out /hf3fs-jd/data/tmp/opensim-fluid-v1/browser
  * node tools/browser_check.mjs --selftest \
  *   --out /hf3fs-jd/data/tmp/opensim-fluid-v1/browser
+ * --probe-input with --url runs only the 390px solve/export/input regression.
  *
  * Requires Node >= 22 (native WebSocket) or existing ws, and local Chromium.
  * Each invocation keeps an immutable run directory, including failed runs.
@@ -13,6 +14,23 @@
  * 2: configuration/dependency/browser/harness failed.
  * AX inspection is NOT a human screen-reader or physical touch-device test.
  * A selftest fixture is NOT a FEM solver or an OpenSim acceptance result.
+ *
+ * DIAGNOSIS 2026-10-10: after a completed export, a Chromium touch activation
+ * could give #pressure_pa DOM focus without a working number-editor selection:
+ * Ctrl+A selected the page, Backspace left "2", and inserting "-1" yielded "".
+ * This is a harness editing-focus defect, not proof of an application failure.
+ * Explicit CDP editor commands alone also failed the new clear-value assertion.
+ * Fix: actual touch activation followed by real Tab / Shift+Tab traversal,
+ * ordinary Ctrl+A / Backspace, and a verified empty value before insertText.
+ * This is touch activation + KEYBOARD editing, NOT pure-touch-device evidence.
+ * No DOM focus/value assignment, input retries, or timeout change is used.
+ * Evidence root: /hf3fs-jd/data/tmp/opensim-fluid-v1/browser/
+ * Baseline failure: run-2026-10-10T06-36-17-927Z-f547adb3/report.json
+ * Instrumented reproduction: run-2026-10-10T06-38-33-425Z-e5d2e418/report.json
+ * Editor-command-only failure: run-2026-10-10T06-39-11-338Z-797c6ec4/report.json
+ * Fix without editor commands: run-2026-10-10T06-40-07-574Z-54493e51/report.json
+ * Selftest: run-2026-10-10T06-40-07-537Z-405adf44/report.json
+ * These narrow probes do not certify the full viewport matrix or release gates.
  */
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -150,7 +168,7 @@ function parseArgs(argv) {
   const options = { chrome: process.env.OPENSIM_CHROME ?? DEFAULT_CHROME, timeout: 30000 };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
-    if (['--selftest', '--help', '--no-sandbox'].includes(argument)) {
+    if (['--selftest', '--help', '--no-sandbox', '--probe-input'].includes(argument)) {
       options[argument.slice(2).replaceAll('-', '_')] = true;
     } else {
       requireCheck(['--url', '--out', '--chrome', '--timeout-ms'].includes(argument),
@@ -170,6 +188,7 @@ function parseArgs(argv) {
   options.out = out;
   requireCheck(options.selftest || options.url, 'CLI', '--url is required unless --selftest');
   requireCheck(!(options.selftest && options.url), 'CLI', '--selftest cannot claim a target URL');
+  requireCheck(!(options.selftest && options.probe_input), 'CLI', '--selftest and --probe-input are exclusive');
   if (options.url) {
     const url = new URL(options.url);
     requireCheck(url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) &&
@@ -454,6 +473,21 @@ class Harness {
     await this.waitFor('Visible nonempty page', async () => this.evaluate(() =>
       document.readyState === 'complete' && document.body?.innerText.trim().length > 30));
     await this.evaluate(async () => { await document.fonts.ready; });
+    if (this.options.probe_input) await this.evaluate(() => {
+      window.__opensimInputEvents = [];
+      for (const type of ['touchstart', 'touchend', 'mousedown', 'mouseup', 'click', 'focusin',
+        'focusout', 'keydown', 'keyup', 'beforeinput', 'input', 'change']) {
+        document.addEventListener(type, event => {
+          window.__opensimInputEvents.push({
+            type, time_ms: performance.now(), target: event.target.id || event.target.tagName,
+            active: document.activeElement?.id || document.activeElement?.tagName,
+            value: event.target.value ?? null, key: event.key ?? null,
+            data: event.data ?? null, trusted: event.isTrusted,
+          });
+          if (window.__opensimInputEvents.length > 500) window.__opensimInputEvents.shift();
+        }, true);
+      }
+    });
   }
   async key(key, code, modifiers = 0) {
     const definition = {
@@ -532,6 +566,20 @@ class Harness {
     }
   }
   async input(selector, value, keyboard = false) {
+    const trace = { selector, expected: String(value), keyboard, touch: this.touch,
+      coordinate: this.coordinate, stages: [] };
+    const sample = async stage => {
+      trace.stages.push({ stage, ...await this.evaluate(sel => {
+        const element = document.querySelector(sel), active = document.activeElement;
+        return {
+          time_ms: performance.now(), value: element?.value, active: active?.id || active?.tagName,
+          active_value: active?.value ?? null, focused: element === active,
+          selected_text: getSelection()?.toString().slice(0, 80) ?? '',
+          rect: element ? { x: element.getBoundingClientRect().x, y: element.getBoundingClientRect().y } : null,
+          scroll_y: scrollY, document_focused: document.hasFocus(),
+        };
+      }, selector) });
+    };
     const locked = await this.evaluate(sel => {
       const element = document.querySelector(sel);
       if (!element) throw new Error(`Missing ${sel}`);
@@ -544,12 +592,35 @@ class Harness {
     }
     if (keyboard) await this.tabTo(selector);
     else await this.activate(selector);
+    await sample('after-activate');
+    requireCheck(trace.stages.at(-1).focused, 'BROWSER-INPUT-FOCUS',
+      `Real input activation did not focus ${selector}`, { trace });
+    if (this.touch && !keyboard) {
+      // A download can leave a number control's internal editor unfocused
+      // despite activeElement matching. A real keyboard focus traversal
+      // re-enters that editor without DOM focus(), value assignment or retries.
+      await this.key('Tab');
+      await this.key('Tab', undefined, 8);
+      await sample('after-keyboard-focus-roundtrip');
+      requireCheck(trace.stages.at(-1).focused, 'BROWSER-INPUT-FOCUS',
+        `Tab/Shift+Tab did not return to ${selector}`, { trace });
+    }
     await this.key('a', undefined, 2);
+    await sample('after-select-all');
     await this.key('Backspace');
+    await sample('after-backspace');
+    requireCheck(trace.stages.at(-1).focused && trace.stages.at(-1).value === '',
+      'BROWSER-INPUT-CLEAR', `Real key events did not clear ${selector}`, { trace });
     if (String(value)) await this.send('Input.insertText', { text: String(value) });
+    await sample('after-insert');
     await this.key('Tab');
-    requireCheck(await this.evaluate((sel, expected) => document.querySelector(sel).value === String(expected),
-      selector, value), 'BROWSER-INPUT', `Real input events did not set ${selector}`, { value });
+    await sample('after-tab');
+    this.report.input_traces ??= [];
+    this.report.input_traces.push(trace);
+    const actual = trace.stages.at(-1).value;
+    requireCheck(actual === String(value), 'BROWSER-INPUT',
+      `Real input events did not set ${selector}: expected=${value}, actual=${actual}, active=${trace.stages.at(-1).active}`,
+      { value, actual, trace });
   }
   async choose(selector, value, keyboard = false) {
     const index = await this.evaluate((sel, desired) =>
@@ -982,6 +1053,24 @@ class Harness {
     this.report.result_count = this.responses.length;
     this.report.network = [...this.requests.values()].map(({ body, ...request }) => request);
   }
+  async probeInput() {
+    this.coordinate = 'probe-mobile-wide';
+    await this.viewport(390, 844, true);
+    await this.navigate();
+    await this.waitFor('Initial actual solve releases form controls', () => this.evaluate(() =>
+      !document.querySelector('#geometry').disabled && !document.querySelector('#solve-button').disabled));
+    await this.config(DEFAULT_CONFIG);
+    await this.solve(DEFAULT_CONFIG);
+    await this.input('#pressure_pa', 2);
+    const changed = { ...DEFAULT_CONFIG, pressure_pa: 2 };
+    const solved = await this.solve(changed);
+    await this.exportResult(solved.result);
+    this.report.input_method = 'Actual CDP touch activation + real Tab/Shift+Tab and keyboard editing; not pure touch';
+    await this.check('BROWSER-INPUT', '390px touch activation + keyboard editing after completed export',
+      () => this.input('#pressure_pa', -1));
+    await this.screenshot('probe-after-input');
+    this.report.probe_events = await this.evaluate(() => window.__opensimInputEvents);
+  }
   async close() {
     if (!this.chrome) return;
     if (this.chrome.exitCode === null) {
@@ -1287,7 +1376,7 @@ async function main() {
     automated_scope: 'OpenSim DOM/HTTP/mesh/metrics/export and specified browser paths, not complete release certification',
     manual_gates: [
       { rule: 'WEB-A11Y-009', status: 'NOT_RUN', reason: 'No human desktop/mobile screen-reader combination was tested; AX is automated only.' },
-      { rule: 'PHYSICAL-TOUCH', status: 'NOT_RUN', reason: 'Chromium touch emulation does not validate a physical device or software keyboard.' },
+      { rule: 'PHYSICAL-TOUCH', status: 'NOT_RUN', reason: 'CDP touch activation uses Tab/Shift+Tab plus keyboard editing; not pure-touch, physical-device or software-keyboard verification.' },
       { rule: 'SCREENSHOT-REVIEW', status: 'NOT_RUN', reason: 'Screenshot capture is not a human composition/readability review.' },
     ],
     uncovered_automatic: [
@@ -1317,7 +1406,8 @@ async function main() {
     report.commit = git.stdout.trim();
     report.tool_sha256 = digest(await fs.readFile(fileURLToPath(import.meta.url)));
     report.target_url = options.url ?? null;
-    report.mode = options.selftest ? 'HARNESS_SELFTEST_NOT_OPENSIM' : 'OPENSIM_ACCEPTANCE';
+    report.mode = options.selftest ? 'HARNESS_SELFTEST_NOT_OPENSIM' :
+      options.probe_input ? 'INPUT_PROBE_NOT_FULL_ACCEPTANCE' : 'OPENSIM_ACCEPTANCE';
     report.contract = CONTRACT;
     report.output = run;
     harness = new Harness(options, run, report);
@@ -1325,9 +1415,11 @@ async function main() {
     if (options.selftest) await selftest(harness);
     else {
       await harness.launch();
-      await harness.runAcceptance();
+      if (options.probe_input) await harness.probeInput();
+      else await harness.runAcceptance();
     }
-    report.verdict = options.selftest ? 'SELFTEST_PASS' : 'AUTOMATED_PASS';
+    report.verdict = options.selftest ? 'SELFTEST_PASS' :
+      options.probe_input ? 'INPUT_PROBE_PASS' : 'AUTOMATED_PASS';
     exitCode = 0;
   } catch (error) {
     report.verdict = 'FAIL';
@@ -1338,6 +1430,10 @@ async function main() {
     ].includes(error.rule) ? 1 : 2;
     console.error(`BROWSER_CHECK FAIL rule=${report.failure.rule} coordinate=${report.failure.coordinate} ${error.message}`);
     if (harness?.session && harness.chrome?.exitCode === null) {
+      if (options?.probe_input) {
+        try { report.probe_events = await harness.evaluate(() => window.__opensimInputEvents); }
+        catch (probeError) { report.probe_capture_failure = probeError.message; }
+      }
       try { await harness.screenshot('failure'); }
       catch (captureError) {
         report.failure_screenshot_error = { message: captureError.message, stack: captureError.stack };
