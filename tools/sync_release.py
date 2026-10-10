@@ -177,12 +177,16 @@ def prepare_output_guard(api, bundle: Path) -> Path:
 def prepare_guard(root: Path, commit: str, ledger_path: Path, bundle: Path,
                   approval_pin: dict | None = None, api_path: Path | None = None) -> dict:
     """Gate first; peer bundle root is separate from seat-sync result output."""
+    raw = gate.read_file(gate.external(ledger_path))
     result = gate.evaluate(root, commit, ledger_path, approval_pin)
+    gate.require(result["ledger_sha256"] == gate.sha(raw) and
+                 gate.read_file(ledger_path) == raw, "Ledger changed during gated prepare")
     api = load_api(api_path or root / "tools/release_app.py",
                    result["identity"]["tool_sha256"]["tools/release_app.py"])
     prepare_output_guard(api, bundle)
-    ledger = gate.decode(gate.read_file(ledger_path))
+    ledger = gate.decode(raw)
     evidence = gate.reference(ledger["evidence"]["numerics"])[1]
+    gate.require(gate.read_file(ledger_path) == raw, "Ledger changed during gated prepare")
     prepared = api.prepare(root, commit, evidence, bundle)
     gate.require(set(prepared) == {"state", "scope", "bundle", "manifest_sha256", "commit", "page_build"}
                  and prepared["state"] == "BUNDLE_PREPARED" and
@@ -193,6 +197,10 @@ def prepare_guard(root: Path, commit: str, ledger_path: Path, bundle: Path,
     manifest = api.validate_bundle(Path(prepared["bundle"]), prepared["manifest_sha256"], commit)
     epoch = int(gate.git(root, "show", "-s", "--format=%ct", commit).strip())
     match_manifest(manifest, {"commit": commit, "source_epoch": epoch}, result["identity"])
+    gate.require(manifest["files"]["evidence/numerics.json"]["sha256"] ==
+                 ledger["evidence"]["numerics"]["sha256"],
+                 "Bundle numerics differ from gated evidence")
+    gate.require(gate.read_file(ledger_path) == raw, "Ledger changed during gated prepare")
     gate.require(gate.identity(root, commit) == result["identity"],
                  "Sources changed during gated prepare")
     return prepared

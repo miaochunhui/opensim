@@ -17,6 +17,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -213,6 +214,120 @@ class SyncTests(unittest.TestCase):
         self.desired["dns_receipt"] = {"state": "APPLIED", "authorized": True}
         self.save()
         self.assertIn("Unknown desired-release", self.cli()["failure"]["reason"])
+
+
+class PreparePinTests(unittest.TestCase):
+    """Isolate the post-gate handoff, never certification or production."""
+
+    def setUp(self):
+        self.directory = gate.OUTPUT_ROOT / ("prepare-pin-" + uuid4().hex)
+        self.directory.mkdir(parents=True)
+        self.ledger = self.directory / "ledger.json"
+        self.numerics = self.directory / "numerics.json"
+        self.body = gate.encode({"scope": "UNIT_FIXTURE_NOT_NUMERICS", "value": 1})
+        gate.write_new(self.numerics, self.body)
+        self.pin = {"path": str(self.numerics), "sha256": gate.sha(self.body)}
+        self.ledger_body = gate.encode({"evidence": {"numerics": self.pin}})
+        gate.write_new(self.ledger, self.ledger_body)
+        self.commit = "a" * 40
+        self.identity = {"source_sha256": {}, "page_build": "123456789abc",
+                         "tool_sha256": {"tools/release_app.py": "b" * 64}}
+        self.result = {"identity": self.identity, "ledger_sha256": gate.sha(self.ledger_body)}
+        self.bundle = self.directory / "bundle-not-created"
+        self.calls = []
+
+        def prepare(root, commit, evidence, bundle):
+            self.calls.append(str(evidence))
+            return {"state": "BUNDLE_PREPARED", "scope": "SOURCE_AND_NUMERICS_ONLY",
+                    "bundle": str(bundle), "manifest_sha256": "c" * 64,
+                    "commit": commit, "page_build": self.identity["page_build"]}
+
+        self.manifest = {"schema": 1, "commit": self.commit, "source_epoch": 1,
+                         "source_sha256": {}, "page_build": self.identity["page_build"],
+                         "files": dict.fromkeys(sync.PAYLOAD, {})}
+        self.manifest["files"]["evidence/numerics.json"] = {"sha256": self.pin["sha256"]}
+        self.api = SimpleNamespace(prepare=prepare, validate_bundle=lambda *args: self.manifest)
+
+    def invoke(self, evaluate=None):
+        # Inject only the handoff, leaving the real certification gate closed.
+        with patch.object(gate, "evaluate", side_effect=evaluate or (lambda *args: self.result)), \
+                patch.object(sync, "load_api", return_value=self.api), \
+                patch.object(sync, "prepare_output_guard", return_value=self.bundle), \
+                patch.object(gate, "identity", return_value=self.identity), \
+                patch.object(gate, "git", return_value=b"1\n"):
+            return sync.prepare_guard(ROOT, self.commit, self.ledger, self.bundle)
+
+    def test_unchanged_handoff_positive_control(self):
+        self.assertEqual(self.invoke()["state"], "BUNDLE_PREPARED")
+        self.assertEqual(self.calls, [str(self.numerics)])
+        self.assertEqual(self.ledger.read_bytes(), self.ledger_body)
+        self.assertFalse(self.bundle.exists())
+
+    def test_ledger_changed_after_gate_refused_before_prepare(self):
+        def changed(*args):
+            put(self.ledger, gate.encode({"evidence": {"numerics": self.pin}, "changed": True}))
+            return self.result
+
+        with self.assertRaisesRegex(gate.GateError, "Ledger changed during gated prepare"):
+            self.invoke(changed)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.bundle.exists())
+
+    def test_bundle_numerics_must_match_gated_pin(self):
+        self.manifest["files"]["evidence/numerics.json"] = {"sha256": "d" * 64}
+        with self.assertRaisesRegex(gate.GateError, "Bundle numerics differ from gated evidence"):
+            self.invoke()
+        self.assertEqual(self.calls, [str(self.numerics)])
+        self.assertFalse(self.bundle.exists())
+
+    def test_ledger_changed_during_prepare_cannot_return_candidate(self):
+        original = self.api.prepare
+
+        def changed(*args):
+            receipt = original(*args)
+            put(self.ledger, gate.encode({"evidence": {"numerics": self.pin}, "changed": True}))
+            return receipt
+
+        self.api.prepare = changed
+        with self.assertRaisesRegex(gate.GateError, "Ledger changed during gated prepare"):
+            self.invoke()
+        self.assertFalse(self.bundle.exists())
+
+
+def run_prepare_pin(out: Path) -> int:
+    """Reuse run_suite in a real child; retain launcher rc and source hashes."""
+    gate.external(out)
+    out.mkdir(parents=True, exist_ok=False)
+    gate.OUTPUT_ROOT = out
+    names = ("tools/sync_release.py", "tests/test_sync_release.py", "tools/release_gate.py",
+             "tests/test_release_gate.py")
+    before = {name: gate.sha(gate.read_file(ROOT / name)) for name in names}
+    result = subprocess.run(
+        [sys.executable, "-B", str(Path(__file__).resolve()), "--prepare-pin-child",
+         "--out", str(out / "tests")], cwd=ROOT, capture_output=True, text=True,
+        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    put(out / "launcher.stdout", result.stdout.encode())
+    put(out / "launcher.stderr", result.stderr.encode())
+    after = {name: gate.sha(gate.read_file(ROOT / name)) for name in names}
+    report = gate.decode(gate.read_file(out / "tests/report.json"))
+    passed = (result.returncode == report["exit_code"] == 0 and report["tests"] == 4 and
+              report["failures"] == report["errors"] == 0 and before == after and
+              "Ran 4 tests" in (out / "tests/execution.log").read_text() and
+              report["line"] in result.stdout)
+    gate.write_new(out / "summary.json", gate.encode({
+        "scope": "INJECTED_HANDOFF_UNIT_NOT_RELEASE_INTEGRATION",
+        "verdict": "PASS" if passed else "FAIL", "launcher_rc": result.returncode,
+        "argv": result.args, "tests": report["tests"], "failures": report["failures"],
+        "errors": report["errors"], "source_before": before, "source_after": after,
+        "source_stable": before == after, "production_changes": False,
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+        "stdout_sha256": gate.sha(result.stdout.encode()),
+        "stderr_sha256": gate.sha(result.stderr.encode()),
+        "report_sha256": gate.sha(gate.read_file(out / "tests/report.json"))}))
+    print(f"OPENSIM_SYNC_PREPARE_PIN verdict={'PASS' if passed else 'FAIL'} "
+          f"tests={report['tests']} failures={report['failures']} errors={report['errors']} "
+          f"launcher_rc={result.returncode} source_stable={before == after} out={out}")
+    return 0 if passed else 1
 
 
 def persistence_child(out: Path, tool: str, fault: str, entry: str) -> int:
@@ -685,6 +800,8 @@ if __name__ == "__main__":
     parser.add_argument("--scan", action="store_true")
     parser.add_argument("--persistence-only", action="store_true")
     parser.add_argument("--main-api-only", action="store_true")
+    parser.add_argument("--prepare-pin-only", action="store_true")
+    parser.add_argument("--prepare-pin-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--fault-child",
                         choices=("none", "log-full", "late-log", "late-report", "foreign-report",
                                  "foreign-identical", "directory-fsync", "final-readback",
@@ -703,8 +820,16 @@ if __name__ == "__main__":
         raise SystemExit(prepare_api_child(args))
     if args.fault_child:
         raise SystemExit(persistence_child(args.out, args.tool, args.fault_child, args.entry))
+    if args.prepare_pin_only:
+        raise SystemExit(run_prepare_pin(args.out))
+    if args.prepare_pin_child:
+        gate.external(args.out)
+        gate.OUTPUT_ROOT = args.out.parent
+        raise SystemExit(run_suite(unittest.defaultTestLoader.loadTestsFromTestCase(PreparePinTests),
+                                   args.out, "OPENSIM_SYNC_PREPARE_PIN_UNIT_TEST"))
     suite = unittest.TestSuite()
     if not args.persistence_only and not args.main_api_only:
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(PreparePinTests))
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(SyncTests))
     if not args.main_api_only:
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(PersistenceTests))
