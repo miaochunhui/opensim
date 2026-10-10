@@ -1,0 +1,7 @@
+# Proposal only. Certificates must exist on both edges before validation.
+opensim.ai4everyone.top:{$EDGE_PORT:18445} {
+    bind 127.0.0.1
+    tls /opt/docs-site/runtime/tls/opensim.crt /opt/docs-site/runtime/tls/opensim.key
+    encode gzip
+    reverse_proxy http://192.168.1.30:8772
+}

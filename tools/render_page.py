@@ -147,10 +147,82 @@ def _evidence_html(evidence: Path | None) -> str:
         return """<p>未采集</p>
           <p>尚未提供独立数值验证报告。一次成功求解不等于已通过网格收敛验证。</p>"""
     report, digest = loaded
+    convergence_html = ""
+    groups = report.get("convergence")
+    if report.get("verdict") != "PASS" or report.get("state") != "COMPLETE":
+        raise ValueError("numerical evidence must be a completed passing report")
+    if not isinstance(groups, dict) or set(groups) != {"circle", "rectangle", "square"}:
+        raise ValueError("numerical evidence requires all three convergence groups")
+    if type(report.get("checks_executed")) is not int or report["checks_executed"] <= 0:
+        raise ValueError("numerical evidence requires a positive check count")
+    if any(not isinstance(report.get(key), list) or not report[key]
+           for key in ("cases", "rejections")):
+        raise ValueError("numerical evidence requires nonempty cases and rejections")
+    if groups:
+        expected_digest = sha256((Path(__file__).resolve().parents[1] / "solver.py").read_bytes()).hexdigest()
+        if report.get("solver", {}).get("sha256") != expected_digest:
+            raise ValueError("numerical report does not match the current solver source")
+        names = {"circle": "圆管", "rectangle": "矩形管", "square": "方管"}
+        colors = ("#176b60", "#b93722", "#3d5e8e")
+        rows, series, all_errors = [], [], []
+        for index, (key, record) in enumerate(sorted(groups.items())):
+            grids = record["resolutions"]
+            errors = record["relative_flow_error"]["errors"]
+            if record.get("verdict") != "PASS" or len(grids) != 3 or len(errors) != 3:
+                raise ValueError("convergence record must contain three verified mesh levels")
+            if any(type(grid) is not int for grid in grids) or grids != [8, 16, 32]:
+                raise ValueError("invalid convergence resolutions")
+            if any(isinstance(value, bool) or not isinstance(value, (float, int)) or value <= 0 for value in errors):
+                raise ValueError("invalid positive convergence errors")
+            if not all(left > right for left, right in zip(errors, errors[1:])):
+                raise ValueError("convergence errors must decrease with mesh refinement")
+            label = names.get(key, key)
+            text = " → ".join(f"{value * 100:.3f}%" for value in errors)
+            rows.append(
+                f"<tr><th scope=\"row\">{escape(label)}</th>"
+                f"<td>{escape(' / '.join(map(str, grids)))}</td><td>{text}</td></tr>"
+            )
+            series.append((label, colors[index % len(colors)], errors))
+            all_errors.extend(errors)
+        minimum, maximum = math.log10(min(all_errors)), math.log10(max(all_errors))
+        span = max(maximum - minimum, 0.1)
+        curves = []
+        for index, (label, color, errors) in enumerate(series):
+            points = [(72 + i * 188, 206 - (math.log10(error) - minimum) / span * 158)
+                      for i, error in enumerate(errors)]
+            polyline = " ".join(f"{x:.3f},{y:.3f}" for x, y in points)
+            circles = "".join(f'<circle cx="{x:.3f}" cy="{y:.3f}" r="5" fill="{color}"/>'
+                              for x, y in points)
+            curves.append(f'<polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="3"/>'
+                          f'{circles}<text x="490" y="{72 + index * 36}" fill="{color}">{escape(label)}</text>')
+        levels = " / ".join(map(str, next(iter(groups.values()))["resolutions"]))
+        convergence_html = f"""<p>独立验收：{escape(report["verdict"])}；
+          {int(report["checks_executed"])} 项检查，{len(report["cases"])} 个算例，
+          {len(report["rejections"])} 个非法输入被拒绝。
+          采集时间：<time>{escape(report["collected_at"])}</time>。
+          这些固定算例通过检查，不代表当前任意参数或范围外流动均已验证。</p>
+          <figure class="convergence-figure">
+            <svg viewBox="0 0 620 270" role="img" aria-labelledby="convergence-chart-title">
+              <title id="convergence-chart-title">网格加密后，圆管、矩形管和方管的流量相对误差下降</title>
+              <path d="M72 38V220H454" fill="none" stroke="#52615d"/>
+              <text x="72" y="26" fill="#202e2d">流量相对误差（对数尺度，越低越好）</text>
+              <text x="66" y="250" fill="#202e2d">粗网格</text>
+              <text x="422" y="250" fill="#202e2d">细网格</text>
+              {''.join(curves)}
+            </svg>
+            <figcaption>分辨率 {levels}；每条线都取自独立报告，同一数据生成下方误差表。</figcaption>
+          </figure>
+          <div class="evidence-table" data-local-scroll tabindex="0" aria-label="网格收敛误差表">
+            <table><caption>三种截面的流量误差</caption>
+              <thead><tr><th scope="col">截面</th><th scope="col">网格分辨率</th>
+              <th scope="col">相对流量误差（从粗到细）</th></tr></thead>
+              <tbody>{''.join(rows)}</tbody></table>
+          </div>"""
     preview = escape(json.dumps(_preview(report), ensure_ascii=False,
                                 sort_keys=True, indent=2, allow_nan=False))
     source = escape(str(evidence))
     return f"""<p>已载入独立报告；报告中的判定原样展示，不代表当前参数已获验证。</p>
+          {convergence_html}
           <p>来源：<code>{source}</code></p>
           <p>报告 SHA-256：<code>{digest}</code></p>
           <details class="evidence-report">
@@ -517,9 +589,19 @@ def _selftest(out: Path, evidence: Path | None) -> dict:
     if report["edited_at"] != expected_iso:
         raise ValueError("editing timestamp is not maximum existing source mtime")
     fixture = out / "selftest-evidence.json"
-    fixture.write_text(json.dumps({"verdict": "SELFTEST_ONLY",
-                                  "note": "<script>not executable</script>"},
-                                 sort_keys=True), encoding="utf-8")
+    fixture_report = {
+        "verdict": "PASS", "state": "COMPLETE",
+        "note": "<script>not executable</script>",
+        "collected_at": "SELFTEST_ONLY_NOT_PHYSICAL_EVIDENCE",
+        "checks_executed": 1, "cases": ["selftest"], "rejections": ["selftest"],
+        "solver": {"sha256": sha256((root / "solver.py").read_bytes()).hexdigest()},
+        "convergence": {
+            name: {"verdict": "PASS", "resolutions": [8, 16, 32],
+                   "relative_flow_error": {"errors": [0.04, 0.01, 0.0025]}}
+            for name in ("circle", "rectangle", "square")
+        },
+    }
+    fixture.write_text(json.dumps(fixture_report, sort_keys=True), encoding="utf-8")
     rendered = render_page(evidence=fixture)
     if "&lt;script&gt;not executable&lt;/script&gt;" not in rendered:
         raise ValueError("evidence was not HTML-escaped")

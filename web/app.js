@@ -186,7 +186,8 @@
     ui.exportButton.disabled = state.busy || state.phase !== "ready" || state.dirty || !state.result;
   }
   function reportError(error, terminal = true) {
-    console.error("OpenSim interaction:", error);
+    if (error instanceof CaseError) console.warn("OpenSim input/action rejected:", error);
+    else console.error("OpenSim unexpected interaction failure:", error);
     if (terminal) { state.phase = "failed"; state.dirty = true; }
     const message = error instanceof Error ? error.message : "未知交互错误。";
     ui.error.textContent = message;
@@ -293,17 +294,11 @@
     }
     const lines = [
       stale ? "旧结果：参数已改变或本次操作未成功，需重新计算；不可导出。" : "当前配置求解成功。",
-      "模型范围：直管充分发展、不可压缩、牛顿流体、稳态层流；忽略入口、弯管、湍流、瞬态与多物理耦合。",
-      "压力沿轴向线性变化是模型假设，不是独立求解的压力场；云图仅来自 P1 三角形 FEM 节点速度。",
-      "模型：直管充分发展稳态层流横截面；离散：P1 线性三角形有限元，单元精确积分、稀疏求解及固定壁面速度消元。",
+      "云图为横截面轴向速度，由 P1 三角形有限元求解；不模拟入口、弯管、湍流或三维流线。",
       `参考方法：${referenceText}。参考数值只用于对照，不填充 FEM 云图。`,
-      `FEM 速度范围：${format(min)} 到 ${format(max)} m/s。`,
-      ...Object.entries(METRICS).map(([key, [label, unit]]) =>
-        `${label}：${format(result.metrics[key])}${unit ? ` ${unit}` : ""}。`),
-      "单位：方程装配使用米及国际单位制，导出节点坐标使用毫米。",
-      "Re 取参考解与数值解横截面平均速度对应值的较大者；力平衡按离散壁面反力计算，并包含壁面节点载荷。",
+      `当前流量相对参考误差 ${(result.metrics.relative_flow_error * 100).toFixed(3)}%；误差与残差仅验证本算例，不代表普适验证。`,
+      "Re 使用参考和数值平均速度对应值的较大者；力平衡按离散壁面反力检查。",
       ...warnings.map((text) => `提醒：${text}`),
-      "以上误差、残差与力平衡只描述本算例，不代表普适验证；独立验证报告见下方页面提供的证据。",
     ];
     ui.summary.textContent = lines.join("\n");
     ui.description.textContent = `${stale ? "旧结果，需重新计算。" : "当前 FEM 结果。"}`
@@ -424,7 +419,8 @@
       return new CaseError(`服务返回 HTTP ${response.status}，错误说明格式无效。`);
     }
     const raw = detail.message;
-    console.error("OpenSim API error:", response.status, detail.code, raw);
+    if (response.status < 500 || response.status === 503) console.warn("OpenSim request rejected:", response.status, detail.code, raw);
+    else console.error("OpenSim API failure:", response.status, detail.code, raw);
     let message;
     if (response.status === 503) message = "求解服务正忙或暂不可用，请稍后手动重试。";
     else if (response.status >= 500) message = "服务内部求解失败；请检查服务端日志后重试。";
