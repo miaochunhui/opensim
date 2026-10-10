@@ -43,6 +43,16 @@ VIEWPORTS = {
 }
 PARTIAL = "LOCAL_AUTOMATION_PARTIAL_NOT_RELEASE"
 PASS = "LOCAL_AUTOMATION_PASS_NOT_RELEASE"
+PERF_PERSISTENCE = {
+    "version": 2, "strategy": "HELD_INODE_NO_PATH_REPLACE",
+    "ownership": "DEV_INO_EXACT_BYTES_SINGLE_LINK_NOFOLLOW",
+    "durability": "FILE_AND_DIRECTORY_FSYNC_WITH_EXACT_READBACK",
+    "failure_evidence": "report-failure-*.json",
+    "acceptance": "SAME_INVOCATION_RC0_REPORT_NO_FAILURE_EVIDENCE",
+    "exclusions": "NOT_CRASH_ATOMIC_NOT_FULL_TREE_NOT_HOSTILE_SAME_UID_ISOLATION",
+}
+UI_DURABILITY = "FINAL_AFTER_FSYNC_AND_INODE_READBACK"
+UI_PROTOCOL = "exclusive-create/no-follow/fsync-file/fsync-directory/exact-inode-and-bytes-readback"
 
 
 class EvidenceError(ValueError):
@@ -273,18 +283,25 @@ def positive(value: object, coordinate: str) -> int:
 
 
 def first_failure(value: dict) -> object | None:
-    for name in ("first_failure", "failure", "harness_failure", "cleanup_failure"):
+    for name in ("first_failure", "failure", "harness_failure"):
         if value.get(name):
             return value[name]
     for row in value.get("checks", []):
         if isinstance(row, dict) and (row.get("status") == "FAIL" or row.get("verdict") == "FAIL"):
             return row
+    for name in ("cleanup_failure", "finalization_failure", "persistence_failure",
+                 "persistence_recovery_failure", "failure_log_failure", "candidate_revocation_failure",
+                 "revocation_failure", "revocation_remove_failure", "fixture_io_failure",
+                 "partial_capture_failure", "input_failure"):
+        if value.get(name):
+            return value[name]
     return None
 
 
 def compact_cause(cause: object) -> object:
     if isinstance(cause, dict):
-        return {key: cause[key] for key in ("type", "rule", "coordinate", "phase", "message", "name")
+        return {key: cause[key] for key in ("type", "rule", "coordinate", "phase", "stage",
+                                           "code", "syscall", "path", "message", "name")
                 if key in cause}
     return str(cause)[:2000]
 
@@ -369,6 +386,311 @@ def artifacts(directory: Path, name: str) -> list[dict]:
             "EMPTY_DIAGNOSTIC" if record["bytes"] == 0 else "ARTIFACT")
         records.append(record)
     need(bool(records), "Producer emitted no artifacts", name)
+    return records
+
+
+def producer_file(directory: Path, relative: str, name: str) -> tuple[bytes, dict]:
+    """Read one bounded regular file once, preserving its observed identity."""
+    need(isinstance(relative, str) and bool(relative) and
+         not Path(relative).is_absolute() and ".." not in Path(relative).parts and
+         Path(relative).as_posix() == relative and "\\" not in relative,
+         f"{name} unsafe evidence reference: {relative}", name)
+    path = bounded(directory / relative, directory)
+    need(path.is_file(), f"{name} missing/nonregular evidence file: {relative}", name)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        need(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 16 * 1024 * 1024,
+             f"{name} empty/nonregular/oversized terminal evidence: {relative}", name)
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            content = stream.read(16 * 1024 * 1024 + 1)
+        after, named = os.fstat(fd), path.lstat()
+        stamp = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+                              info.st_ctime_ns, info.st_nlink, info.st_mode)
+        need(stamp(before) == stamp(after) == stamp(named) and len(content) == before.st_size,
+             f"{name} terminal evidence changed during read: {relative}", name)
+    finally:
+        os.close(fd)
+    return content, {"path": str(path), "bytes": len(content), "sha256": sha(content),
+                     "dev": str(named.st_dev), "ino": str(named.st_ino), "nlink": named.st_nlink}
+
+
+def marker_paths(directory: Path, name: str) -> list[Path]:
+    patterns = {"browser": (), "audit": ("report.failure.json",),
+                "ui": ("finalization-failure.json", "report-revocation.json"),
+                "perf": ("report-failure-*.json",)}[name]
+    return sorted({path for pattern in patterns for path in directory.glob(pattern)})
+
+
+def failure_markers(directory: Path, name: str) -> None:
+    markers = marker_paths(directory, name)
+    need(not markers, f"{name} failure marker present: {markers}", name)
+
+
+def same_evidence_path(value: object, expected: Path) -> bool:
+    if not isinstance(value, str) or not Path(value).is_absolute() or ".." in Path(value).parts:
+        return False
+    try:
+        return bounded(Path(value)) == bounded(expected)
+    except (EvidenceError, OSError):
+        return False
+
+
+def validate_durable_producer(name: str, value: dict, rc: int, directory: Path) -> dict:
+    """Consume each producer's actual completion protocol, not a common invented receipt."""
+    cause = first_failure(value)
+    need(cause is None,
+         f"{name} first cause: {json.dumps(compact_cause(cause), ensure_ascii=False)}; process_rc={rc}", name)
+    need(type(rc) is int and rc == 0 and type(value.get("exit_code")) is int and value["exit_code"] == rc,
+         f"{name} durable terminal process/report rc mismatch: {rc}", name)
+    failure_markers(directory, name)
+    data, report = producer_file(directory, "report.json", name)
+    need(decode(data) == value, f"{name} final report differs from consumed report", name)
+    if name == "browser":
+        durability = value.get("durability", {})
+        need(isinstance(durability, dict) and durability.get("protocol") == "browser-durable-final-v1" and
+             durability.get("state") == "FINAL_AFTER_DURABLE_LOG",
+             "browser missing/nonfinal durable protocol", name)
+        saved_log = durability.get("log", {})
+        need(isinstance(saved_log, dict) and saved_log.get("file") == "run.log",
+             "browser missing/unsafe durable log reference", name)
+        log_data, log = producer_file(directory, "run.log", name)
+        need(type(saved_log.get("bytes")) is int and saved_log["bytes"] == log["bytes"] and
+             saved_log.get("sha256") == log["sha256"], "browser durable log bytes/SHA differ", name)
+        lines = log_data.decode("utf-8").splitlines()
+        need(bool(lines) and re.search(rf"(?:^|\s)candidate_verdict={re.escape(value['verdict'])}(?:\s|$)",
+                                      lines[-1]) is not None and
+             re.search(rf"(?:^|\s)candidate_rc={rc}(?:\s|$)", lines[-1]) is not None,
+             "browser log lacks matching candidate termination", name)
+        records, protocol = [report, log], "browser-durable-final-v1"
+    elif name == "audit":
+        completion = value.get("completion", {})
+        need(isinstance(completion, dict) and completion.get("protocol") == "durable-final-v2" and
+             completion.get("status") == "FINAL" and completion.get("receipt") == "completion.json" and
+             completion.get("log") == "logs/audit.log", "audit missing/nonfinal completion protocol", name)
+        receipt_data, receipt_record = producer_file(directory, "completion.json", name)
+        receipt = decode(receipt_data)
+        need(receipt.get("protocol") == "durable-final-v2" and receipt.get("status") == "COMPLETE" and
+             type(receipt.get("exit_code")) is int and receipt["exit_code"] == rc and
+             receipt.get("report") == "report.json", "audit incomplete/mismatched completion receipt", name)
+        log_data, log = producer_file(directory, "logs/audit.log", name)
+        need(receipt.get("report_sha256") == report["sha256"], "audit receipt report SHA differs", name)
+        need(receipt.get("log_sha256") == completion.get("log_sha256") == log["sha256"],
+             "audit receipt/report log SHA differs", name)
+        prefix = f"AUDIT candidate_verdict={value['verdict']} candidate_rc={rc} report="
+        text = log_data.decode("utf-8")
+        need(text.startswith(prefix) and text.endswith("\n") and
+             same_evidence_path(text[len(prefix):-1], directory / "report.json"),
+             "audit candidate log termination differs", name)
+        records = [report, receipt_record, log]
+        protocol = "durable-final-v2"
+    elif name == "perf":
+        matching(value.get("persistence_protocol"), PERF_PERSISTENCE, "perf-persistence")
+        log_data, log = producer_file(directory, "run.log", name)
+        prefix = (f"{value['started_at']} START\n{value['finished_at']} EVIDENCE_READY "
+                  f"scope={value['scope']} terminal_authority=")
+        text = log_data.decode("utf-8")
+        need(text.startswith(prefix) and text.endswith("\n") and
+             same_evidence_path(text[len(prefix):-1], directory / "report.json"),
+             "perf EVIDENCE_READY log differs from terminal report", name)
+        candidate_data, candidate_record = producer_file(directory, "report-candidate.json", name)
+        candidate = decode(candidate_data)
+        pending = {**value, "verdict": "EVIDENCE_PENDING", "g5_certified": False, "exit_code": 2}
+        need(candidate == pending, "perf retained pending candidate differs", name)
+        records = [report, log, candidate_record]
+        need(all(record["nlink"] == 1 for record in records), "perf terminal evidence is not single-link", name)
+        protocol = PERF_PERSISTENCE["durability"]
+    else:
+        durability = value.get("durability", {})
+        need(value.get("state") == "FINAL" and isinstance(durability, dict) and
+             durability.get("state") == UI_DURABILITY and durability.get("protocol") == UI_PROTOCOL,
+             "ui missing/nonfinal durable protocol (legacy manifest is insufficient)", name)
+        evidence_data, evidence_record = producer_file(directory, "evidence.json", name)
+        evidence = decode(evidence_data)
+        log_data, log = producer_file(directory, "run.log", name)
+        need(value.get("evidence_sha256") == evidence_record["sha256"], "ui evidence manifest SHA differs", name)
+        need(value.get("run_log_sha256") == evidence.get("run_log_sha256") == log["sha256"],
+             "ui report/manifest run log SHA differs", name)
+        lines = log_data.decode("utf-8").splitlines()
+        ending = f" CANDIDATE verdict={value['verdict']} rc={rc} checks={len(value['checks'])}"
+        need(len(lines) >= 2 and lines[0] == f"{value['started_at']} START mode=PROVISIONAL" and
+             lines[-1].endswith(ending), "ui execution log lacks matching candidate termination", name)
+        need(evidence.get("state") == "COMPLETE" and
+             type(evidence.get("actual_solver_calls")) is int and
+             evidence["actual_solver_calls"] == value.get("actual_solver_calls"),
+             "ui incomplete manifest/solver count differs", name)
+        matching(evidence.get("sources"), value.get("sources"), "ui-manifest-source")
+        rows = evidence.get("files")
+        need(isinstance(rows, list) and bool(rows), "ui empty evidence manifest", name)
+        expected_files = {row["file"] for row in value["screenshots"]}
+        expected_files.update(path.name for path in directory.glob("solve-*.json"))
+        downloads = value.get("downloads")
+        need(isinstance(downloads, list), "ui missing download inventory", name)
+        for download in downloads:
+            need(isinstance(download, dict) and download.get("state") == "completed" and
+                 isinstance(download.get("guid"), str) and Path(download["guid"]).name == download["guid"],
+                 "ui incomplete/unsafe download inventory", name)
+            expected_files.add("downloads/" + download["guid"])
+        download_dir = directory / "downloads"
+        need(not download_dir.is_symlink(), "ui download directory symlink", name)
+        actual_downloads = {"downloads/" + path.name for path in download_dir.iterdir()} if download_dir.exists() else set()
+        need(actual_downloads == {"downloads/" + row["guid"] for row in downloads},
+             "ui actual download inventory differs", name)
+        records, seen = [report, evidence_record, log], set()
+        screenshot_hashes = {row["file"]: row["sha256"] for row in value["screenshots"]}
+        for row in rows:
+            need(isinstance(row, dict) and isinstance(row.get("file"), str) and row["file"] not in seen,
+                 "ui malformed/duplicate manifest file", name)
+            content, record = producer_file(directory, row["file"], name)
+            need(record["sha256"] == row.get("sha256"), "ui manifest artifact SHA differs", name)
+            need(row["file"] not in screenshot_hashes or row["sha256"] == screenshot_hashes[row["file"]],
+                 "ui manifest screenshot SHA differs from report", name)
+            if row["file"].startswith("downloads/"):
+                matching(decode(content).get("reproducibility", {}).get("source_sha256"),
+                         value["sources"], "ui-download-source")
+            seen.add(row["file"])
+            records.append(record)
+        need(seen == expected_files, "ui manifest file set differs from screenshots/solves/downloads", name)
+        operations = durability.get("operations")
+        need(isinstance(operations, list) and bool(operations), "ui empty durability operations", name)
+        # UI snapshots these operations before creating the final report; require
+        # fsync/readback for its dependencies, not a nonexistent final-report op.
+        for record in records[1:]:
+            for operation in ("fsync-file", "exact-readback"):
+                need(any(isinstance(row, dict) and row.get("operation") == operation and
+                         same_evidence_path(row.get("file"), Path(record["path"])) and
+                         all(row.get(field) == record[field] for field in ("dev", "ino", "sha256"))
+                         for row in operations), f"ui missing/drifted {operation}: {record['path']}", name)
+            parent = Path(record["path"]).parent
+            info = parent.stat()
+            need(any(isinstance(row, dict) and row.get("operation") == "fsync-directory" and
+                     same_evidence_path(row.get("path"), parent) and
+                     row.get("dev") == str(info.st_dev) and row.get("ino") == str(info.st_ino)
+                     for row in operations), f"ui missing/drifted directory fsync: {parent}", name)
+        protocol = UI_PROTOCOL
+    # Detect dependency or failure-sidecar drift between the individual reads.
+    for record in records:
+        _, current = producer_file(directory, Path(record["path"]).relative_to(directory.resolve()).as_posix(), name)
+        need(current == record, f"{name} durable dependency drift after validation", name)
+    failure_markers(directory, name)
+    return {"protocol": protocol, "artifacts": records, "scope": "OBSERVED_READBACK_NOT_CRASH_CERTIFICATION"}
+
+
+def load_producer_terminal(output: Path, name: str) -> tuple[dict, dict, list[dict]]:
+    runs = sorted(output.glob("run-*"))
+    need(len(runs) == 1 and runs[0].is_dir() and not runs[0].is_symlink(),
+         f"{name} expected exactly one owned run directory", name)
+    directory, failures = runs[0], []
+    if name != "browser":
+        for path in marker_paths(directory, name):
+            data, record = producer_file(directory, path.name, name)
+            failures.append({"report": record, "value": decode(data)})
+    # A failed finalization may revoke report.json or leave unknown bytes there.
+    # Read the actual failure sidecar first rather than masking it as "no report".
+    if failures:
+        selected = next((row for row in failures if first_failure(row["value"])), failures[0])
+        return selected["value"], selected["report"], failures
+    data, record = producer_file(directory, "report.json", name)
+    return decode(data), record, failures
+
+
+def validate_audit_payload(value: dict, directory: Path, sources: dict, url: str) -> list[dict]:
+    posts = value.get("post_source_checks", [])
+    positive(len(posts), "audit")
+    records, seen = [], set()
+    for row in posts:
+        need(isinstance(row, dict) and isinstance(row.get("artifact"), str) and
+             row["artifact"] not in seen and Path(row["artifact"]).name == row["artifact"],
+             "Audit duplicate/unsafe POST artifact", "audit")
+        matching(row.get("source_sha256"), sources, "audit")
+        need(row.get("verdict") == "PASS" and row.get("url") == url + "api/solve",
+             "Audit POST source check failed/foreign URL", "audit")
+        data, record = producer_file(directory, row["artifact"], "audit")
+        post = decode(data)
+        payload = post.get("payload") or {}
+        stamp = payload.get("reproducibility", {})
+        matching(stamp.get("source_sha256"), sources, "audit")
+        need(type(post.get("status")) is int and post["status"] == 200 and
+             post.get("url") == row["url"] and post.get("injection") in (None, "hold", "long"),
+             "Audit POST is not a successful actual solve response", "audit")
+        need(stamp.get("solver_sha256") == sources["solver.py"] and
+             isinstance(stamp.get("computed_at"), str), "Audit POST solver/time missing or stale", "audit")
+        time = datetime.fromisoformat(stamp["computed_at"].replace("Z", "+00:00"))
+        need(time.tzinfo is not None, "Audit POST computation time lacks timezone", "audit")
+        need(bool(payload.get("mesh", {}).get("nodes_mm")) and
+             bool(payload.get("fields", {}).get("velocity_m_s")), "Audit POST empty FEM payload", "audit")
+        need(type(post.get("bytes")) is int and post["bytes"] > 0 and
+             isinstance(post.get("body_sha256"), str) and
+             re.fullmatch(r"[a-f0-9]{64}", post["body_sha256"]) is not None and
+             post["body_sha256"] == row.get("body_sha256"), "Audit POST CDP digest differs/missing", "audit")
+        seen.add(row["artifact"])
+        records.append(record)
+    actual = []
+    for path in sorted(directory.glob("http-solve-*.json")):
+        data, _ = producer_file(directory, path.name, "audit")
+        post = decode(data)
+        if post.get("status") == 200 and post.get("injection") != "empty":
+            actual.append(path.name)
+    need(set(actual) == seen, "Audit successful POST inventory differs", "audit")
+    return records
+
+
+def validate_audit_coverage(value: dict, directory: Path, url: str) -> list[dict]:
+    screenshots, injections, records = value.get("screenshots", []), value.get("injections", []), []
+    need(isinstance(injections, list) and len(injections) == 16, "Audit incomplete injection inventory", "audit")
+    need(len({row.get("request_id") for row in injections}) == 16 and
+         all(isinstance(row.get("request_id"), str) and row["request_id"] for row in injections),
+         "Audit duplicate/missing injection request", "audit")
+    pictures = {row["file"]: row for row in screenshots}
+    need(len(pictures) == len(screenshots), "Audit duplicate screenshot file", "audit")
+    for width, height in ((320, 568), (768, 1024), (1064, 768), (1440, 900)):
+        for mode in ("hold", "error", "empty", "long"):
+            phase = f"{width}-loading-empty" if mode == "hold" else f"{width}-{mode}"
+            rows = [row for row in injections if row.get("mode") == mode and row.get("phase") == phase]
+            need(len(rows) == 1 and rows[0].get("url") == url + "api/solve",
+                 "Audit missing/foreign required injection", "audit")
+            if mode != "hold":
+                need(rows[0].get("status") == (503 if mode == "error" else 200) and
+                     isinstance(rows[0].get("body_sha256"), str) and
+                     re.fullmatch(r"[a-f0-9]{64}", rows[0]["body_sha256"]) is not None,
+                     "Audit injection response metadata differs", "audit")
+            if mode == "long":
+                positive(rows[0].get("real_mesh_nodes"), "audit-long")
+                length = positive(rows[0].get("injected_warning_length"), "audit-long")
+                need(length <= 4096, "Audit long warning outside actual contract", "audit")
+        for state in ("loading-empty", "ready", "error", "empty", "long",
+                      "error-recovery", "empty-recovery", "long-recovery"):
+            phase = f"{width}-{state}"
+            main = pictures.get(phase + ".png", {})
+            need(main.get("state") == phase and main.get("url") == url and
+                 (main.get("width"), main.get("height")) == (width, height),
+                 "Audit required viewport/state screenshot missing", "audit")
+            data, record = producer_file(directory, phase + ".coverage.json", "audit")
+            coverage = decode(data)
+            document, tiles = coverage.get("document", {}), coverage.get("tiles", [])
+            need(coverage.get("status") == "PASS" and coverage.get("scale") == 1 and
+                 coverage.get("horizontal_coverage") == "COMPLETE" and
+                 type(document.get("height")) is int and document["height"] > 0 and
+                 type(document.get("width")) is int and 0 < document["width"] <= width and
+                 isinstance(tiles, list) and bool(tiles), "Audit incomplete state screenshot coverage", "audit")
+            covered, seen = 0, set()
+            for tile in tiles:
+                picture = pictures.get(tile.get("file"), {})
+                y = tile.get("document_y")
+                need(tile.get("file") not in seen and type(y) is int and 0 <= y <= covered and
+                     tile.get("viewport") == {"width": width, "height": height} and
+                     picture.get("url") == url and picture.get("state", "").startswith(phase + "-tile-") and
+                     (picture.get("width"), picture.get("height")) == (width, height),
+                     "Audit tile inventory/coverage gap differs", "audit")
+                seen.add(tile["file"])
+                covered = max(covered, y + height)
+            need(covered >= document["height"] and coverage.get("vertical_coverage") == covered,
+                 "Audit incomplete vertical state coverage", "audit")
+            records.append(record)
+    counts = value.get("coverage_counts", {})
+    for key, expected in (("matrix", 4), ("checks", len(value["checks"])),
+                          ("screenshots", len(screenshots)), ("injected_requests", len(injections))):
+        need(type(counts.get(key)) is int and counts[key] == expected, "Audit coverage count differs", "audit")
     return records
 
 
@@ -481,15 +803,8 @@ def validate_producer(name: str, value: dict, rc: int, root: Path,
             need(row["health"].get("page_build") == build, "Audit health build differs", name)
         need(identities[0].get("served_byte_sha256") == identities[1].get("served_byte_sha256") and
              bool(identities[0].get("served_byte_sha256")), "Audit served bytes drift/empty", name)
-        posts = value.get("post_source_checks", [])
-        solves = positive(len(posts), name)
-        for row in posts:
-            matching(row.get("source_sha256"), sources, name)
-            need(row.get("verdict") == "PASS", "Audit POST source check failed", name)
-            post, _ = read_report(directory / row["artifact"], directory)
-            matching(post.get("payload", {}).get("reproducibility", {}).get("source_sha256"), sources, name)
-            need(post.get("body_sha256") == row.get("body_sha256") and bool(post.get("bytes")),
-                 "Audit POST artifact differs/empty", name)
+        posts = validate_audit_payload(value, directory, sources, url)
+        solves = len(posts)
         matrix = value.get("matrix", [])
         need({(row.get("width"), row.get("height")) for row in matrix} ==
              {(320, 568), (768, 1024), (1064, 768), (1440, 900)} and len(matrix) == 4,
@@ -503,6 +818,7 @@ def validate_producer(name: str, value: dict, rc: int, root: Path,
             if row["status"] in {"PARTIAL", "NOT_TESTED"}:
                 remaining.append(row)
         remaining.extend(row for row in checks if row["status"] == "NOT_TESTED")
+        validate_audit_coverage(value, directory, url)
         pictures = value.get("screenshots")
     elif name == "perf":
         need(value.get("scope") == "LOCAL_PREFLIGHT" and value.get("g5_certified") is False and
@@ -535,9 +851,21 @@ def validate_producer(name: str, value: dict, rc: int, root: Path,
         pictures = value.get("screenshots")
     need(isinstance(pictures, list) and bool(pictures), f"{name} empty PNG evidence", name)
     pngs = [png_record(row, directory, (360, 800) if name == "perf" else None) for row in pictures]
+    durability = validate_durable_producer(name, value, rc, directory)
     return {"checks": len(checks), "solves": solves, "pngs": pngs, "remaining": remaining,
+            "durable_completion": durability,
             "commit": candidate["commit"], "source_sha256": sources, "page_build": build,
             "commit_binding": "CLEAN_BEFORE_AFTER_INVENTORY" if name == "ui" else "PRODUCER_AND_INVENTORY"}
+
+
+def validate_perf_readback(value: dict, rc: int, directory: Path,
+                           original: dict, tool_sha256: str) -> dict:
+    terminal(value, rc, "perf-readback", "OFFLINE_PARSE_PASS")
+    need(value.get("schema_version") == 1 and value.get("tool") == PRODUCERS["perf"][2] and
+         value.get("scope") == "OFFLINE_PARSE_NOT_G5" and value.get("g5_certified") is False and
+         value.get("parsed_source", {}).get("sha256") == original["sha256"] and
+         value.get("tool_sha256") == tool_sha256, "Performance raw readback failed/mismatched", "perf")
+    return validate_durable_producer("perf", value, rc, directory)
 
 
 def execute(argv: list[str], root: Path, output: Path, name: str) -> dict:
@@ -805,24 +1133,28 @@ def run(root: Path, output: Path, integration: Path | None = None) -> dict:
             report["steps"].append(step)
             report["active"] = {"name": name, "state": "EXITED", "rc": step["rc"]}
             checkpoint(output, report, name + "-exit")
-            reports = sorted(child_output.glob("run-*/report.json"))
-            if len(reports) != 1:
+            try:
+                child, child_record, failed_reports = load_producer_terminal(child_output, name)
+            except Exception:
                 check_step(step)
-                raise EvidenceError(f"{name} expected exactly one report, got {len(reports)}", name)
-            child, child_record = read_report(reports[0], child_output)
+                raise
+            producer_report = Path(child_record["path"])
             entry["report"] = child_record
+            if failed_reports:
+                entry["failure_reports"] = failed_reports
             entry["terminal"] = {"rc": step["rc"], "exit_code": child.get("exit_code"),
                                  "verdict": child.get("verdict")}
             if first_failure(child) is not None:
                 entry["producer_first_cause"] = first_failure(child)
             artifact_error = None
             try:
-                entry["artifacts"] = artifacts(reports[0].parent, name)
+                entry["artifacts"] = artifacts(producer_report.parent, name)
             except Exception as exc:
                 artifact_error = exc
                 entry["artifact_failure"] = str(exc)
             # Preserve producer first cause even if later artifact readback also fails.
-            result = validate_producer(name, child, step["rc"], root, before, reports[0].parent, url)
+            result = validate_producer(name, child, step["rc"], root, before, producer_report.parent, url)
+            need(not failed_reports, f"{name} failure sidecar is not consumable success", name)
             if artifact_error is not None:
                 raise artifact_error
             entry["validation"] = result
@@ -833,20 +1165,21 @@ def run(root: Path, output: Path, integration: Path | None = None) -> dict:
                 parse_output = child_output / "readback"
                 report["active"] = {"name": "perf-readback", "state": "RUNNING"}
                 checkpoint(output, report, "perf-readback-start")
-                parsed_step = execute(["node", str(root / "tools" / tool_file), "--parse", str(reports[0]),
+                parsed_step = execute(["node", str(root / "tools" / tool_file), "--parse", str(producer_report),
                                       "--out", str(parse_output)], root, output, "perf-readback")
                 report["steps"].append(parsed_step)
-                check_step(parsed_step)
-                parsed_reports = list(parse_output.glob("run-*/report.json"))
-                need(len(parsed_reports) == 1, "Performance parser report missing/ambiguous", name)
-                parsed, parsed_record = read_report(parsed_reports[0], parse_output)
-                need(parsed.get("verdict") == "OFFLINE_PARSE_PASS" and parsed.get("exit_code") == 0 and
-                     parsed.get("scope") == "OFFLINE_PARSE_NOT_G5" and
-                     parsed.get("parsed_source", {}).get("sha256") == child_record["sha256"] and
-                     parsed.get("tool_sha256") == entry["tool_sha256"] and
-                     not first_failure(parsed), "Performance raw readback failed/mismatched", name)
+                try:
+                    parsed, parsed_record, parsed_failures = load_producer_terminal(parse_output, "perf")
+                except Exception:
+                    check_step(parsed_step)
+                    raise
+                if parsed_failures:
+                    entry["readback_failure_reports"] = parsed_failures
+                entry["readback_durable_completion"] = validate_perf_readback(
+                    parsed, parsed_step["rc"], Path(parsed_record["path"]).parent,
+                    child_record, entry["tool_sha256"])
                 entry["raw_metric_readback"] = parsed_record
-                entry["readback_artifacts"] = artifacts(parsed_reports[0].parent, name)
+                entry["readback_artifacts"] = artifacts(Path(parsed_record["path"]).parent, name)
                 report["active"] = {"name": "perf-readback", "state": "EXITED", "rc": parsed_step["rc"]}
                 checkpoint(output, report, "perf-readback-complete")
         report["server_after"] = server_identity(url, root, before, output, "after")

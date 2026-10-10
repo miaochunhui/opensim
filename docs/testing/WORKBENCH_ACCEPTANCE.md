@@ -80,7 +80,13 @@ UI 的 `bad-empty.json` 明确标 `NEGATIVE_INPUT`，不能算正向非空证据
   逐件 POST 核成功 FEM/source stamp，PNG 核实际 hash、尺寸、CRC、完整解压扫描线。
 - audit：`G3_G6_AUTOMATIC_EXTENSION_NOT_RELEASE`、`AUTOMATED_SCOPE_PASS`；
   核 source_sha256/page_build、before/after identity_checks、实际 POST、
-  4 视口、coverage/gates。PARTIAL/NOT_TESTED 逐条保留。
+  4 视口的 loading-empty/ready/error/empty/long 及三种 recovery 截图，
+  每态 coverage.json 的实际 tile 集合、尺寸、无缺口覆盖、16 个唯一请求注入、
+  coverage_counts 与 coverage/gates。PARTIAL/NOT_TESTED 逐条保留。
+  POST 必须实际 status=200、同 URL/source/solver/time、非空 mesh/velocity，
+  成功 http-solve 文件集合与 post_source_checks 双向一致。
+  当前 producer 保存解析后的 payload 和 CDP body_sha256/bytes，不保存完整响应
+  body 原文字节；此处只验证摘要格式及两处声明一致，不能称独立重算原响应 SHA。
 - perf：`LOCAL_PREFLIGHT`、`LOCAL_PREFLIGHT_PASS`、`g5_certified=false`；
   核一份 cold sample、sample.source_identity、固定 360×800 PNG；
   producer 截图没有 width/height，按固定基线核实际尺寸，不补造原字段。
@@ -98,6 +104,50 @@ audit coverage 仍 PARTIAL/NOT_TESTED 时为
 失败 rc=1；参数/落盘入口错误 rc=2。PARTIAL 不升认证。
 公网 DNS/TLS/同版本真实 FEM、public G5、物理触屏/软键盘、桌面/移动读屏、
 人工截图审阅、生产 apply/revert、授权和例外均另列未验。
+
+## Producer 终态消费
+
+`validate_durable_producer` 对各 producer 强制消费各自的实际协议，
+不发明共同 receipt，不以递归读取任意文件或 report PASS 代替完成证明：
+
+- audit `fb852044`：report.completion 为 `durable-final-v2/FINAL`，
+  completion.json 为同协议 `COMPLETE`，receipt rc 与真实进程/报告码相等；
+  receipt.report_sha256 对 report.json 原字节，receipt 与 report 的 log_sha256
+  同对实际 logs/audit.log，候选日志判词/rc/report 路径必须同本 run。
+  `report.failure.json` 存在即拒绝。
+- perf `994d8d2`：persistence_protocol.version=2、held-inode strategy、
+  exact-byte/single-link/no-follow ownership 和 file/directory fsync/readback
+  声明与实际工具一致；实际 run.log 的 EVIDENCE_READY scope/time/
+  terminal_authority 对当前终态，report-candidate.json 只能是原终态对应的
+  `EVIDENCE_PENDING/exit_code=2/g5_certified=false`。该 candidate 既不是失败
+  marker，也不是成功证据。`report-failure-*.json` 即拒绝；原始与 --parse
+  输出均经同一消费门，读回所有文件摘要及单链接状态，不伪造日志摘要字段。
+- UI `e596718`：state=FINAL，durability 为
+  `FINAL_AFTER_FSYNC_AND_INODE_READBACK` 与实际 exclusive/fsync/inode protocol；
+  report.evidence_sha256 对 evidence.json 原字节；report/manifest
+  run_log_sha256 同对实际 run.log，其首行与候选终止行必须相符。
+  manifest 必须 COMPLETE、source/count 同报告；files 不重不漏、不越界，
+  与截图、solve 文件及实际完成 downloads 双向一致，逐件 SHA、导出来源验证。
+  operations 的 fsync-file/exact-readback 用 `file`，fsync-directory 用 `path`；
+  依赖文件实际 dev/ino/SHA 与目录 dev/ino 均对拍，不要求 producer 在 final
+  创建前快照中不存在的 final-report 操作。旧 manifest-only 协议明确拒绝。
+  finalization-failure.json/report-revocation.json 或真实 failure 字段即拒绝。
+- browser：按主席交接的 `browser-durable-final-v1/FINAL_AFTER_DURABLE_LOG`，
+  durability.log.file=run.log，bytes/SHA 对实际非空日志，末行的
+  candidate_verdict/candidate_rc 同报告及真实进程；不要求不存在的 FINAL 文本。
+  本席未见新版 browser 实际终态产物，只有消费夹具，新版真实组合归主席核验。
+
+报告、receipt、log、manifest 通过有界 no-follow/nonblock 描述符回读，
+前后核 dev/ino/size/mtime/ctime/links 与命名路径，结束再次核依赖及失败标记。
+仅接受获准 `/hf3fs-jd` 根和其已知 `/3fs` 物理落点的同 realpath 语义，
+不拿 `.absolute()` 字符串区别误拒真实日志与 operations。
+这不是密码学签名、断电恢复、全盘耐久或恶意同 UID 并发隔离证明。
+
+撤销 report.json 或留下未知替换 bytes 时，`load_producer_terminal` 先回读
+上述实际失败侧档，保留 first_failure/finalization_failure/revocations；
+原运行首因优先于晚期 I/O，摘要还保留 stage/code/syscall/path。
+空/坏失败侧档也不能获得成功。原 browser schema/mode 不变，其新尾部实现
+由独占 browser 席与主席收口，本 delta 只消费已明确交接字段。
 
 ## 本席验收与交接
 
@@ -152,3 +202,55 @@ CLI 脏候选反例 `workbench-tests-f5fa51c69da24eb993572fc284d478d0/summary.js
 真实日志漂移和 provisional 拒绝例。脏候选 CLI 现读
 `workbench-tests-020c0347c68e41a1acb5979fd573c108/summary.json`，
 PASS，child_rc=1，`2026-10-10T08:32:13+00:00`。
+
+本轮在原 `5dea139` 三件上新增上述终态消费，主席已先合原件；
+只读研究 audit `fb852044`、perf `9214c70+994d8d2` 和 UI `e596718`，
+不合入或修改他席资产。本轮不运行 --regression、旧完整 FEM 或全组合。
+文件反例覆盖 receipt 缺失/空/未完成/错 rc/report/log SHA，实际字节漂移、
+失败侧档+未知 report 保护，UI 旧协议/operations 字段和 inode 变异、
+manifest 缺漏/重复/越界/错 source/count，perf pending/单链接/log 漂移，
+audit POST 与四视口状态/注入/tiles 缺件。夹具只证明检测器，不称产品 PASS。
+
+只读实际产物协议入口为测试工具的 `--producer-readback PRODUCER REPORT
+--producer-rc RC`；RC 须取原同次 execution/invocations 记录，不能猜测。
+该入口输出 `EXISTING_PRODUCER_PROTOCOL_READBACK_NOT_PRODUCT`，不以旧
+commit、最小 run 或文件夹具冒充本候选完整执行。
+首轮新专项 `workbench-tests-f549e6905904456692bec691903e0f65/summary.json`
+现读 2026-10-10T08:45:06Z：53 项、0 failures、1 error；真实缺 POST ENOENT
+暴露旧反例只捕获 EvidenceError，已统一缺证据报错后新目录复测，旧失败保留。
+修后专项 `workbench-tests-1658db1c2c7447d1b93797b9a02430c4/summary.json`
+现读 2026-10-10T08:47:26Z：53 PASS、0 failures/errors；随后增加三种实际失败
+侧档否决未变成功 report 的反例，最终计数以最新 summary 为准。
+
+只读真实协议回读，未启动 producer 或 FEM，证据均在同外置根：
+
+- audit `workbench-tests-fa8c4260733b4d4289d98ae395522142/summary.json`：
+  2026-10-10T08:47:34Z PASS；读取 fb852044 工具产生的真实 Chromium 正向夹具
+  receipt/report/log、成功 POST 和32份必需状态覆盖。mode 仍为 fixture，
+  此结果不是产品 audit 通过。
+- perf `workbench-tests-31a9796268614d98a9cc548cea0aa728/summary.json`：
+  2026-10-10T08:46:20Z PASS；读取 994d8d2 的实际 --parse rc0/21 checks 输出，
+  log/pending/protocol 通过；输入为合成尺子，不是产品 cold/G5。
+  原 invocations.json 与 cli-003.log 同验 rc0；先前挑到 --selftest 失败报告的
+  读回为 FAIL，首因 SELFTEST/At least six named file fixtures required，留在
+  `workbench-tests-12fc4df9260d416b96c650ad75f890aa/summary.json`，不追认。
+- UI `workbench-tests-3ace5a110d254e9eb79dd900fb7807dd/summary.json`：
+  2026-10-10T08:47:39Z PASS；读取 e596718 完整真实 UI run
+  `seat-ui/unittest-20261010T084206Z-7bd59a43/run-2026-10-10T08-42-06-706Z-03680c1c/report.json`，
+  原 execution.json 同次 rc0，43 checks、61 solve、28 PNG、6 downloads，
+  实际 report SHA256 为
+  `29b6c3bbbac86a57d3eed6cb7ac26018e0f682a028e8a02b480d98d590a5c7b8`；
+  全部 manifest/log/SHA/operations dev/ino 对拍。此前 durable-smoke 仅为
+  新协议最小3 solve run；没有使用 cb75283 preprotocol 报告充当新版证明。
+
+以上不追认主仓新候选组合、不代人工/公网认证；最终冻结候选全组合由主席执行。
+完整三 producer 消费专项最终 2026-10-10T08:49:23Z 为54 PASS，
+0 failures/errors/skips，报告
+`workbench-tests-2c33673c196146468f7f9572b3c91bde/summary.json`。
+主席随后明确 browser 新尾部字段，本席只加对应日志消费及8种文件阴性变体，
+不修改 browser 席资产；最后测试计数以新增后 summary 为准。
+新增 browser 消费后的最终专项现读 2026-10-10T08:51:36Z：
+`workbench-tests-b87fe2fd22ca4b20b4e2dc14e0f2ded4/summary.json`，
+55 PASS、0 failures/errors/skips；所有专项已终止，无遗留 RUNNING。
+新版 browser 真实产物仍未回读，整合后的同候选串行组合未运行，
+本席不声明发布认证或全部开发完成；未 push。
