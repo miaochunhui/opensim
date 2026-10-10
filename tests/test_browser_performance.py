@@ -10,10 +10,16 @@ import argparse
 import hashlib
 import io
 import json
+import math
+import os
+import re
+import stat
+import struct
 import subprocess
 import sys
 import time
 import unittest
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -22,6 +28,9 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools/browser_performance.mjs"
 EVIDENCE = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-perf")
 REVIEW_EVIDENCE = EVIDENCE / "review-v1-20261010"
+DEFAULT_REVIEW_EVIDENCE = REVIEW_EVIDENCE
+TASK_EVIDENCE = EVIDENCE.parent
+ORIGINAL_REPORT = COMBINATION_STATE = COMBINATION_REPORT = None
 BASELINE = {
     "id": "opensim-mobile-cold-v1", "width": 360, "height": 800,
     "device_scale_factor": 1, "mobile": True, "touch": True,
@@ -37,6 +46,221 @@ CONFIG = {"geometry": "circle", "width_mm": 4, "height_mm": 4, "length_mm": 100,
 
 def write_json(path, value):
     path.write_text(json.dumps(value, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+
+
+def read_exact(path):
+    """Read regular evidence through a held inode without modifying producer files."""
+    evidence_path(path, TASK_EVIDENCE)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 16 * 1024 * 1024:
+            raise ValueError(f"Nonregular/empty/oversized evidence: {path}")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read(16 * 1024 * 1024 + 1)
+        stamp = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_nlink)
+        if stamp(before) != stamp(os.fstat(fd)) or stamp(before) != stamp(path.lstat()):
+            raise ValueError(f"Evidence inode/content changed during read: {path}")
+        if len(data) != before.st_size or before.st_nlink != 1:
+            raise ValueError(f"Short or multiply linked evidence: {path}")
+        return data, stamp(before)
+    finally:
+        os.close(fd)
+
+
+def evidence_path(path, boundary):
+    """Keep the approved logical path while checking its physical boundary."""
+    if not path.is_absolute() or ".." in path.parts or not path.is_relative_to(boundary):
+        raise ValueError(f"Evidence path must be absolute and inside {boundary}: {path}")
+    relative = path.relative_to(boundary)
+    current = boundary
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"Evidence path has a symlink below its boundary: {current}")
+    if not path.resolve().is_relative_to(boundary.resolve()):
+        raise ValueError(f"Evidence physical path escapes {boundary}: {path}")
+    return path
+
+
+def validate_review_args(parser, args):
+    originals = (args.original_report, args.combination_state, args.combination_report)
+    if any(path is not None for path in originals) and not all(path is not None for path in originals):
+        parser.error("Original review requires original report plus combination state and report")
+    if args.health_review_only and (args.real_browser or args.preflight):
+        parser.error("Health parse review cannot launch browser or preflight")
+    try:
+        allowed_tools = {TOOL.resolve(), Path("/data/dev/opensim/tools/browser_performance.mjs").resolve()}
+        if (not args.tool.is_absolute() or ".." in args.tool.parts or args.tool.is_symlink() or
+                args.tool.resolve(strict=True) not in allowed_tools or not args.tool.is_file()):
+            raise ValueError("Tool must be the review or main repository performance tool")
+        output = evidence_path(args.evidence_root, EVIDENCE)
+        relative = output.relative_to(EVIDENCE)
+        if (output != DEFAULT_REVIEW_EVIDENCE and
+                (not relative.parts or not re.fullmatch(r"review-integrated-v2-[A-Za-z0-9_-]+", relative.parts[0]))):
+            raise ValueError("Evidence output must be in a dedicated review-integrated-v2-* directory")
+        if all(path is not None for path in originals):
+            for path in originals:
+                evidence_path(path, TASK_EVIDENCE)
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    raise ValueError(f"Original input must be a regular file: {path}")
+            original, state, combination = originals
+            if not original.is_relative_to(EVIDENCE) or original.name != "report.json":
+                raise ValueError("Original report must be a seat-perf report.json")
+            if (state.parent != combination.parent or combination.name != "workbench.json" or
+                    not re.fullmatch(r"state-[0-9]{3}\.json", state.name) or
+                    state.parent.parent != TASK_EVIDENCE or
+                    not state.parent.name.startswith("workbench-integrated-")):
+                raise ValueError("Combination inputs must be same-run state-NNN.json and workbench.json")
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    return args.tool.resolve(strict=True), output, originals
+
+
+def inspect_original(path):
+    """Independent arithmetic and file checks; never recertify an original FAIL."""
+    data, stamp = read_exact(path)
+    report = json.loads(data)
+    sample = report["samples"][0]
+    if (report["verdict"] != "FAIL" or report["exit_code"] != 1 or
+            report["scope"] != "LOCAL_PREFLIGHT" or report["g5_certified"] or
+            report["release_verdict"] != "NOT_CERTIFIED" or len(report["samples"]) != 1 or
+            report["baseline"] != BASELINE or report["identity_before"] != report["identity_after"]):
+        raise ValueError("Original terminal/baseline/source contract differs")
+    state = json.loads(read_exact(COMBINATION_STATE)[0])
+    workbench = json.loads(read_exact(COMBINATION_REPORT)[0])
+    steps = [step for step in state["report"]["steps"] if step["name"] == "perf"]
+    if len(steps) != 1 or steps[0]["rc"] != 1 or state["stage"] != "perf-exit":
+        raise ValueError("Original perf rc not established by combination state")
+    if any(step["name"] == "perf-readback" for step in workbench["steps"]):
+        raise ValueError("Unexpected parse invocation after original failure")
+    record = workbench["producers"]["perf"]["report"]
+    digest = lambda b: hashlib.sha256(b).hexdigest()
+    if (Path(record["path"]).resolve() != path.resolve() or record["sha256"] != digest(data) or
+            record["dev"] != str(stamp[0]) or record["ino"] != str(stamp[1])):
+        raise ValueError("Combination did not bind the current original inode/bytes")
+    raw, metrics = sample["raw_metrics"], sample["metrics"]
+    lcp = raw["lcp"][-1]["startTime"]
+    maximum, value, start, last = 0, 0, None, None
+    for shift in sorted(raw["shifts"], key=lambda row: row["startTime"]):
+        if shift["hadRecentInput"]:
+            continue
+        moment = shift["startTime"]
+        if start is None or moment - last >= 1000 or moment - start >= 5000:
+            start, value = moment, 0
+        value += shift["value"]
+        maximum, last = max(maximum, value), moment
+    latencies = []
+    for row in sample["interactions"]:
+        if row["click_count"] != 1 or any(not p["trusted"] for p in row["paints"]):
+            raise ValueError("Untrusted/multiple original clicks")
+        bounds = [p["end_ms"] - p["start_ms"] for p in row["paints"]]
+        if bounds != [p["bound_ms"] for p in row["paints"]]:
+            raise ValueError("Original raw paint subtraction differs")
+        latency = max(bounds + [e["duration"] for e in row["event_timing"]])
+        if latency != row["latency_ms"]:
+            raise ValueError("Original interaction raw/summary mismatch")
+        latencies.append(latency)
+    measured = {"lcp_ms": lcp, "cls": maximum, "interaction_latency_ms": max(latencies)}
+    if any(metrics[key] != value for key, value in measured.items()) or metrics["inp_ms"] is not None:
+        raise ValueError("Original metrics differ from independent raw arithmetic")
+    resources = sample["resources"]
+    measured.update({"critical_bytes": sum(r["transfer_bytes"] for r in resources
+                                           if r["type"] in {"Document", "Stylesheet", "Script"}),
+                     "first_screen_bytes": sum(r["transfer_bytes"] for r in resources),
+                     "javascript_bytes": sum(r["transfer_bytes"] for r in resources if r["type"] == "Script"),
+                     "font_bytes": sum(r["transfer_bytes"] for r in resources if r["type"] == "Font")})
+    limits = {"lcp_ms": 2500, "cls": 0.1, "interaction_latency_ms": 200, "critical_bytes": 200000,
+              "first_screen_bytes": 1000000, "javascript_bytes": 300000, "font_bytes": 150000}
+    if any(not math.isfinite(value) or value > limits[key] for key, value in measured.items()):
+        raise ValueError("Original actually exceeded an unchanged budget")
+    identity = sample["source_identity"]
+    sources = report["identity_before"]["source_sha256"]
+    if sources != report["identity_before"]["committed_source_sha256"]:
+        raise ValueError("Original source identity is not committed")
+    source_root = Path("/data/dev/opensim")
+    commit = report["commit"]
+    for name in [*SOURCES, "tools/browser_performance.mjs"]:
+        committed = subprocess.run(["git", "show", f"{commit}:{name}"],
+                                   cwd=source_root, capture_output=True, check=True).stdout
+        expected = report["tool_sha256"] if name == "tools/browser_performance.mjs" else sources[name]
+        if digest(committed) != expected:
+            raise ValueError(f"Original commit bytes differ: {name}")
+    healths = identity["health_responses"]
+    health_phases = []
+    for kind in ("health", "solve"):
+        rows = identity[kind + "_responses"]
+        ids = [row["request_id"] for row in rows]
+        actual = [r for r in identity["response_resources"] if r["url"].endswith("/api/" + kind)]
+        if len(ids) != len(set(ids)) or set(ids) != {r["request_id"] for r in actual}:
+            raise ValueError(f"Original {kind} request inventory differs")
+        for index, row in enumerate(rows, 1):
+            wire = row["response_body"].encode()
+            saved = read_exact(path.parent / f"{kind}-{index}.json")[0]
+            resource = next(r for r in actual if r["request_id"] == row["request_id"])
+            if (digest(wire) != row["response_sha256"] or resource["body_sha256"] != digest(wire) or
+                    resource["status"] != 200 or not resource["finished"] or
+                    json.loads(wire) != row["result"] or json.loads(saved) != row["result"]):
+                raise ValueError(f"Original {kind} raw bytes/result differ")
+            if kind == "health":
+                if saved != wire or row["result"]["source_sha256"] != sources:
+                    raise ValueError("Original health identity differs")
+                health_phases.append(resource["phase"])
+            elif (row["result"]["config"] != CONFIG or
+                  row["result"]["reproducibility"]["source_sha256"] != sources or
+                  len(row["result"]["fields"]["velocity_m_s"]) != len(row["result"]["mesh"]["nodes_mm"])):
+                raise ValueError("Original full FEM/config identity differs")
+    for resource in identity["response_resources"]:
+        if resource["type"] in {"Document", "Script", "Stylesheet"}:
+            saved = read_exact(path.parent / ("response-" + resource["request_id"].replace(".", "-") + ".txt"))[0]
+            if digest(saved) != resource["body_sha256"]:
+                raise ValueError("Original page/assets raw bytes differ")
+    if "<code>" + report["identity_before"]["page_build"] + "</code>" not in identity["document_body"]:
+        raise ValueError("Original exact page build element missing")
+    screenshot_file = sample["screenshot"]["file"]
+    if Path(screenshot_file).name != screenshot_file:
+        raise ValueError("Original screenshot must be a run-local basename")
+    png = read_exact(path.parent / screenshot_file)[0]
+    if digest(png) != sample["screenshot"]["sha256"] or len(png) != sample["screenshot"]["bytes"]:
+        raise ValueError("Original screenshot bytes/hash differ")
+    if not png.startswith(b"\x89PNG\r\n\x1a\n") or struct.unpack(">II", png[16:24]) != (360, 800):
+        raise ValueError("Original PNG size/signature differs")
+    offset, chunks, ended = 8, [], False
+    while offset < len(png):
+        length = int.from_bytes(png[offset:offset + 4], "big")
+        kind, chunk = png[offset + 4:offset + 8], png[offset + 8:offset + 8 + length]
+        crc = int.from_bytes(png[offset + 8 + length:offset + 12 + length], "big")
+        if zlib.crc32(kind + chunk) != crc:
+            raise ValueError("Original PNG CRC differs")
+        if kind == b"IDAT":
+            chunks.append(chunk)
+        offset += length + 12
+        if kind == b"IEND":
+            ended = True
+            break
+    channels = {2: 3, 6: 4}[png[25]]
+    pixels = zlib.decompress(b"".join(chunks))
+    if not ended or offset != len(png) or len(pixels) != (360 * channels + 1) * 800:
+        raise ValueError("Original PNG incomplete")
+    candidate = json.loads(read_exact(path.parent / "report-candidate.json")[0])
+    if candidate != dict(report, verdict="EVIDENCE_PENDING", exit_code=2, g5_certified=False):
+        raise ValueError("Original held-inode pending candidate differs")
+    expected_log = (report["started_at"] + " START\n" + report["finished_at"] +
+                    " EVIDENCE_READY scope=LOCAL_PREFLIGHT terminal_authority=")
+    log = read_exact(path.parent / "run.log")[0].decode()
+    if not log.startswith(expected_log) or Path(log[len(expected_log):].strip()).resolve() != path.resolve():
+        raise ValueError("Original ready log differs")
+    if list(path.parent.glob("report-failure-*.json")) or report.get("persistence_failure"):
+        raise ValueError("Original unexpected persistence failure marker")
+    return {"collected_at": datetime.now(timezone.utc).isoformat(), "verdict": "DIAGNOSED_HARNESS_BUG",
+            "original_verdict": "FAIL", "original_rc_from_state": steps[0]["rc"], "parse_state": "NOT_RUN",
+            "report": str(path), "report_sha256": digest(data), "dev": stamp[0], "ino": stamp[1],
+            "started_at": report["started_at"], "finished_at": report["finished_at"],
+            "measured": measured, "limits": limits, "budget_exceeded": False,
+            "health_count": len(healths), "health_phases": health_phases, "solves": 2,
+            "samples": 1, "retries": 0, "screenshot": sample["screenshot"],
+            "source_before_after_equal": True, "scope": "LOCAL_PREFLIGHT", "g5_certified": False,
+            "production_changes": 0}
 
 
 def sample_report():
@@ -112,11 +336,13 @@ def sample_report():
             text = json.dumps(result)
             digest = hashlib.sha256(text.encode()).hexdigest()
             request_id = f"{key}-{index}"
-            identity[key].append({"result": json.loads(text), "response_body": text,
+            phase = (["cold-baseline", "core-interactions"] if key == "solve_responses" else
+                     ["identity-before-interactions", "source-identity"])[index]
+            identity[key].append({"phase": phase, "result": json.loads(text), "response_body": text,
                                   "response_sha256": digest, "request_id": request_id})
             identity["response_resources"].append({
                 "request_id": request_id, "url": target.rstrip("/") + pathname, "method": method,
-                "status": 200, "finished": True, "body_sha256": digest})
+                "phase": phase, "status": 200, "finished": True, "body_sha256": digest})
     snapshot = {"commit": "a" * 40, "tool_sha256": "b" * 64,
                 "identity_scope": "FIVE_APPLICATION_SOURCES_PLUS_PERFORMANCE_TOOL_NOT_FULL_TREE",
                 "committed_tool_sha256": "b" * 64, "page_build": "b" * 12,
@@ -146,6 +372,18 @@ def set_metric(report, name, value):
         row["paints"][0]["bound_ms"] = value
         row["paints"][0]["end_ms"] = row["paints"][0]["start_ms"] + value
         row["event_timing"][0]["duration"] = value
+
+
+def add_startup_health(report, mutation=None):
+    """Keep all three distinct responses, as the integrated page actually does."""
+    identity = report["samples"][0]["source_identity"]
+    row = json.loads(json.dumps(identity["health_responses"][0]))
+    row.update(request_id="startup-health", phase="cold-baseline")
+    resource = dict(identity["response_resources"][2], request_id=row["request_id"], phase=row["phase"])
+    identity["health_responses"].insert(0, row)
+    identity["response_resources"].append(resource)
+    if mutation:
+        mutation(identity, row, resource)
 
 
 def fixture_page(kind):
@@ -256,6 +494,33 @@ def create_fixtures(directory, real_browser=False):
     add("first-health-identity-mismatch", "FAIL", "G5-IDENTITY", lambda r:
         r["samples"][0]["source_identity"]["health_responses"][0]["result"]
         ["source_sha256"].update({"solver.py": "c" * 64}))
+    add("health-three-valid", "PASS", mutation=add_startup_health)
+    add("health-extra-wrong-source", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: row["result"]["source_sha256"].update({"solver.py": "c" * 64})))
+    add("health-extra-wrong-body", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: row.update(response_body="{}")))
+    add("health-extra-wrong-status", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: resource.update(status=503)))
+    add("health-extra-duplicate-id", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: row.update(request_id=identity["health_responses"][1]["request_id"])))
+    add("health-extra-missing-row", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: identity["health_responses"].remove(row)))
+    add("health-extra-missing-resource", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: identity["response_resources"].remove(resource)))
+    add("health-extra-duplicate-resource", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: identity["response_resources"].append(dict(resource))))
+    add("health-missing-before-phase", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: identity["health_responses"][1].update(phase="cold-baseline")))
+    add("health-missing-final-phase", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: identity["health_responses"][2].update(phase="cold-baseline")))
+    add("health-extra-unknown-phase", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: (row.update(phase="unknown"), resource.update(phase="unknown"))))
+    add("health-extra-phase-mismatch", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: resource.update(phase="source-identity")))
+    add("health-extra-wrong-method", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: resource.update(method="POST")))
+    add("health-extra-wrong-origin", "FAIL", "G5-IDENTITY", lambda r: add_startup_health(r,
+        lambda identity, row, resource: resource.update(url="http://127.0.0.1:54321/api/health")))
     add("missing-first-solve", "FAIL", "G5-IDENTITY", lambda r:
         r["samples"][0]["source_identity"]["solve_responses"].pop(0))
     add("empty-first-solve-velocity", "FAIL", "G5-IDENTITY", lambda r:
@@ -301,10 +566,12 @@ class PerformanceTests(unittest.TestCase):
         cls.fixtures = cls.evidence_run / "fixtures"
         cls.cases = create_fixtures(cls.fixtures)
         cls.invocations = []
+        cls.argument_invocations = []
 
     @classmethod
     def tearDownClass(cls):
         write_json(cls.evidence_run / "invocations.json", cls.invocations)
+        write_json(cls.evidence_run / "argument-invocations.json", cls.argument_invocations)
 
     def invoke(self, *args):
         command = ["node", str(TOOL), *args, "--out", str(self.evidence_run / "cli")]
@@ -353,6 +620,66 @@ class PerformanceTests(unittest.TestCase):
             result, report = self.invoke("--selftest", "--fixtures", str(directory))
             self.assertEqual(result.returncode, 2)
             self.assertEqual(report["verdict"], "FAIL")
+
+    def test_health_response_inventory(self):
+        cases = [case for case in self.cases if case["file"].startswith("health-") or
+                 case["file"] == "positive-synthetic-ruler.json"]
+        self.assertEqual(len(cases), 15)
+        for case in cases:
+            with self.subTest(file=case["file"]):
+                result, report = self.invoke("--parse", str(self.fixtures / case["file"]))
+                self.assertEqual(result.returncode, 0 if case["expected"] == "PASS" else 1,
+                                 result.stdout + result.stderr)
+                self.assertFalse(report["g5_certified"])
+                if case["expected"] == "FAIL":
+                    self.assertTrue(any(row["rule"] == "G5-IDENTITY" and row["status"] == "FAIL"
+                                        for row in report["checks"]))
+        if ORIGINAL_REPORT:
+            before = read_exact(ORIGINAL_REPORT)
+            actual = inspect_original(ORIGINAL_REPORT)
+            result, parsed = self.invoke("--parse", str(ORIGINAL_REPORT))
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(parsed["verdict"], "FAIL")
+            self.assertEqual(parsed["input_failure"]["rule"], "G5-IDENTITY")
+            self.assertEqual(parsed["parsed_source"]["sha256"], actual["report_sha256"])
+            self.assertTrue(any(row["rule"] == "EVIDENCE" and row["status"] == "FAIL"
+                                for row in parsed["checks"]))
+            self.assertEqual(read_exact(ORIGINAL_REPORT), before)
+            write_json(self.evidence_run / "original-review.json", actual)
+
+    def test_review_cli_rejects_partial_inputs_and_unsafe_paths(self):
+        """Reject bad admission before creating any child evidence or executing a tool."""
+        original_args = ["--original-report", str(self.fixtures / "report.json")]
+        state_args = ["--combination-state", str(TASK_EVIDENCE / "workbench-integrated-v2/state-021.json")]
+        combination_args = ["--combination-report", str(TASK_EVIDENCE / "workbench-integrated-v2/workbench.json")]
+        triples = [original_args, state_args, combination_args]
+        cases = [([arg for index, pair in enumerate(triples) if mask & (1 << index) for arg in pair],
+                  "Original review requires") for mask in range(1, 7)]
+        cases += [(["--health-review-only", option], "cannot launch")
+                  for option in ("--real-browser", "--preflight")]
+        cases += [(["--evidence-root", str(path)], "Evidence") for path in (
+            Path("/tmp/opensim-perf-unapproved"), EVIDENCE, EVIDENCE / "workbench-other-seat",
+            Path("relative-evidence"), EVIDENCE / "review-integrated-v2-invalid/../escape")]
+        cases += [(["--tool", "/bin/true"], "Tool must be")]
+        link = self.evidence_run / "symlink-output"
+        link.symlink_to(self.fixtures, target_is_directory=True)
+        cases += [(["--evidence-root", str(link / "child")], "symlink")]
+        cases += [(original_args + state_args + combination_args, "No such file")]
+        outside = ["--original-report", "/etc/passwd"] + state_args + combination_args
+        cases += [(outside, "Evidence path")]
+        child_output = self.evidence_run / "argument-child"
+        for index, (args, message) in enumerate(cases, 1):
+            with self.subTest(args=args):
+                command = [sys.executable, "-B", str(Path(__file__).resolve()),
+                           "--evidence-root", str(child_output), *args]
+                result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertNotIn("PERFORMANCE_TESTS", result.stdout)
+                self.assertFalse(child_output.exists())
+                log = f"argument-{index:03d}.log"
+                (self.evidence_run / log).write_text(result.stdout + result.stderr, encoding="utf-8")
+                self.argument_invocations.append({"command": command, "exit_code": result.returncode, "log": log})
 
     def test_targets_and_baseline_cannot_be_loosened(self):
         for args in [
@@ -451,8 +778,8 @@ def verify_product_artifacts(report, directory):
     counts = {}
     for kind in ("health", "solve"):
         responses = identity[kind + "_responses"]
-        if len(responses) != 2:
-            raise ValueError(f"Expected exactly two full {kind} responses")
+        if len(responses) < 2 or kind == "solve" and len(responses) != 2:
+            raise ValueError(f"Missing required full {kind} responses")
         for index, row in enumerate(responses, 1):
             raw = (directory / f"{kind}-{index}.json").read_bytes()
             if json.loads(raw) != row["result"]:
@@ -552,12 +879,23 @@ def owned_preflight(directory):
 
 
 def run_main():
+    global TOOL, REVIEW_EVIDENCE, ORIGINAL_REPORT, COMBINATION_STATE, COMBINATION_REPORT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--real-browser", action="store_true")
     parser.add_argument("--preflight", action="store_true",
                         help="Start/stop an owned new loopback server and verify actual product evidence")
+    parser.add_argument("--health-review-only", action="store_true",
+                        help="Only parse health inventory fixtures; never launch Chromium/server")
+    parser.add_argument("--tool", type=Path, default=TOOL)
+    parser.add_argument("--evidence-root", type=Path, default=REVIEW_EVIDENCE)
+    parser.add_argument("--original-report", type=Path)
+    parser.add_argument("--combination-state", type=Path)
+    parser.add_argument("--combination-report", type=Path)
     args = parser.parse_args()
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(PerformanceTests)
+    TOOL, REVIEW_EVIDENCE, originals = validate_review_args(parser, args)
+    ORIGINAL_REPORT, COMBINATION_STATE, COMBINATION_REPORT = originals
+    suite = (unittest.TestSuite([PerformanceTests("test_health_response_inventory")])
+             if args.health_review_only else unittest.defaultTestLoader.loadTestsFromTestCase(PerformanceTests))
     test_log = io.StringIO()
     result = unittest.TextTestRunner(verbosity=2, stream=test_log).run(suite)
     directory = PerformanceTests.evidence_run
@@ -567,6 +905,9 @@ def run_main():
               "cli_invocations": len(PerformanceTests.invocations),
               "failures": len(result.failures), "errors": len(result.errors),
               "real_browser": "NOT_RUN", "verdict": "PASS" if result.wasSuccessful() else "FAIL"}
+    report.update(tool_path=str(TOOL), tool_sha256=hashlib.sha256(TOOL.read_bytes()).hexdigest(),
+                  health_review_only=args.health_review_only, production_changes=0,
+                  original_review="original-review.json" if ORIGINAL_REPORT else None)
     if args.real_browser and result.wasSuccessful():
         fixture_dir = directory / "real-browser-fixtures"
         create_fixtures(fixture_dir, real_browser=True)
@@ -589,8 +930,10 @@ def run_main():
             report["verdict"] = "FAIL"
     report["cli_invocations"] = len(PerformanceTests.invocations)
     report["all_cli_invocations"] = (report["cli_invocations"] +
+                                     len(PerformanceTests.argument_invocations) +
                                      int("real_browser_exit_code" in report) +
                                      len(report.get("preflight", {}).get("browser_runs", [])))
+    report["argument_invocations"] = len(PerformanceTests.argument_invocations)
     report["collected_at"] = datetime.now(timezone.utc).isoformat()
     write_json(directory / "summary.json", report)
     print(f"PERFORMANCE_TESTS verdict={report['verdict']} tests={report['tests']} "

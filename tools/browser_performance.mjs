@@ -467,7 +467,7 @@ export class Browser {
             await fs.writeFile(path.join(this.run, `solve-${this.solves.length}.json`), json(result), { flag: 'wx' });
           }
           if (new URL(r.url).pathname === '/api/health') {
-            this.healths.push({ result: JSON.parse(text), request_id: e.requestId,
+            this.healths.push({ phase: r.phase, result: JSON.parse(text), request_id: e.requestId,
               response_sha256: sha(text), response_body: text });
             await fs.writeFile(path.join(this.run, `health-${this.healths.length}.json`), text, { flag: 'wx' });
           }
@@ -776,6 +776,36 @@ export function validateReport(report) {
       new URL(resource.url).pathname === pathname && resource.method === method &&
       resource.status === 200 && resource.finished === true &&
       resource.body_sha256 === row.response_sha256);
+  const responseSet = (rows, pathname, method, phases, extraPhases = []) => {
+    const resources = identity?.response_resources?.filter(resource =>
+      new URL(resource.url).pathname === pathname) ?? [];
+    const failures = [];
+    if (!Array.isArray(rows) || rows.length < phases.length) failures.push('missing-responses');
+    rows = Array.isArray(rows) ? rows : [];
+    const unique = values => values.every(value => typeof value === 'string' && value.length > 0) &&
+      new Set(values).size === values.length;
+    const ids = rows.map(row => row.request_id), actualIds = resources.map(row => row.request_id);
+    if (!unique(ids) || !unique(actualIds)) failures.push('duplicate-or-missing-request-id');
+    if (ids.length !== actualIds.length || actualIds.some(id => !ids.includes(id))) {
+      failures.push('response-inventory-differs');
+    }
+    if (phases.some(phase => rows.filter(row => row.phase === phase).length !== 1) ||
+        rows.some(row => ![...phases, ...extraPhases].includes(row.phase))) {
+      failures.push('required-phase-missing-duplicate-or-unknown');
+    }
+    if (!rows.every(row => capturedResponse(row, pathname, method) && resources.some(resource =>
+      resource.request_id === row.request_id && resource.phase === row.phase &&
+      new URL(resource.url).origin === new URL(report.target_url).origin))) {
+      failures.push('response-body-status-method-origin-or-phase-mismatch');
+    }
+    return { bound: failures.length === 0, count: rows.length, request_ids: ids,
+      required_phases: phases, failures };
+  };
+  // Page startup can probe health too; validate the full set, not a chosen pair.
+  const healthResponses = responseSet(identity?.health_responses, '/api/health', 'GET',
+    ['identity-before-interactions', 'source-identity'], ['cold-baseline']);
+  const solveResponses = responseSet(identity?.solve_responses, '/api/solve', 'POST',
+    ['cold-baseline', 'core-interactions']);
   const matching = map => map && Object.keys(map).length === SOURCES.length &&
     SOURCES.every(name => /^[a-f0-9]{64}$/.test(identity.local_source_sha256?.[name] ?? '') &&
       map[name] === identity.local_source_sha256[name]);
@@ -794,16 +824,17 @@ export function validateReport(report) {
     sameSources(report.identity_after.source_sha256, identity.local_source_sha256) &&
     identity.document_body?.includes(`<code>${report.identity_before.page_build}</code>`) &&
     sha(identity.document_body ?? '') === identity.document_sha256 &&
-    identity.health_responses?.length === 2 && identity.health_responses.every(row =>
+    healthResponses.bound && identity.health_responses.every(row =>
       row.result?.status === 'ok' && row.result.schema_version === 1 &&
       row.result.page_build === report.identity_before.page_build &&
       matching(row.result.source_sha256) && capturedResponse(row, '/api/health', 'GET')) &&
-    identity.solve_responses?.length === 2 && sample.content.solve_count === 2 &&
+    solveResponses.bound && sample.content.solve_count === 2 &&
     identity.solve_responses.every(row => realSolve(row.result, identity.local_source_sha256) &&
       capturedResponse(row, '/api/solve', 'POST'));
   const checks = evaluateSample(sample);
   checks.push({ rule: 'G5-IDENTITY', name: 'served-page-assets-health-solve-bound-to-commit',
-    status: identityBound ? 'PASS' : 'FAIL', detail: identity });
+    status: identityBound ? 'PASS' : 'FAIL', detail: { ...identity,
+      health_response_validation: healthResponses, solve_response_validation: solveResponses } });
   checks.push({ rule: 'EVIDENCE', name: 'no-preserved-failure-or-incomplete-terminal',
     status: !report.failure && !report.cleanup_failure && !report.persistence_failure &&
       !report.fixture_io_failure && !['FAIL', 'EVIDENCE_PENDING'].includes(report.verdict) ? 'PASS' : 'FAIL',

@@ -126,7 +126,10 @@ third_party, redirects, network_errors, runtime_errors
 `identity_scope=FIVE_APPLICATION_SOURCES_PLUS_PERFORMANCE_TOOL_NOT_FULL_TREE`：
 这只是五份应用源码加性能工具的绑定，不是全树摘要、全仓依赖封印，
 也不涵盖测试、其他工具、运行依赖或部署对象。
-检查两个完整 `/api/health` 和两个完整 `/api/solve`，不只检查最后一个求解。
+要求交互前、结束后各一次完整 `/api/health`，并保留及验证页面自身发起的
+所有额外 health；两个完整 `/api/solve` 分别来自冷启动和真实核心交互。
+响应请求 ID 必须唯一，与 CDP 实际响应集合双向一致，且方法、状态、来源、
+正文摘要和采集阶段对应。不能过滤到两条、挑最后一条或漏掉失败响应。
 每个响应与 CDP 请求 ID、状态、实际正文 SHA256 绑定；页面正文及 JS/CSS
 原文、health 原文、完整求解、实际 PNG 均外置保存供独立回读。
 页面必须出现当前现算 build 的 `<code>`，不是任意字符串包含即可。
@@ -265,3 +268,50 @@ LCP908ms、CLS0、交互上界104ms（不是INP），关键传输22015字节、
 `identity_scope` 固定为五源+工具，`release_verdict=NOT_CERTIFIED`、
 loopback `g5_certified=false` 和 `inp_ms=null` 均保持，不自动获得全树/
 公网/人工门认证。最终协议字段已在工具终态报告内，不只存在文档。
+
+## Integrated V2 Health Review
+
+2026-10-10 原组合 `workbench-integrated-v2/state-021.json` 记录真实性能
+退出1，parse/UI 未运行。原单次 cold 报告为
+`workbench-852b356915b04220927ba686447bb574/run-2026-10-10T09-34-58-013Z-c2e181e3/report.json`，
+09:34:58.009Z 至09:35:08.692Z，21检查，仅 G5-IDENTITY 失败。
+实际有三件合法 health：页面启动 `cold-baseline`，工具
+`identity-before-interactions` 和 `source-identity` 各一次；不是三份冷样本。
+旧验收器固定要求两件，既误拒合法三件，也能漏验未记录的额外响应。
+
+修复要求两个工具必要阶段各恰好一件，允许额外页面启动阶段，但每一件
+都必须完整有效、request_id 非空唯一、与同源 CDP 响应集合双向相等；
+缺件、重复、错阶段、错来源、错正文、错方法或非200状态均闭门。
+采集保存 health 的实际请求阶段；不从旧产物补字段，不删除首因。
+旧报告保持 FAIL，新工具离线 parse 仍退出1，不追认原运行。
+
+独立原证据回读工具在本测试模块内，使用 held inode 校验并重算预算，
+源码身份只覆盖五份应用源码加性能工具，不是全树封印。
+入口 `--original-report`、`--combination-state`、`--combination-report`
+必须全有或全无，任意半套退出2，不能默记未运行。三个输入均只读：
+原报告限 seat-perf 的 report.json；组合输入限同目录 state-NNN.json 与
+workbench.json，均限外置任务根并拒绝下级符号链接。
+`--tool` 只允许本独立树或主仓的指定性能工具。
+`--evidence-root` 保留批准的逻辑路径并核真实路径，新增输出仅允许
+seat-perf/review-integrated-v2-* 内，默认旧独立review目录保持窄兼容；
+不允许任意根目录或其他席的workbench目录写入，每次另建唯一子run。
+
+仅健康专项使用 `--health-review-only`；完整离线模块不带
+`--real-browser` 或 `--preflight`。本轮不重跑 producer、浏览器或产品。
+证据都在 `seat-perf/review-integrated-v2-20261010T093842Z-health-diagnosis/`：
+首次 before/after 专项误把逻辑路径解析成物理路径，被工具 OUTPUT 门拒绝，
+各15/16次CLI失败原样保留，不计为业务修前/修后证据。
+修正测试入口路径后，before-logical-path-fixed/
+`python-tests-20261010T094731Z-2d64706e/summary.json` 有15次CLI、2反证失败；
+after-logical-path-fixed/`python-tests-20261010T094731Z-d5cdb7c0/summary.json`
+有15夹具及原报告parse，共16次CLI，专项PASS。
+full-module-v1/`python-tests-20261010T094800Z-57fddf43/summary.json`
+09:48:23.205337Z 终态PASS，9测试、55文件夹具、86性能CLI、17入口拒绝CLI，
+合计103次CLI；18个持久化场景为1正例和17退出2反例。浏览器NOT_RUN。
+
+原raw重算为LCP836ms、CLS0、交互上界112ms，传输
+critical/initial/Script/font=25515/64697/13007/0字节，原预算没有突破。
+3health、2solve、1PNG、前后五源+工具一致，仍仅LOCAL_PREFLIGHT。
+未测INP、公网、actual root或人工/真实设备门；只读源码比较未发现
+release_gate.performance 对当前原生 PUBLIC_LAB 字段的确定误拒，
+这不是实测公网验收。新候选完整组合复验及Curie独立审核由主席收口。
