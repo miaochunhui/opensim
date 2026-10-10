@@ -1407,7 +1407,8 @@ class WorkbenchTests(unittest.TestCase):
         report = {"schema_version": 1, "tool": "opensim-workbench-acceptance",
                   "scope": "LOCAL_AUTOMATION_NOT_RELEASE", "release_verdict": "NOT_CERTIFIED",
                   "before": self.candidate, "after": self.candidate, "producers": {}, "remaining": [],
-                  "owned_server": {"url": self.url, "stopped": True}, "steps": [], "counts": {},
+                  "owned_server": {"url": self.url, "source_root": str(self.root), "stopped": True},
+                  "steps": [], "counts": {},
                   "finished_at": gate.now(), "verdict": gate.PARTIAL, "exit_code": 3}
         for name in [*(f"local-{index}" for index in range(1, 6)), "browser", "audit", "perf", "perf-readback", "ui"]:
             report["steps"].append(gate.execute(["git", "--version"], self.root, directory, name))
@@ -1417,12 +1418,13 @@ class WorkbenchTests(unittest.TestCase):
             value = getattr(self, name)(child_dir)
             validation = self.validate(value, child_dir, name=name)
             entry = {"report": gate.file_record(child_dir / "report.json", directory),
+                     "artifacts": gate.artifacts(child_dir, name),
                      "terminal": {"rc": 0, "exit_code": 0, "verdict": value["verdict"]}, "validation": validation}
             report["producers"][name] = entry
             report["remaining"].extend({"producer": name, **row} for row in validation["remaining"])
             if name == "perf":
-                parsed_dir = child_dir / "readback"
-                parsed_dir.mkdir()
+                parsed_dir = child_dir / "readback/run-fixture"
+                parsed_dir.mkdir(parents=True)
                 parsed = {**value, "scope": "OFFLINE_PARSE_NOT_G5", "verdict": "OFFLINE_PARSE_PASS",
                           "parsed_source": entry["report"]}
                 self.seal_producer_fixture("perf", parsed, parsed_dir)
@@ -1430,6 +1432,26 @@ class WorkbenchTests(unittest.TestCase):
                 entry["raw_metric_readback"] = gate.file_record(parsed_dir / "report.json", directory)
                 entry["readback_durable_completion"] = gate.validate_perf_readback(
                     parsed, 0, parsed_dir, entry["report"], value["tool_sha256"])
+                entry["readback_artifacts"] = gate.artifacts(parsed_dir, "perf")
+        local_dir = directory / "local"
+        local_dir.mkdir()
+        self.save(local_dir, self.local(), "acceptance.json")
+        numerical = self.numerics(local_dir)
+        parts = local_dir / "numerics-parts-fixture"
+        parts.mkdir()
+        (local_dir / "raw-circle.json").rename(parts / "raw-circle.json")
+        numerical["cases"][0]["result_path"] = str(parts / "raw-circle.json")
+        numerical.update(parts_dir=str(parts), log_path=str(local_dir / "numerics.log"))
+        (local_dir / "numerics.log").write_bytes(b"COLLECTION_START FILE_FIXTURE\nNUMERICS verdict=PASS\n")
+        self.save(parts, {"state": "RUNNING", "stage": "collection_start"}, "checkpoint-0000.json")
+        self.save(local_dir, numerical, "numerics.json")
+        (parts / "checkpoint-0001.json").write_bytes((local_dir / "numerics.json").read_bytes())
+        report["local_artifacts"] = gate.artifacts(local_dir, "local")
+        report["numerics"] = gate.file_record(local_dir / "numerics.json", directory)
+        report["owned_server"]["numerics"] = report["numerics"]
+        report["counts"]["numerics"] = gate.validate_numerics(numerical, self.root, self.candidate)
+        report["numerics_dependencies"] = gate.numerics_dependencies(numerical)
+        report["counts"]["unit_tests"] = 2
         for key, value in (("producers_validated", 4),
                            ("checks", sum(row["validation"]["checks"] for row in report["producers"].values())),
                            ("solves", sum(row["validation"]["solves"] for row in report["producers"].values())),
@@ -1448,6 +1470,185 @@ class WorkbenchTests(unittest.TestCase):
         report["first_cause"] = {"coordinate": "coverage", "message": "Producer coverage remains PARTIAL/NOT_TESTED",
                                  "detail": report["remaining"][0]}
         return report
+
+    def test_resume_late_terminal_actual_bytes_and_post_replacement_rejected(self):
+        directory = self.directory()
+        report = self.complete_fixture(directory)
+        gate.validate_complete_run(report)
+        gate.persist_result(directory, report)
+        self.assertEqual(gate.read_final(directory)["exit_code"], 3)
+        targets = [("browser-png", directory / "browser/mobile-narrow-mesh.png"),
+                   ("browser-post", directory / "browser/solve-001.json"),
+                   ("audit-post", next((directory / "audit").glob("http-solve-*.json"))),
+                   ("ui-download", next((directory / "ui/downloads").iterdir())),
+                   ("perf-png", directory / "perf/result.png"),
+                   ("numerics-raw", directory / "local/numerics-parts-fixture/raw-circle.json"),
+                   ("numerics-log", directory / "local/numerics.log"),
+                   ("numerics-checkpoint", directory / "local/numerics-parts-fixture/checkpoint-0001.json")]
+        for label, path in targets:
+            original = path.read_bytes()
+            path.write_bytes(original + b"\nLATE_DEPENDENCY_CHANGE\n")
+            try:
+                with self.subTest(target=label), self.assertRaises(gate.EvidenceError):
+                    gate.read_final(directory)
+            finally:
+                path.write_bytes(original)
+
+    def test_resume_late_terminal_manifest_withdrawal_rejected(self):
+        directory = self.directory()
+        report = self.complete_fixture(directory)
+        gate.validate_complete_run(report)
+        gate.persist_result(directory, report)
+        for path in (directory / "browser/mobile-narrow-mesh-capture.json",
+                     directory / "browser/mobile-narrow-layout.json",
+                     next((directory / "audit").glob("*.coverage.json"))):
+            held = directory / ("held-" + path.name)
+            path.rename(held)
+            try:
+                with self.subTest(target=path.name), self.assertRaises(gate.EvidenceError):
+                    gate.read_final(directory)
+            finally:
+                held.rename(path)
+
+    def test_resume_late_terminal_inventory_bidirectional_extra_missing_rejected(self):
+        directory = self.directory()
+        report = self.complete_fixture(directory)
+        gate.validate_complete_run(report)
+        gate.persist_result(directory, report)
+        for name in (*gate.PRODUCERS, "local", "readback"):
+            child = directory / ("perf/readback/run-fixture" if name == "readback" else name)
+            extra = child / "late-unlisted.bin"
+            extra.write_bytes(b"ACTUAL_UNLISTED_ARTIFACT_NOT_PRODUCER_EVIDENCE\n")
+            try:
+                with self.subTest(extra=name), self.assertRaises(gate.EvidenceError):
+                    gate.read_final(directory)
+            finally:
+                extra.rename(directory / ("held-extra-" + name + ".bin"))
+        for variant in ("missing", "duplicate", "empty"):
+            value = copy.deepcopy(report)
+            rows = value["producers"]["browser"]["artifacts"]
+            if variant == "missing":
+                rows.pop()
+            elif variant == "duplicate":
+                rows.append(rows[0])
+            else:
+                rows.clear()
+            with self.subTest(inventory=variant), self.assertRaises(gate.EvidenceError):
+                gate.validate_complete_run(value)
+
+    def test_resume_late_terminal_local_numerics_and_parse_receipts_rejected(self):
+        directory = self.directory()
+        report = self.complete_fixture(directory)
+        gate.validate_complete_run(report)
+        gate.persist_result(directory, report)
+        for path in (directory / "local/acceptance.json", directory / "local/numerics.json"):
+            original = path.read_bytes()
+            path.write_bytes(original + b"\nLATE_REPORT_CHANGE\n")
+            try:
+                with self.subTest(target=path.name), self.assertRaises(gate.EvidenceError):
+                    gate.read_final(directory)
+            finally:
+                path.write_bytes(original)
+        value = copy.deepcopy(report)
+        value["producers"]["perf"]["raw_metric_readback"]["sha256"] = "0" * 64
+        with self.assertRaises(gate.EvidenceError):
+            gate.validate_complete_run(value)
+
+    def test_resume_late_terminal_revalidation_not_just_self_updated_inventory(self):
+        directory = self.directory()
+        report = self.complete_fixture(directory)
+        gate.validate_complete_run(report)
+        for variant in ("post", "png", "manifest", "coverage", "raw"):
+            value = copy.deepcopy(report)
+            name = "audit" if variant == "coverage" else "browser"
+            child = directory / name
+            path = (directory / "local/numerics-parts-fixture/raw-circle.json" if variant == "raw" else
+                    child / "solve-001.json" if variant == "post" else
+                    child / "mobile-narrow-mesh.png" if variant == "png" else
+                    child / "mobile-narrow-mesh-capture.json" if variant == "manifest" else
+                    next(child.glob("*.coverage.json")))
+            original = path.read_bytes()
+            if variant == "png":
+                path.write_bytes(png(1, 1))
+            else:
+                altered = json.loads(original)
+                if variant == "post":
+                    altered["result"]["fields"]["velocity_m_s"] = []
+                elif variant == "manifest":
+                    altered["selected_view"] = "field"
+                elif variant == "coverage":
+                    altered["tiles"] = []
+                else:
+                    altered["mesh"]["nodes_mm"] = []
+                path.write_bytes(gate.json_bytes(altered))
+            try:
+                if variant == "raw":
+                    value["local_artifacts"] = gate.artifacts(directory / "local", "local")
+                else:
+                    value["producers"][name]["artifacts"] = gate.artifacts(child, name)
+                with self.subTest(variant=variant), self.assertRaises(gate.EvidenceError):
+                    gate.validate_complete_run(value)
+            finally:
+                path.write_bytes(original)
+
+    def test_resume_late_terminal_requires_numerics_dependencies_and_live_source(self):
+        directory = self.directory()
+        report = self.complete_fixture(directory)
+        gate.validate_complete_run(report)
+        for key in ("numerics", "local_artifacts", "numerics_dependencies"):
+            value = copy.deepcopy(report)
+            del value[key]
+            with self.subTest(missing=key), self.assertRaises(gate.EvidenceError):
+                gate.validate_complete_run(value)
+        for key in ("log_path", "parts_dir"):
+            value = json.loads((directory / "local/numerics.json").read_bytes())
+            del value[key]
+            with self.subTest(missing=key), self.assertRaisesRegex(gate.EvidenceError, "missing log/parts"):
+                gate.numerics_dependencies(value)
+        path = self.root / "web/app.js"
+        original = path.read_bytes()
+        path.write_bytes(original + b"\nLATE_SOURCE_CHANGE\n")
+        try:
+            with self.assertRaisesRegex(gate.EvidenceError, "live candidate inventory"):
+                gate.validate_complete_run(report)
+        finally:
+            path.write_bytes(original)
+
+    def test_resume_late_terminal_json_coordinate_and_nested_parse_positive(self):
+        directory = self.directory()
+        report = self.complete_fixture(directory)
+        gate.validate_complete_run(report)
+        self.assertIn("readback/run-fixture", report["producers"]["perf"]["raw_metric_readback"]["path"])
+        path = directory / "broken-json.json"
+        path.write_bytes(b"{\n invalid JSON\n}\n")
+        with self.assertRaisesRegex(gate.EvidenceError, "broken-json.json.*line=2 column=2") as raised:
+            gate.read_report(path, directory)
+        self.assertIsInstance(raised.exception.__cause__, json.JSONDecodeError)
+        self.assertEqual(raised.exception.coordinate, "report-json")
+
+    def test_resume_diagnostic_long_prefix_retains_first_unit_failure_and_tail(self):
+        directory = self.directory()
+        for kind in ("failure", "error"):
+            step = gate.execute([sys.executable, "-B", str(Path(__file__).resolve()),
+                                 "--diagnostic-child", kind], self.root, directory, "diagnostic-" + kind)
+            self.assertEqual(step["rc"], 1)
+            path = Path(step["stderr"]["path"])
+            raw = path.read_text()
+            self.assertGreater(raw.index("FIRST_DIAGNOSTIC_"), 2000)
+            self.assertIn("Ran 2 tests", raw)
+            self.assertIn("DIAGNOSTIC_TAIL_MARKER", raw)
+            with self.subTest(kind=kind), self.assertRaises(gate.EvidenceError) as raised:
+                gate.check_step(step)
+            message = str(raised.exception)
+            with self.subTest(kind=kind):
+                self.assertIn("FIRST_DIAGNOSTIC_" + kind.upper(), message)
+                self.assertIn("Ran 2 tests", message)
+                self.assertIn("FAILED (", message)
+                self.assertIn("DIAGNOSTIC_TAIL_MARKER", message)
+                self.assertIn("rc=1", message)
+                self.assertIn(str(path), message)
+                self.assertEqual(raised.exception.coordinate, "diagnostic-" + kind)
+                self.assertEqual(gate.file_record(path, directory), step["stderr"])
 
     def test_resume_complete_terminal_rejects_inventory_rc_log_and_preserves_partial(self):
         directory = self.directory()
@@ -1597,18 +1798,35 @@ def main():
     parser.add_argument("--producer-rc", type=int, default=0)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--focused", action="store_true")
+    parser.add_argument("--late-focused", action="store_true", help="Only late terminal dependency controls")
+    parser.add_argument("--diagnostic-focused", action="store_true", help="Only long-log failure diagnostics")
+    parser.add_argument("--diagnostic-child", choices=("failure", "error"), help=gate.argparse.SUPPRESS)
     parser.add_argument("--release-source", type=Path, default=RELEASE_SOURCE)
     parser.add_argument("--suite-child", action="store_true", help=gate.argparse.SUPPRESS)
     args = parser.parse_args()
     RELEASE_SOURCE = args.release_source
+    if args.diagnostic_child:
+        class DiagnosticFixture(unittest.TestCase):
+            def test_01_first(self):
+                if args.diagnostic_child == "error":
+                    raise ValueError("FIRST_DIAGNOSTIC_ERROR")
+                self.fail("FIRST_DIAGNOSTIC_FAILURE")
+
+            def test_02_secondary(self):
+                self.fail("SECONDARY_DIAGNOSTIC_NOT_FIRST")
+
+        sys.stderr.write("NORMAL_COMPLETED_TEST_PREFIX_NOT_FIRST_CAUSE\n" * 160)
+        result = unittest.TextTestRunner(stream=sys.stderr, verbosity=2).run(
+            unittest.defaultTestLoader.loadTestsFromTestCase(DiagnosticFixture))
+        sys.stderr.write("DIAGNOSTIC_TAIL_MARKER\n")
+        return 0 if result.wasSuccessful() else 1
     if args.suite_child:
         WorkbenchTests.artifact_base = args.out
         suite = unittest.TestSuite()
         suite.addTests(WorkbenchTests(name) for name in unittest.defaultTestLoader.getTestCaseNames(WorkbenchTests)
-                       if name.startswith("test_resume_"))
-        if not args.focused:
-            suite.addTests(WorkbenchTests(name) for name in unittest.defaultTestLoader.getTestCaseNames(WorkbenchTests)
-                           if not name.startswith("test_resume_"))
+                       if (name.startswith("test_resume_diagnostic_") if args.diagnostic_focused else
+                           name.startswith("test_resume_late_terminal_") if args.late_focused else
+                           name.startswith("test_resume_") or not args.focused))
         with (args.out / "progress.log").open("x", encoding="utf-8", buffering=1) as stream:
             result = unittest.TextTestRunner(stream=stream, verbosity=2, resultclass=ProgressResult).run(suite)
         summary = {"tests": result.testsRun, "failures": len(result.failures), "errors": len(result.errors),
@@ -1623,11 +1841,16 @@ def main():
     if not (args.producer_readback or args.regression or args.cli_smoke):
         before = gate.inventory(ROOT)
         gate.write_json(output / "run-start.json", {"state": "RUNNING", "source_before": before,
-                        "collected_at": gate.now(), "focused": args.focused})
+                        "collected_at": gate.now(), "focused": args.focused, "late_focused": args.late_focused,
+                        "diagnostic_focused": args.diagnostic_focused})
         argv = [sys.executable, "-B", str(Path(__file__).resolve()), "--suite-child", "--out", str(output),
                 "--release-source", str(RELEASE_SOURCE)]
         if args.focused:
             argv.append("--focused")
+        if args.late_focused:
+            argv.append("--late-focused")
+        if args.diagnostic_focused:
+            argv.append("--diagnostic-focused")
         step = gate.execute(argv, ROOT, output, "unittest")
         result, _ = gate.read_report(output / "unit-result.json", output)
         after = gate.inventory(ROOT)

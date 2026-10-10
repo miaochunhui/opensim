@@ -1,5 +1,40 @@
 # 工作台组合验收
 
+## 晚期终态依赖闭合
+
+`validate_complete_run` / `read_final` 在正向终态重新消费四 producer 的
+`entry.artifacts` 与实际文件全集：空表、重复、漏项、多项、字节变化均拒绝，
+不是仅核 receipt/log 的摘要子集。随后复用 `validate_producer`，重新核全部
+PNG/POST/capture/layout/coverage、UI downloads 和原始数值结果；已存 validation
+必须与本次实际校验相等。perf 的主 run 和已记录的 parse run 分开核完整清单，
+只有该已独立核验子树可作为采集后合法新增；其它新增文件仍拒绝。
+parse report 的路径/字节/SHA 与同次原始 report、纯 parse 校验同时对拍。
+local 清单、acceptance、numerics 报告/原始结果及 producer-owned parts/logs
+均重新回读；完整终态强制实际 log_path/parts_dir，raw 集合双向匹配且不重复，
+owned_server.numerics 同 receipt。独立历史 `validate_numerics` 文件解析仍非完整
+run，不能凭无 log/parts 的旧夹具获完整终态。pure reader 不执行 source_root，
+但完整终态必须与其 live inventory / before 相等。报告及 raw 使用单次有界
+描述符读取的同一字节核摘要/JSON。缺文件或读取 OSError 保留坐标和原异常；
+坏 JSON 归一 EvidenceError 并保留 path/line/column/offset，不当成默认空值。
+
+本轮原红 `resume-s3-workbench-20261010/late-terminal-red-v1/summary.json`
+为4 methods、20 failures、0 errors、真实 launcher rc1、源码稳定；PNG 晚变、
+manifest/layout/coverage 撤走、POST/数值改变和清单双向缺失均为实际文件控制。
+UI download 字节变动已被旧 durable 门拒绝，不混入20个新增漏拒。
+后续新增 inventory 自报更新但实际 PNG/POST/manifest/coverage/raw 错误的负例，
+防止实现退化为只核文件哈希。`--focused` 包含全部续跑负例，
+`--late-focused` 只跑本轮终态控制。新绿与完整模块以新 summary 为准。
+不重发 producer/FEM，不追认冻结 `2a86feb`/combo99370，不扩大真人或恶意同 UID 边界。
+
+子进程非零时 `check_step` 不截取正常日志开头冒充首因；unittest 日志优先
+取第一个 FAIL/ERROR 明细段（超长段保留头尾）并附最终统计/尾部，始终给
+实际 rc、完整 stderr 路径。其它命令保留有界头尾，诊断读取失败明确报错
+并保留原异常。`--diagnostic-focused` 使用真实 unittest 失败子进程的长正常
+前缀与尾部控制，不运行产品。其原红 diagnostic-red-v1 为1 method、2 failures、
+0 errors、实际 launcher rc1、源码稳定；不是原产品重跑。
+数值内部 checkpoint/log 在本门仅做原始字节闭包与集合核对，不重算其完整
+日志语义、convergence/scaling 或 FEM 物理指标。
+
 ## 2026-10-10 续跑消费门
 
 独立基线 `6734853` 的新增负例先保留于

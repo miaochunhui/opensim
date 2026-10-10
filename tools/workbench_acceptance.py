@@ -161,14 +161,25 @@ def new_output(path: Path) -> Path:
 def file_record(path: Path, base: Path, allow_empty: bool = False) -> dict:
     path = bounded(path, base)
     need(path.is_file(), f"Missing evidence file: {path}", "artifact")
-    content = path.read_bytes()
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise EvidenceError(f"Evidence read failed: {path}; {exc}", "artifact") from exc
     need(bool(content) or allow_empty, f"Empty evidence file: {path}", "artifact")
     return {"path": str(path), "bytes": len(content), "sha256": sha(content)}
 
 
 def read_report(path: Path, base: Path) -> tuple[dict, dict]:
-    record = file_record(path, base)
-    return decode(Path(record["path"]).read_bytes()), record
+    path = bounded(path, base)
+    content, observed = producer_file(path.parent, path.name, "report")
+    record = {key: observed[key] for key in ("path", "bytes", "sha256")}
+    try:
+        return decode(content), record
+    except json.JSONDecodeError as exc:
+        raise EvidenceError(f"Invalid JSON report: {path}; line={exc.lineno} column={exc.colno} "
+                            f"offset={exc.pos}; {exc.msg}", "report-json") from exc
+    except UnicodeError as exc:
+        raise EvidenceError(f"Invalid JSON encoding: {path}; {exc}", "report-json") from exc
 
 
 def json_bytes(value: dict) -> bytes:
@@ -400,7 +411,10 @@ def producer_file(directory: Path, relative: str, name: str) -> tuple[bytes, dic
          f"{name} unsafe evidence reference: {relative}", name)
     path = bounded(directory / relative, directory)
     need(path.is_file(), f"{name} missing/nonregular evidence file: {relative}", name)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise EvidenceError(f"{name} evidence open failed: {relative}; {exc}", name) from exc
     try:
         before = os.fstat(fd)
         need(stat.S_ISREG(before.st_mode) and 0 < before.st_size <= 16 * 1024 * 1024,
@@ -412,10 +426,45 @@ def producer_file(directory: Path, relative: str, name: str) -> tuple[bytes, dic
                               info.st_ctime_ns, info.st_nlink, info.st_mode)
         need(stamp(before) == stamp(after) == stamp(named) and len(content) == before.st_size,
              f"{name} terminal evidence changed during read: {relative}", name)
+    except OSError as exc:
+        raise EvidenceError(f"{name} evidence read failed: {relative}; {exc}", name) from exc
     finally:
         os.close(fd)
     return content, {"path": str(path), "bytes": len(content), "sha256": sha(content),
                      "dev": str(named.st_dev), "ino": str(named.st_ino), "nlink": named.st_nlink}
+
+
+def validate_artifact_inventory(directory: Path, saved: object, name: str,
+                                separate: Path | None = None) -> None:
+    """Compare the saved inventory with every current file, not a hash subset."""
+    need(isinstance(saved, list) and bool(saved) and
+         all(isinstance(row, dict) and isinstance(row.get("path"), str) for row in saved),
+         f"{name} terminal artifact inventory missing", name)
+    actual = artifacts(directory, name)
+    # Only the already independently inventoried parse run may be later-created.
+    if separate is not None and directory.resolve() in separate.resolve().parents:
+        actual = [row for row in actual if separate.resolve() not in Path(row["path"]).parents]
+    expected = {row["path"]: row for row in saved}
+    observed = {row["path"]: row for row in actual}
+    need(len(expected) == len(saved), f"{name} duplicate terminal artifact inventory", name)
+    missing, extra = sorted(set(expected) - set(observed)), sorted(set(observed) - set(expected))
+    need(not missing and not extra,
+         f"{name} terminal artifact set differs: missing={missing[:3]} extra={extra[:3]}", name)
+    for path, record in expected.items():
+        need(observed[path] == record, f"{name} terminal artifact changed: {path}", name)
+
+
+def numerics_dependencies(value: dict) -> dict:
+    """Full runs require producer-owned parts/logs; isolated legacy parsing does not."""
+    need(all(isinstance(value.get(key), str) and Path(value[key]).is_absolute()
+             for key in ("log_path", "parts_dir")), "Numerics full run missing log/parts", "numerics")
+    parts = bounded(Path(value["parts_dir"]))
+    records = artifacts(parts, "numerics")
+    raw_paths = [bounded(Path(row["result_path"])) for row in value["cases"]]
+    need(len(set(raw_paths)) == len(raw_paths) and
+         set(raw_paths) == {path.resolve() for path in parts.glob("raw-*.json")},
+         "Numerics raw parts inventory differs/duplicates", "numerics")
+    return {"log": file_record(Path(value["log_path"]), EXTERNAL), "parts": records}
 
 
 def marker_paths(directory: Path, name: str) -> list[Path]:
@@ -905,9 +954,8 @@ def validate_numerics(value: dict, root: Path, candidate: dict) -> dict:
              "Numerics has failed/unfinished records", "numerics")
     raw_records = []
     for row in value["cases"]:
-        record = file_record(Path(row["result_path"]), EXTERNAL)
+        raw, record = read_report(Path(row["result_path"]), EXTERNAL)
         need(record["sha256"] == row.get("result_sha256"), "Numerics raw case hash differs", "numerics")
-        raw = decode(Path(record["path"]).read_bytes())
         need(bool(raw.get("mesh", {}).get("nodes_mm")) and bool(raw.get("fields", {}).get("velocity_m_s")),
              "Numerics raw FEM result empty", "numerics")
         raw_records.append(record)
@@ -1070,8 +1118,23 @@ def execute(argv: list[str], root: Path, output: Path, name: str) -> dict:
 
 def check_step(step: dict) -> None:
     if step["rc"] != 0:
-        message = Path(step["stderr"]["path"]).read_text(encoding="utf-8", errors="replace")
-        raise EvidenceError(f"{step['name']} rc={step['rc']}: {message.strip()[:2000]}; "
+        path = Path(step["stderr"]["path"])
+        try:
+            message = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError as exc:
+            raise EvidenceError("{} rc={}; diagnostic read failed: {}; log={}".format(
+                step["name"], step["rc"], exc, path), step["name"]) from exc
+        first = re.search(r"^(?:FAIL|ERROR): .+$", message, re.MULTILINE)
+        if first:
+            block = message[first.start():]
+            boundary = re.search(r"^={10,}$|^-{10,}\nRan ", block, re.MULTILINE)
+            if boundary:
+                block = block[:boundary.start()].rstrip()
+            excerpt = block if len(block) <= 2400 else block[:1000] + "\n[... omitted ...]\n" + block[-1400:]
+            excerpt += "\nUNITTEST_TAIL\n" + message[-1800:]
+        else:
+            excerpt = message if len(message) <= 2400 else message[:600] + "\n[... omitted ...]\n" + message[-1800:]
+        raise EvidenceError(f"{step['name']} rc={step['rc']}: {excerpt}; "
                             f"log={step['stderr']['path']}", step["name"])
 
 
@@ -1296,6 +1359,26 @@ def validate_complete_run(report: dict) -> None:
         need(isinstance(report.get("integration"), dict) and
              file_record(Path(report["integration"]["path"]), EXTERNAL) == report["integration"],
              "Workbench missing/stale integration receipt", "completion")
+    server = report.get("owned_server", {})
+    need(isinstance(server.get("source_root"), str) and Path(server["source_root"]).is_absolute() and
+         Path(server["source_root"]).is_dir(), "Workbench candidate source root missing", "completion")
+    root = Path(server["source_root"])
+    need(inventory(root) == before, "Workbench live candidate inventory differs", "source")
+    numerical_record = report.get("numerics", {})
+    need(isinstance(numerical_record, dict) and isinstance(numerical_record.get("path"), str),
+         "Workbench numerics receipt missing", "numerics")
+    numerical, actual_numerical = read_report(Path(numerical_record["path"]), EXTERNAL)
+    need(actual_numerical == numerical_record, "Workbench numerics report changed", "numerics")
+    need(server.get("numerics") == numerical_record, "Workbench server numerics receipt differs", "numerics")
+    local_dir = Path(numerical_record["path"]).parent
+    validate_artifact_inventory(local_dir, report.get("local_artifacts"), "local")
+    local, _ = read_report(local_dir / "acceptance.json", EXTERNAL)
+    need(validate_local(local, before) == report.get("counts", {}).get("unit_tests"),
+         "Workbench local unit count changed", "local")
+    need(validate_numerics(numerical, root, before) == report.get("counts", {}).get("numerics"),
+         "Workbench numerics raw dependencies/counts changed", "numerics")
+    need(numerics_dependencies(numerical) == report.get("numerics_dependencies"),
+         "Workbench numerics parts/log dependencies changed", "numerics")
     remaining, checks, solves, pngs = [], 0, 0, 0
     for name, entry in producers.items():
         validation = entry["validation"]
@@ -1315,12 +1398,26 @@ def validate_complete_run(report: dict) -> None:
         need(file_record(Path(saved["path"]), EXTERNAL) ==
              {key: saved[key] for key in ("path", "bytes", "sha256")},
              "Workbench producer report changed", name)
+        directory = Path(saved["path"]).parent
+        separate = None
+        if name == "perf":
+            parsed_record = entry.get("raw_metric_readback", {})
+            need(isinstance(parsed_record, dict) and isinstance(parsed_record.get("path"), str),
+                 "Workbench perf parse receipt missing", name)
+            separate = Path(parsed_record["path"]).parent
+            need(separate.resolve() != directory.resolve(), "Workbench perf parse aliases original run", name)
+        validate_artifact_inventory(directory, entry.get("artifacts"), name, separate)
         if not (name == "browser" and reused):
             step = next(row for row in steps if row["name"] == name)
             terminal = entry.get("terminal", {})
             need(type(terminal.get("rc")) is int and terminal["rc"] == step["rc"] and
                  type(terminal.get("exit_code")) is int and terminal["exit_code"] == step["rc"],
                  "Workbench producer process/report terminal differs", name)
+        child, _ = read_report(Path(saved["path"]), EXTERNAL)
+        url = child.get("target_url") if name == "browser" and reused else server.get("url")
+        observed_validation = validate_producer(name, child, 0, root, before, directory, url)
+        need(observed_validation == validation,
+             "Workbench producer terminal semantic evidence differs", name)
         checks += positive(validation.get("checks"), name)
         solves += positive(validation.get("solves"), name)
         need(isinstance(validation.get("pngs"), list) and bool(validation["pngs"]),
@@ -1334,6 +1431,16 @@ def validate_complete_run(report: dict) -> None:
         path = Path(saved["path"])
         need(producer_file(path.parent, path.name, "perf")[1] == saved,
              "Workbench perf parse dependency changed", "perf")
+    parsed_record = perf["raw_metric_readback"]
+    parsed, observed_record = read_report(Path(parsed_record["path"]), EXTERNAL)
+    need(observed_record == {key: parsed_record[key] for key in ("path", "bytes", "sha256")},
+         "Workbench perf raw metric readback report changed", "perf")
+    parse_dir = Path(parsed_record["path"]).parent
+    validate_artifact_inventory(parse_dir, perf.get("readback_artifacts"), "perf")
+    observed_parse = validate_perf_readback(parsed, 0, parse_dir, perf["report"],
+                                           sha((root / "tools" / PRODUCERS["perf"][0]).read_bytes()))
+    need(observed_parse == perf["readback_durable_completion"],
+         "Workbench perf parse terminal semantic evidence differs", "perf")
     need(type(producers["ui"]["validation"].get("downloads")) is int and
          producers["ui"]["validation"]["downloads"] > 0, "Workbench UI download inventory missing", "ui")
     need(report.get("remaining") == remaining, "Workbench remaining coverage inventory differs", "coverage")
@@ -1388,6 +1495,7 @@ def run(root: Path, output: Path, integration: Path | None = None) -> dict:
         value, record = read_report(numerics, EXTERNAL)
         report["counts"]["numerics"] = validate_numerics(value, root, before)
         report["numerics"] = record
+        report["numerics_dependencies"] = numerics_dependencies(value)
         sys.path.insert(0, str(root))
         from server import ApplicationServer, RUNTIME_SOURCES
         matching(RUNTIME_SOURCES, source_map(before), "server-import")
