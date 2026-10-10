@@ -7,6 +7,8 @@ Each subprocess uses its owned Chromium and loopback selftest server.
 
 import hashlib
 import json
+import argparse
+from PIL import Image
 from pathlib import Path
 import subprocess
 import time
@@ -16,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/browser")
 FAULTS = ("log-directory", "log-enospc", "log-fsync", "post-publish-fsync",
           "same-inode", "replaced-directory")
-VIEW_FAULTS = ("wrong-selection", "stuck-toggle", "capture-change")
+VIEW_FAULTS = ("wrong-selection", "stuck-toggle", "capture-change", "stale-canvas", "capture-stale-canvas")
 
 
 class BrowserFinalizationTests(unittest.TestCase):
@@ -69,6 +71,21 @@ class BrowserFinalizationTests(unittest.TestCase):
                 self.assertTrue(view_check["detail"]["wrong_selection_rejected"])
                 self.assertTrue(view_check["detail"]["no_wrong_capture_written"])
                 self.assertTrue(view_check["detail"]["repeated_selection_preserved"])
+                detail = view_check["detail"]
+                self.assertNotEqual(detail["fieldCanvas"]["pixel_hash"], detail["meshCanvas"]["pixel_hash"])
+                box = detail["canvas_box"]
+                crop = tuple(round(value * box["dpr"]) for value in (
+                    box["x"], box["y"], box["x"] + box["width"], box["y"] + box["height"]))
+                pixels = {}
+                for view in ("field", "mesh"):
+                    with Image.open(run / f"selftest-{view}.png") as image:
+                        self.assertTrue(0 <= crop[0] < crop[2] <= image.width and
+                                        0 <= crop[1] < crop[3] <= image.height)
+                        pixels[view] = image.convert("RGBA").crop(crop).tobytes()
+                self.assertNotEqual(pixels["field"], pixels["mesh"], "Actual PNG canvas domains must differ")
+                summary["canvas_crop"] = {"box": crop, "field_sha256": hashlib.sha256(pixels["field"]).hexdigest(),
+                                          "mesh_sha256": hashlib.sha256(pixels["mesh"]).hexdigest()}
+                self.assertEqual(len(detail["breakpoints"]), 3)
                 self.assertFalse(list(run.glob("selftest-wrong-*")))
                 for name, view in (("selftest-field", "field"), ("selftest-mesh", "mesh")):
                     capture = next(row for row in report["captures"] if row["name"] == name)
@@ -77,6 +94,13 @@ class BrowserFinalizationTests(unittest.TestCase):
                     self.assertEqual(manifest["selected_view"], view)
                     self.assertTrue(manifest["artifacts"])
                     self.assertTrue(all(row["selected_view"] == view for row in manifest["artifacts"]))
+                    self.assertEqual(manifest["canvas"], capture["canvas"])
+                    self.assertEqual(manifest["canvas"]["pixel_hash"], detail[view + "Canvas"]["pixel_hash"])
+                    self.assertTrue(all(row["canvas"] == manifest["canvas"] for row in manifest["artifacts"]))
+                for index in range(3):
+                    capture = next(row for row in report["captures"] if row["name"] == f"selftest-breakpoint-{index}")
+                    self.assertEqual(capture["selected_view"], "field")
+                    self.assertEqual(capture["canvas"]["pixel_hash"], detail["fieldCanvas"]["pixel_hash"])
             if fault:
                 self.assertEqual(process.returncode, 2)
                 self.assertEqual(report["exit_code"], 2)
@@ -119,13 +143,24 @@ class BrowserFinalizationTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(log).hexdigest(), report["durability"]["log"]["sha256"])
                 self.assertEqual(len(log), report["durability"]["log"]["bytes"])
                 if view_fault:
-                    self.assertEqual(report["failure"]["rule"], "BROWSER-VIEW")
+                    rule = "BROWSER-VIEW-CANVAS" if "stale-canvas" in view_fault else "BROWSER-VIEW"
+                    self.assertEqual(report["failure"]["rule"], rule)
                     failed = [row for row in report["checks"] if row["status"] == "FAIL"]
                     self.assertEqual(len(failed), 1)
-                    self.assertEqual(failed[0]["rule"], "BROWSER-VIEW")
+                    self.assertEqual(failed[0]["rule"], rule)
                     self.assertEqual(failed[0]["detail"], report["failure"]["detail"])
-                    self.assertEqual(report["failure"]["detail"]["expected"], "field" if view_fault != "stuck-toggle" else "mesh")
-                    self.assertIn("BROWSER_CHECK FAIL rule=BROWSER-VIEW", (folder / "stderr.log").read_text())
+                    self.assertEqual(report["failure"]["detail"]["expected"],
+                                     "mesh" if view_fault in ("stuck-toggle", "stale-canvas") else "field")
+                    self.assertIn(f"BROWSER_CHECK FAIL rule={rule}", (folder / "stderr.log").read_text())
+                    if view_fault == "stale-canvas":
+                        before = report["failure"]["detail"]["before"]
+                        after = report["failure"]["detail"]["after"]
+                        self.assertEqual(after["selected_view"], "mesh")
+                        self.assertEqual(after["canvas"]["pixel_hash"], before["canvas"]["pixel_hash"])
+                        self.assertFalse((run / "selftest-mesh-capture.json").exists())
+                    if view_fault == "capture-stale-canvas":
+                        self.assertEqual(report["failure"]["detail"]["actual"]["selected_view"], "field")
+                        self.assertFalse((run / "selftest-field-capture.json").exists())
                     self.assertFalse(list(run.glob("selftest-wrong-*")))
                     if view_fault == "capture-change":
                         self.assertFalse((run / "selftest-field-capture.json").exists())
@@ -159,11 +194,22 @@ class BrowserFinalizationTests(unittest.TestCase):
             with self.subTest(view_fault=view_fault):
                 self.run_case(view_fault=view_fault)
 
+    def test_all_product_view_flows_use_bound_selection(self):
+        source = (ROOT / "tools/browser_check.mjs").read_text()
+        product = source.split("async function selftest(harness)", 1)[0]
+        self.assertNotIn("activate(\u0027#view-", product,
+                         "Product paths must not directly toggle independent views")
+
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--focused-view", action="store_true", help="Only view-binding positive and path checks")
+    args = parser.parse_args()
     output = OUTPUT / f"finalize-suite-{time.time_ns()}"
     output.mkdir(parents=True)
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(BrowserFinalizationTests)
+    suite = unittest.TestSuite(BrowserFinalizationTests(name) for name in (
+        "test_real_chromium_selftest_positive", "test_all_product_view_flows_use_bound_selection")) if args.focused_view else (
+        unittest.defaultTestLoader.loadTestsFromTestCase(BrowserFinalizationTests))
     with (output / "unittest.log").open("w") as log:
         outcome = unittest.TextTestRunner(stream=log, verbosity=2).run(suite)
     summary = {"verdict": "PASS" if outcome.wasSuccessful() else "FAIL", "tests": outcome.testsRun,

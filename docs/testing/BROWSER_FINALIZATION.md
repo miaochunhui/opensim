@@ -68,8 +68,8 @@ From the audit worktree:
 sudo -n -u infra python3 -B tests/test_browser_finalize.py
 ```
 
-Four unittest methods execute eleven subprocess cases: one actual Chromium
-selftest positive; three actual DOM view-fault cases; six actual filesystem
+Five unittest methods execute thirteen subprocess cases: one actual Chromium
+selftest positive; five actual DOM view-fault cases; six actual filesystem
 fault cases (`log-directory`:
 EISDIR, `/dev/full` log write: ENOSPC, `/dev/full` log/post-publication fsync:
 EINVAL, same-inode same-size byte rewrite, unrelated replacement directory);
@@ -96,30 +96,46 @@ The product exposes independent `#view-field` and `#view-mesh` toggles, not
 mutually exclusive tabs. `selectView` reads their actual `aria-pressed` values,
 uses existing real pointer/touch or keyboard activation only when a toggle
 differs from its desired value, and confirms the result after rendering frames.
-It never assigns product DOM state. Re-selecting an already correct view must
+It never assigns product DOM state. A real transition must change the existing
+canvas pixel hash after rendering frames; unchanged pixels fail with
+`BROWSER-VIEW-CANVAS`, even when ARIA matches. The observed canvas dimensions
+and pixel hash are retained with the selection. Re-selecting an already correct view must
 not switch it off. Core flow selects field before its baseline canvas, selects mesh
 before mesh capture, and selects field again after reset before field capture.
-The named mesh screenshot probe follows the same contract.
+All intended field/mesh paths, including breakpoint mesh-to-field transitions,
+bad-input field captures, rectangle and narrow probes, follow this contract.
+The breakpoint selection/capture helper is exercised repeatedly by the small
+DOM test; product paths are also checked for residual direct view activation.
 
 `screenshot(name, expectedView)` checks the actual state before capture, before
 and after each real PNG capture, and after scroll restoration. Explicit field
 requires field=true and mesh=false; mesh requires the inverse. Missing,
 duplicate or invalid controls and unexpected selection throw `BROWSER-VIEW`
 with expected/actual state. No differently named capture is substituted.
+Explicit captures must have a confirmed selection and match its canvas
+dimensions and pixel hash at each sampling point. The manifest, report capture
+entry and PNG entries also carry `canvas` evidence; readback verifies equality.
 Every capture manifest, report capture entry and PNG entry includes actual
 `selected_view` (`field`, `mesh`, `field+mesh`, `none`, or `unavailable` when both
 controls are absent on a diagnostic/non-product page). Explicit view captures
 never accept `unavailable`. Generic diagnostics record state without claiming
 field/mesh. View changes fail even for generic captures.
 
+The fixture now actually redraws distinct filled-field and line-mesh pixels on
+real toggle events. The test independently decodes the actual PNGs and requires
+different bytes in their canvas domains, not only different whole-PNG hashes.
 The real DOM selftest proves touch selection of mesh, keyboard selection of
 field, repeated-selection stability, rejection of wrong/both/none/invalid
 states and no artifact creation for an initial wrong view. Three subprocess
-faults (`--view-fixture wrong-selection`, `stuck-toggle`, `capture-change`)
+faults (`--view-fixture wrong-selection`, `stuck-toggle`, `capture-change`,
+`stale-canvas`, `capture-stale-canvas`)
 prove rc=1, first-cause state and no misleading completed manifest. For a
 later segment failure, earlier valid PNGs remain as partial evidence and the
-run is FAIL. These samples check DOM state binding, not the physical meaning
-of fixture pixels, human device use, or product FEM correctness. State sampling
+run is FAIL. The stale cases respectively preserve old pixels through a real
+ARIA toggle and replace a confirmed field canvas with observed mesh pixels
+while ARIA remains field; both must fail, without an explicit successful
+capture manifest. These samples check DOM/repaint binding, not numerical or
+physical meaning of fixture pixels, human device use, or product FEM correctness. State sampling
 is not atomic against hostile page code toggling away and back during capture;
 no malicious same-UID or page-code sandbox claim is made.
 
@@ -157,6 +173,13 @@ acceptance was run. The chair must test the final integrated candidate.
 
 ## Focused P3 Validation (2026-10-10)
 
+This is historical test evidence for `60c7930`, NOT accepted P3 closure.
+Independent S3 review `seat-ui/review-s4-view-20261010T095128Z/review.json`
+returned CHANGES_REQUIRED: the fixture changed ARIA without redrawing the
+canvas and breakpoint paths still directly toggled independent controls.
+The original PASS summaries remain untouched and are not retroactively
+credited with covering those two missing boundaries.
+
 `finalize-suite-1791625719834987312/summary.json` and `unittest.log` were
 read after actual rc=0: PASS, four unittest methods, eleven subprocess cases,
 zero failures/errors, 77.600 seconds. Tool SHA256 before/after every case and
@@ -182,3 +205,49 @@ Its three-file baseline commit `0c8ee8d` is byte-equivalent to frozen main
 focused P3 commit is for chair review/integration; its test diff appends view
 coverage while retaining the main finalization cases. Syntax and diff-whitespace
 checks pass. Full browser, product FEM and human device validation were NOT_RUN.
+
+## S3 Changes Required Followup (2026-10-10)
+
+The historical integration wording above is superseded: `60c7930` alone must
+not be merged as accepted closure. Its old green suite is kept as history.
+New red `finalize-suite-1791626278079274749` records rc=1, two methods,
+two failures, zero errors. Its actual browser report records
+`HARNESS-VIEW-REPAINT`, with identical field/mesh canvas hashes; the second
+failure identifies the residual direct breakpoint toggle. The case-summary
+count assertion (`7 != 11`) is secondary to that retained browser first cause.
+No old report or summary was rewritten.
+
+After fixing both issues, `finalize-suite-1791626452182084446/summary.json`
+and `unittest.log` were read at terminal rc=0: PASS, five methods, thirteen
+subprocess cases, zero failures/errors, 104.285 seconds. Every case binds
+the same tool SHA256 before/after and in its actual report:
+`d9a1531c737f454c7776fac51d7d5a7111ef57593162f70bdad9605ea8d8b8c8`.
+The test uses existing system Pillow 9.0.1 from
+`/usr/lib/python3/dist-packages`; no dependency was installed.
+
+Positive `finalize-test-1791626509013988875` returns rc=0 with eleven checks
+and eight PNGs, including three repeated breakpoint field captures. Actual
+decoded PNG canvas crop `(16,253,216,373)` has field SHA256
+`50dba8c9c5c4e74ea05968ab2e505880c78e23d43311b37401b6445dac18556e`
+and mesh SHA256
+`7de09f31bf4ac7bdca84bbc2207fbea9e8e388a0c338d9581857b813f34c42d0`.
+Native image readback also shows a filled field versus a line mesh. This is
+model inspection of fixture images, not human device or solver validation.
+Complete final log SHA256 is
+`117220cac0c018667c6747ee7ee50f096a44d4de894b90666f4374243997f720`.
+
+New `finalize-test-1791626541346386391` (stale-canvas) and
+`finalize-test-1791626548660974888` (capture-stale-canvas) return actual rc=1,
+durable FAIL and `BROWSER-VIEW-CANVAS` as first cause while ARIA is correct.
+The first retains identical before/after canvas hashes; the second retains
+field selection but different actual pixels. Neither creates the intended
+successful capture manifest. All seven I/O/first-cause negatives still return
+rc=2 and the three previous DOM faults still return rc=1. Product view-path
+scan found no direct activation outside the helper; intended captures use
+explicit expected views. Generic failure screenshots remain diagnostic.
+
+Syntax and whitespace checks pass. Timeout and bitmap budgets are unchanged.
+Canvas evidence reuses the existing noncryptographic pixel hash as a redraw
+and stability signal, not a numerical oracle or adversarial integrity proof.
+No full product browser or FEM run occurred. Chair integration and Euclid
+independent read-only acceptance are still required.
