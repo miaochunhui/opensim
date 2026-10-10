@@ -35,6 +35,8 @@ PEM = re.compile(rb"-----BEGIN " + rb"(?:[A-Z]+ )?PRIVATE KEY-----")
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--path", action="append",
+                        help="Explicit task file; repeat instead of scanning unrelated work")
     args = parser.parse_args()
     out = args.out.resolve()
     if Path("/hf3fs-jd/data/tmp/opensim-fluid-v1").resolve() not in out.parents or out.exists():
@@ -48,7 +50,12 @@ def main() -> int:
         raise AssertionError("Exact credential scanner selftest failed")
     if not PEM.search(b"-----BEGIN " + b"PRIVATE KEY-----") or PEM.search(b"public data"):
         raise AssertionError("Private-key scanner selftest failed")
-    for relative in PATHS:
+    paths = args.path if args.path is not None else PATHS
+    for relative in paths:
+        source = ROOT / relative
+        if (Path(relative).is_absolute() or source.is_symlink()
+                or ROOT not in source.resolve(strict=True).parents):
+            parser.error(f"Review path must be a regular file within the repository: {relative}")
         content = (ROOT / relative).read_bytes()
         rows.append({
             "path": relative, "bytes": len(content),
