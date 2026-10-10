@@ -16,6 +16,7 @@ sudo -n -u infra node tools/browser_performance.mjs --parse /ABSOLUTE/REPORT.jso
 sudo -n -u infra python3 -B tests/test_browser_performance.py --real-browser
 sudo -n -u infra python3 -B tests/test_browser_performance.py --real-browser --preflight
 sudo -n -u infra node tools/browser_performance.mjs --selftest --fixtures /ABSOLUTE/FIXTURES
+sudo -n -u infra node tools/browser_performance.mjs --persistence-selftest --out /hf3fs-jd/data/tmp/opensim-fluid-v1/seat-perf/review-v1-20261010/persistence-check
 ```
 
 `PORT` 使用新实例启动日志中的实际端口。完整工具路径为
@@ -122,18 +123,31 @@ third_party, redirects, network_errors, runtime_errors
 `identity_after`。两次均检查 HEAD、已加载工具 SHA256、提交中工具 SHA256、
 五份完整源码 SHA256 及按生成器顺序现算的 page build；实际工具或源码
 未提交、HEAD/源码/工具漂移均闭门，不能把末尾的新 HEAD 归给旧执行代码。
+`identity_scope=FIVE_APPLICATION_SOURCES_PLUS_PERFORMANCE_TOOL_NOT_FULL_TREE`：
+这只是五份应用源码加性能工具的绑定，不是全树摘要、全仓依赖封印，
+也不涵盖测试、其他工具、运行依赖或部署对象。
 检查两个完整 `/api/health` 和两个完整 `/api/solve`，不只检查最后一个求解。
 每个响应与 CDP 请求 ID、状态、实际正文 SHA256 绑定；页面正文及 JS/CSS
 原文、health 原文、完整求解、实际 PNG 均外置保存供独立回读。
 页面必须出现当前现算 build 的 `<code>`，不是任意字符串包含即可。
 固定窗口记录实际结果就绪时间，晚于8000ms完成不能延长观察补绿。
 
-报告持久化先写 `EVIDENCE_PENDING`，再写未认证的 `EVIDENCE_READY` 日志，
-回读候选完整报告，最后原子发布终态。晚写、回读或重命名失败为
-`persistence_failure`，强制 FAIL/退出2/不认证；已有首因保持原值。
-磁盘全部不可写时不能保证新增失败文件，但原有未认证状态不会升为绿灯，
-标准错误会保留故障。解析输入保留的 failure/cleanup/persistence 也不能
-重新计算为 PASS。日志不是认证权威，只有最后的 `report.json` 是终态。
+报告持久化用 `O_EXCL|O_NOFOLLOW` 创建文件，并持有文件及目录句柄。
+先写 `EVIDENCE_PENDING` 并同步文件、目录；日志和候选报告均未认证。
+逐字节回读和 dev/inode/单链接检查贯穿写入前后，最后通过原句柄写终态，
+同步文件、目录并再次核对身份和内容，全部完成才输出成功终判。
+不再以 rename 是最后操作冒充持久化，不用 rename 覆盖 report 路径。
+晚写、回读、sync、close 或身份/内容漂移为 `persistence_failure`，
+强制 FAIL/退出2/不认证，已有首因保持原值。
+
+发生晚期错误，只有仍能验证的自有 inode 可写 FAIL；替换路径、符号链接、
+未知内容都不收养、不覆盖。独立 `report-failure-*.json` 以排他创建、文件及
+目录同步和回读留证。被挪走但仍持有且内容可核对的自有 inode 也降为 FAIL。
+存储持续失效、突然断电或不合作的同身份并发写者不在可靠持久化认证范围；
+文件/目录 sync 成功不能证明 3FS 底层断电恢复。无法新增失败文件时仍退出2
+并在标准错误报首因；未知替换报告不得作为本次成功凭据。
+解析输入保留的 failure/cleanup/persistence 不能重新计算为 PASS。
+`run.log` 是就绪记录而非认证权威；CLI 成功终判须配合同次报告验收。
 
 公网 G5 PASS 要求页面构建、两个实际 JS/CSS 响应、health 及真实求解中的
 五份源码 SHA256，全部与当前工作树及当前提交字节一致；
@@ -221,3 +235,33 @@ OpenCAD/openopt、生产、凭据或公网入口，不 push。
 既有两次启动测试曾用默认 evidence 根创建独立新目录，未覆盖其他产物。
 未覆盖 actual root/public/manual 发布记录，不签 G5 公网或全发布门，
 缺真实触屏、桌面/移动屏幕阅读器以及公网同版本实算仍明确未验。
+
+## Persistence Review V2
+
+`9214c70` 的真实浏览器证据保留于
+`review-v1-20261010/python-tests-20261010T082733Z-f06ac588/summary.json`：
+6测试、41解析夹具、58 CLI调用、4真实浏览器夹具，专属loopback单样本
+21检查、2求解、2health、3份页面/资源原文、1 PNG，LOCAL_PREFLIGHT_PASS。
+LCP908ms、CLS0、交互上界104ms（不是INP），关键传输22015字节、
+初始全部42208字节；前后五源码+工具身份一致，自有服务已停止。
+该证据只对应旧提交，不追认为本轮持久化修复已跑真实冷启动或公网。
+
+主席指出旧版缺终态 inode 防覆盖、文件/目录 sync 与发布后回读；
+本轮专修三文件，不重跑完整产品 cold/四浏览器矩阵，不改变预算和观察窗口。
+专项 `--persistence-selftest` 共18场景：1正例、17负例，真实 inode/目录/
+符号链接替换、同 inode 内容漂移、写入/回读/文件和目录同步/关闭的
+系统调用 EBADF，以及已存在首因遇晚期同步失败。每个负例退出2；
+可核自有旧PASS降FAIL，未知字节不覆盖，独立失败证据现读。
+此专项不是产品G5，不是崩溃原子性、恶意同UID安全隔离或全树身份认证。
+新增证据仍只在本席外置时间/随机新目录，旧失败原样保存；
+最终新版实际组合、actual root/public/manual 发布记录由主席另验。
+
+主席/Curie 消费协议：导出 `persistReport(run, report)` 使用生产默认 I/O；
+额外参数仅供仓内专项自检。`persistence_protocol.version=2`，
+`strategy=HELD_INODE_NO_PATH_REPLACE`，`ownership` 声明 dev/inode/逐字节/
+单链接/no-follow，`durability` 声明文件及目录 fsync 与 exact readback。
+接受须同时满足本次CLI退出0、报告无 failure/cleanup/persistence 故障、
+同run无 `report-failure-*.json`；未知替换报告或单个PASS字符串不成立。
+`identity_scope` 固定为五源+工具，`release_verdict=NOT_CERTIFIED`、
+loopback `g5_certified=false` 和 `inp_ms=null` 均保持，不自动获得全树/
+公网/人工门认证。最终协议字段已在工具终态报告内，不只存在文档。

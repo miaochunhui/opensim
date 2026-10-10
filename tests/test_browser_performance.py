@@ -118,6 +118,7 @@ def sample_report():
                 "request_id": request_id, "url": target.rstrip("/") + pathname, "method": method,
                 "status": 200, "finished": True, "body_sha256": digest})
     snapshot = {"commit": "a" * 40, "tool_sha256": "b" * 64,
+                "identity_scope": "FIVE_APPLICATION_SOURCES_PLUS_PERFORMANCE_TOOL_NOT_FULL_TREE",
                 "committed_tool_sha256": "b" * 64, "page_build": "b" * 12,
                 "source_sha256": sources, "committed_source_sha256": sources}
     report = {"schema_version": 1, "tool": "opensim-browser-performance", "standard": "shared-r41",
@@ -410,6 +411,20 @@ class PerformanceTests(unittest.TestCase):
             self.assertIn("persistence_failure", report)
             expected_rule = "EVIDENCE" if fixture.startswith("positive") else "WEB-PERF-001"
             self.assertEqual(report["failure"]["rule"], expected_rule, report)
+
+    def test_real_inode_drift_and_persistence_io_controls(self):
+        result, report = self.invoke("--persistence-selftest")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        actual = report["persistence_selftest"]
+        self.assertEqual(actual["count"], 18)
+        self.assertEqual(actual["status"], "PASS")
+        self.assertEqual(len({row["name"] for row in actual["cases"]}), 18)
+        self.assertEqual(sum(row["rc"] == 2 for row in actual["cases"]), 17)
+        self.assertTrue(all(row["status"] == "PASS" for row in actual["cases"]))
+        self.assertTrue(all(row["failure"]["code"] == "EBADF"
+                            for row in actual["cases"] if "ebadf" in row["name"]))
+        self.assertEqual(report["scope"], "PERSISTENCE_FIXTURES_NOT_G5")
+        self.assertFalse(report["g5_certified"])
 
 
 def verify_product_artifacts(report, directory):

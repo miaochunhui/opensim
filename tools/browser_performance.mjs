@@ -9,6 +9,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { lookup } from 'node:dns/promises';
+import { closeSync, fsyncSync, writeSync } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import http from 'node:http';
 import { isIP } from 'node:net';
@@ -62,6 +63,7 @@ async function sourceSnapshot() {
     build.update(name + '\0'); build.update(bytes); build.update('\0');
   }
   const snapshot = { commit, source_sha256: local, committed_source_sha256: committed,
+    identity_scope: 'FIVE_APPLICATION_SOURCES_PLUS_PERFORMANCE_TOOL_NOT_FULL_TREE',
     tool_sha256: sha(await fs.readFile(TOOL_FILE)),
     committed_tool_sha256: sha(git(['show', `${commit}:tools/browser_performance.mjs`])),
     page_build: build.digest('hex').slice(0, 12) };
@@ -74,6 +76,7 @@ const sameSources = (actual, expected) => actual && expected &&
     /^[a-f0-9]{64}$/.test(expected[name] ?? '') && actual[name] === expected[name]);
 function snapshotBound(snapshot, report) {
   return snapshot?.commit === report.commit && snapshot.tool_sha256 === report.tool_sha256 &&
+    snapshot.identity_scope === 'FIVE_APPLICATION_SOURCES_PLUS_PERFORMANCE_TOOL_NOT_FULL_TREE' &&
     snapshot.committed_tool_sha256 === report.tool_sha256 &&
     sameSources(snapshot.source_sha256, snapshot.committed_source_sha256) &&
     /^[a-f0-9]{12}$/.test(snapshot.page_build ?? '');
@@ -134,7 +137,7 @@ export function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     need(!seen.has(arg), 'CLI', `Duplicate ${arg}`); seen.add(arg);
-    if (['--help', '--selftest'].includes(arg)) {
+    if (['--help', '--selftest', '--persistence-selftest'].includes(arg)) {
       need(!options[arg.slice(2)], 'CLI', `Duplicate ${arg}`);
       options[arg.slice(2)] = true;
     } else {
@@ -146,8 +149,8 @@ export function parseArgs(argv) {
     }
   }
   if (options.help) return options;
-  need([options.url, options.parse, options.selftest].filter(Boolean).length === 1,
-    'CLI', 'Choose exactly one of --url, --parse, --selftest');
+  need([options.url, options.parse, options.selftest, options['persistence-selftest']].filter(Boolean).length === 1,
+    'CLI', 'Choose exactly one of --url, --parse, --selftest, --persistence-selftest');
   need(Boolean(options.fixtures) === Boolean(options.selftest),
     'CLI', '--selftest requires --fixtures; fixtures cannot be used as target evidence');
   options.out = path.resolve(options.out);
@@ -826,43 +829,317 @@ function retainCheckFailure(report) {
   if (failed && !report.failure) report.failure = {
     rule: failed.rule, message: failed.name, detail: failed.detail, phase: 'gate-evaluation' };
 }
-async function persistReport(run, report) {
+export async function persistReport(run, report, io = fs, checkpoint = async () => {}) {
+  report.persistence_protocol = {
+    version: 2, strategy: 'HELD_INODE_NO_PATH_REPLACE',
+    ownership: 'DEV_INO_EXACT_BYTES_SINGLE_LINK_NOFOLLOW',
+    durability: 'FILE_AND_DIRECTORY_FSYNC_WITH_EXACT_READBACK',
+    failure_evidence: 'report-failure-*.json',
+    acceptance: 'SAME_INVOCATION_RC0_REPORT_NO_FAILURE_EVIDENCE',
+    exclusions: 'NOT_CRASH_ATOMIC_NOT_FULL_TREE_NOT_HOSTILE_SAME_UID_ISOLATION',
+  };
   const filename = path.join(run, 'report.json');
   const line = () => `PERFORMANCE verdict=${report.verdict} scope=${report.scope} g5_certified=${report.g5_certified} ` +
     `rc=${report.exit_code} samples=${report.samples.length} checks=${report.checks.length} report=${filename}`;
+  const owned = [];
+  const equalInode = (a, b) => a.dev === b.dev && a.ino === b.ino;
+  const flags = fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW;
+  let directory, directoryStat, terminal;
+  const bytesAt = async file => {
+    const stat = await file.handle.stat();
+    need(stat.isFile() && stat.size <= 16 * 1024 * 1024, 'EVIDENCE', 'Unsafe report size/type');
+    const buffer = Buffer.alloc(stat.size);
+    let position = 0;
+    while (position < buffer.length) {
+      const { bytesRead } = await file.handle.read(buffer, position, buffer.length - position, position);
+      need(bytesRead > 0, 'EVIDENCE', 'Short owned evidence read');
+      position += bytesRead;
+    }
+    return buffer;
+  };
+  const exactDirectory = async () => {
+    const current = await io.lstat(run);
+    need(current.isDirectory() && equalInode(current, directoryStat) &&
+      equalInode(await directory.stat(), directoryStat),
+    'EVIDENCE', 'Run directory inode was replaced');
+  };
+  const exact = async file => {
+    await exactDirectory();
+    const current = await io.lstat(file.path);
+    need(current.isFile() && current.nlink === 1 && equalInode(current, file.stat) &&
+      equalInode(await file.handle.stat(), file.stat),
+    'EVIDENCE', 'Owned evidence inode was replaced', { file: file.path });
+    need((await bytesAt(file)).equals(file.expected), 'EVIDENCE',
+      'Owned evidence content drift', { file: file.path });
+  };
+  const exactHandle = async file => {
+    const stat = await file.handle.stat();
+    need(stat.isFile() && stat.nlink === 1 && equalInode(stat, file.stat) &&
+      (await bytesAt(file)).equals(file.expected), 'EVIDENCE',
+    'Held evidence inode/content no longer ours', { file: file.path });
+  };
+  const create = async name => {
+    const file = { path: path.join(run, name), expected: Buffer.alloc(0) };
+    file.handle = await io.open(file.path, flags, 0o600);
+    file.stat = await file.handle.stat();
+    owned.push(file);
+    await exact(file);
+    return file;
+  };
+  const write = async (file, text, checkPath = true) => {
+    await (checkPath ? exact(file) : exactHandle(file));
+    const buffer = Buffer.from(text);
+    let position = 0;
+    while (position < buffer.length) {
+      const { bytesWritten } = await file.handle.write(buffer, position, buffer.length - position, position);
+      need(bytesWritten > 0, 'EVIDENCE', 'Short owned evidence write', { file: file.path });
+      const next = Buffer.alloc(Math.max(file.expected.length, position + bytesWritten));
+      file.expected.copy(next); buffer.copy(next, position, position, position + bytesWritten);
+      file.expected = next; position += bytesWritten;
+    }
+    await file.handle.truncate(buffer.length);
+    file.expected = buffer;
+    await file.handle.sync();
+    await (checkPath ? exact(file) : exactHandle(file));
+  };
+  const syncDirectory = async () => {
+    await exactDirectory(); await directory.sync(); await exactDirectory();
+  };
+  const close = async file => {
+    await file.handle.close(); file.closed = true;
+  };
   try {
-    // A non-certifying report is always on disk before any late evidence writes.
-    await fs.writeFile(filename, json({ ...report, verdict: 'EVIDENCE_PENDING',
-      g5_certified: false, exit_code: 2 }), { flag: 'wx' });
-    const candidate = path.join(run, 'report-candidate.json');
-    const bytes = json(report);
-    const evidenceLine = `EVIDENCE_READY scope=${report.scope} proposed_verdict=${report.verdict} ` +
+    directory = await io.open(run, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    directoryStat = await directory.stat();
+    await exactDirectory();
+    terminal = await create('report.json');
+    await write(terminal, json({ ...report, verdict: 'EVIDENCE_PENDING',
+      g5_certified: false, exit_code: 2 }));
+    await syncDirectory();
+    await checkpoint('pending-durable', { terminal, directory, owned });
+    const evidenceLine = `EVIDENCE_READY scope=${report.scope} ` +
       `terminal_authority=${filename}`;
-    await fs.writeFile(path.join(run, 'run.log'),
-      `${report.started_at} START\n${report.finished_at} ${evidenceLine}\n`, { flag: 'wx' });
-    need((await fs.readFile(path.join(run, 'run.log'), 'utf8')).includes(evidenceLine),
-      'EVIDENCE', 'Terminal log readback mismatch');
-    await fs.writeFile(candidate, bytes, { flag: 'wx' });
-    assert.equal(await fs.readFile(candidate, 'utf8'), bytes);
-    // Publishing the terminal report is the final fallible filesystem operation.
-    await fs.rename(candidate, filename);
+    const log = await create('run.log');
+    await write(log, `${report.started_at} START\n${report.finished_at} ${evidenceLine}\n`);
+    const candidate = await create('report-candidate.json');
+    await write(candidate, json({ ...report, verdict: 'EVIDENCE_PENDING',
+      g5_certified: false, exit_code: 2 }));
+    await syncDirectory();
+    await checkpoint('before-terminal-write', { terminal, directory, owned });
+    for (const file of owned) await exact(file);
+    // Write only through the held inode, never rename over an unknown pathname.
+    await write(terminal, json(report));
+    await checkpoint('after-terminal-write', { terminal, directory, owned });
+    await syncDirectory();
+    for (const file of owned) await exact(file);
+    await checkpoint('before-final-readback', { terminal, directory, owned });
+    for (const file of owned) await exact(file);
+    for (const file of owned.filter(file => file !== terminal)) await close(file);
+    await exact(terminal);
+    await directory.close(); directory = null;
+    await close(terminal);
   } catch (error) {
     report.persistence_failure = { rule: 'EVIDENCE', message: error.message,
       code: error.code ?? null, phase: 'terminal-persistence', stack: error.stack };
     retainFailure(report, new Failure('EVIDENCE', error.message,
       { code: error.code ?? null }), 'terminal-persistence');
     report.exit_code = 2;
-    const failureFile = path.join(run, `report-failure-${randomUUID()}.json`);
+    // Invalidate our inode even when a later fsync fails. Never adopt a replacement.
     try {
-      await fs.writeFile(failureFile, json(report), { flag: 'wx' });
-      await fs.rename(failureFile, filename);
+      if (terminal) {
+        let handleAvailable = !terminal.closed;
+        if (handleAvailable) {
+          try { await terminal.handle.stat(); } catch (statError) {
+            handleAvailable = false;
+          }
+        }
+        if (!handleAvailable) {
+          terminal.handle = await io.open(filename, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+          terminal.closed = false;
+        }
+        // A held old inode may be invalidated after pathname replacement; never
+        // write the replacement. Same-inode unknown content fails exactHandle.
+        await write(terminal, json(report), false);
+        if (!directory) directory = await io.open(run,
+          fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+        need(equalInode(await directory.stat(), directoryStat), 'EVIDENCE',
+          'Recovery directory is not our inode');
+        await directory.sync();
+      }
     } catch (emergency) {
+      report.persistence_recovery_failure = { message: emergency.message, code: emergency.code ?? null };
       console.error(`PERFORMANCE_EVIDENCE_RECOVERY_FAIL ${emergency.message}`);
     }
+    const failureFile = path.join(run, `report-failure-${randomUUID()}.json`);
+    try {
+      // Independent no-replace failure evidence; report.json can remain unknown.
+      const failureDirectory = await io.open(run,
+        fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      const failureDirectoryStat = await failureDirectory.stat();
+      let handle;
+      try {
+        need(equalInode(await io.lstat(run), failureDirectoryStat), 'EVIDENCE',
+          'Failure evidence directory replaced before creation');
+        handle = await io.open(failureFile, flags, 0o600);
+        const failureStat = await handle.stat();
+        const bytes = Buffer.from(json(report));
+        await handle.writeFile(bytes);
+        await handle.sync();
+        const failure = { path: failureFile, handle, stat: failureStat, expected: bytes };
+        need(equalInode(await io.lstat(failureFile), failureStat) &&
+          (await bytesAt(failure)).equals(bytes), 'EVIDENCE', 'Failure evidence replaced or drifted');
+        await failureDirectory.sync();
+        need(equalInode(await io.lstat(run), failureDirectoryStat) &&
+          equalInode(await io.lstat(failureFile), failureStat) &&
+          (await bytesAt(failure)).equals(bytes), 'EVIDENCE', 'Failure evidence final readback differs');
+      } finally {
+        if (handle) await handle.close();
+        await failureDirectory.close();
+      }
+    } catch (emergency) {
+      console.error(`PERFORMANCE_FAILURE_EVIDENCE_FAIL ${emergency.message}`);
+    }
     console.error(`PERFORMANCE_FAIL rule=EVIDENCE phase=terminal-persistence ${error.message}`);
+  } finally {
+    for (const file of owned.filter(file => !file.closed)) {
+      try { await file.handle.close(); } catch (error) {
+        console.error(`PERFORMANCE_EVIDENCE_CLOSE_FAIL ${error.message}`);
+      }
+    }
+    if (directory) {
+      try { await directory.close(); } catch (error) {
+        console.error(`PERFORMANCE_DIRECTORY_CLOSE_FAIL ${error.message}`);
+      }
+    }
   }
   console.log(line());
   return report.exit_code;
+}
+async function persistenceSelftest(run) {
+  const results = [];
+  const cases = ['positive', 'initial-unknown', 'pending-inode-replacement',
+    'late-inode-replacement', 'late-content-drift', 'candidate-inode-replacement',
+    'candidate-content-drift', 'run-directory-replacement', 'file-write-ebadf',
+    'file-sync-ebadf', 'late-file-sync-ebadf', 'late-directory-sync-ebadf',
+    'late-directory-close-ebadf', 'late-file-close-ebadf',
+    'late-directory-replacement', 'late-symlink-replacement', 'late-readback-ebadf',
+    'late-directory-sync-initial-error-ebadf'];
+  for (const name of cases) {
+    const directory = path.join(run, name);
+    await fs.mkdir(directory);
+    const report = { verdict: 'LOCAL_PREFLIGHT_PASS', scope: 'PERSISTENCE_FIXTURE_NOT_G5',
+      g5_certified: false, release_verdict: 'NOT_CERTIFIED', exit_code: 0,
+      started_at: new Date().toISOString(), finished_at: new Date().toISOString(), checks: [], samples: [] };
+    if (name === 'late-directory-sync-initial-error-ebadf') {
+      report.verdict = 'FAIL'; report.exit_code = 1;
+      report.failure = { rule: 'WEB-PERF-001', message: 'Initial performance failure remains first' };
+    }
+    const unknown = 'UNKNOWN REPLACEMENT MUST REMAIN UNCHANGED\n';
+    let unknownPath, driftPath, fired = false, directorySyncs = 0, reportSyncs = 0;
+    if (name === 'initial-unknown') {
+      unknownPath = path.join(directory, 'report.json');
+      await fs.writeFile(unknownPath, unknown, { flag: 'wx' });
+    }
+    const checkpoint = async (stage, state) => {
+      const selected = name.startsWith('pending-') || name === 'run-directory-replacement' ?
+        'pending-durable' : name.startsWith('candidate-') ? 'before-terminal-write' : 'after-terminal-write';
+      if (fired || stage !== selected || !/replacement|drift/.test(name)) return;
+      fired = true;
+      const file = name.startsWith('candidate-') ? state.owned.find(f =>
+        f.path.endsWith('/report-candidate.json')) : state.terminal;
+      if (name === 'run-directory-replacement' || name === 'late-directory-replacement') {
+        await fs.rename(directory, directory + '-original');
+        await fs.mkdir(directory);
+        unknownPath = path.join(directory, 'report.json');
+        await fs.writeFile(unknownPath, unknown, { flag: 'wx' });
+      } else if (name === 'late-symlink-replacement') {
+        await fs.rename(file.path, file.path + '.original');
+        unknownPath = file.path + '.unknown';
+        await fs.writeFile(unknownPath, unknown, { flag: 'wx' });
+        await fs.symlink(unknownPath, file.path);
+      } else if (name.includes('inode-replacement')) {
+        await fs.rename(file.path, file.path + '.original');
+        unknownPath = file.path;
+        await fs.writeFile(unknownPath, unknown, { flag: 'wx' });
+      } else {
+        driftPath = file.path;
+        await fs.writeFile(driftPath, unknown);
+      }
+    };
+    const io = { ...fs, open: async (...args) => {
+      const handle = await fs.open(...args);
+      const isDirectory = args[0] === directory;
+      const isReport = args[0] === path.join(directory, 'report.json');
+      return new Proxy(handle, { get(target, key) {
+        if (key === 'sync') return async () => {
+          if (isDirectory) directorySyncs++;
+          if (isReport) reportSyncs++;
+          const trigger = !fired && (
+            name === 'file-sync-ebadf' && isReport && reportSyncs === 1 ||
+            name === 'late-file-sync-ebadf' && isReport && reportSyncs === 2 ||
+            name.startsWith('late-directory-sync-') && isDirectory && directorySyncs === 3);
+          if (trigger) {
+            fired = true; const fd = target.fd; await target.close(); fsyncSync(fd);
+          }
+          return target.sync();
+        };
+        if (key === 'write') return async (...values) => {
+          if (!fired && name === 'file-write-ebadf' && isReport) {
+            fired = true; const fd = target.fd; await target.close(); writeSync(fd, Buffer.from('failure'));
+          }
+          return target.write(...values);
+        };
+        if (key === 'read') return async (...values) => {
+          if (!fired && name === 'late-readback-ebadf' && isReport && reportSyncs >= 2) {
+            fired = true; const fd = target.fd; await target.close(); fsyncSync(fd);
+          }
+          return target.read(...values);
+        };
+        if (key === 'close') return async () => {
+          const trigger = !fired && (
+            name === 'late-directory-close-ebadf' && isDirectory ||
+            name === 'late-file-close-ebadf' && isReport && reportSyncs >= 2);
+          if (trigger) {
+            fired = true; const fd = target.fd; await target.close(); closeSync(fd);
+          }
+          return target.close();
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      } });
+    } };
+    const rc = await persistReport(directory, report, io, checkpoint);
+    if (name === 'positive') {
+      need(rc === 0 && JSON.parse(await fs.readFile(path.join(directory, 'report.json'), 'utf8'))
+        .verdict === 'LOCAL_PREFLIGHT_PASS', 'SELFTEST', 'Positive persistence arm failed');
+      need(directorySyncs >= 3 && reportSyncs === 2, 'SELFTEST',
+        'Positive arm did not perform required actual file/directory syncs');
+    } else {
+      need(rc === 2 && report.verdict === 'FAIL' && report.persistence_failure,
+        'SELFTEST', 'Persistence failure did not close the gate', { name, rc });
+      if (unknownPath || driftPath) need(await fs.readFile(unknownPath ?? driftPath, 'utf8') === unknown,
+        'SELFTEST', 'Unknown replacement or content drift overwritten', { name });
+      if (name === 'late-inode-replacement' || name === 'late-symlink-replacement') need(
+        JSON.parse(await fs.readFile(path.join(directory, 'report.json.original'), 'utf8')).verdict === 'FAIL',
+      'SELFTEST', 'Own displaced inode left PASS', { name });
+      if (name === 'late-directory-replacement') need(JSON.parse(await fs.readFile(
+        path.join(directory + '-original', 'report.json'), 'utf8')).verdict === 'FAIL',
+      'SELFTEST', 'Own displaced directory left PASS', { name });
+      if (!unknownPath && !driftPath) need(JSON.parse(await fs.readFile(
+        path.join(directory, 'report.json'), 'utf8')).verdict !== 'LOCAL_PREFLIGHT_PASS',
+      'SELFTEST', 'Known I/O failure left an old PASS', { name });
+      need((await fs.readdir(directory)).some(file => file.startsWith('report-failure-')),
+        'SELFTEST', 'Missing independent failure evidence', { name });
+      if (name.includes('ebadf')) need(fired && report.persistence_failure.code === 'EBADF',
+        'SELFTEST', 'Real EBADF control did not execute', { name });
+      if (name.includes('initial-error')) need(report.failure.rule === 'WEB-PERF-001',
+        'SELFTEST', 'Late persistence failure overwrote the original failure', { name });
+    }
+    results.push({ name, rc, status: 'PASS', failure: report.persistence_failure ?? null,
+      preserved_unknown: Boolean(unknownPath || driftPath), injected: fired,
+      directory_sync_calls: directorySyncs, report_sync_calls: reportSyncs });
+  }
+  return { status: 'PASS', count: results.length, cases: results, scope: 'PERSISTENCE_FIXTURES_NOT_G5' };
 }
 async function outputDirectory(out) {
   const allowed = await fs.realpath('/hf3fs-jd/data/tmp');
@@ -1002,7 +1279,11 @@ export async function main(argv = process.argv.slice(2)) {
     report.commit = git.stdout.trim();
     report.tool_sha256 = LOADED_TOOL_SHA256;
     report.target_url = options.url ?? null; report.scope = options.scope ?? 'OFFLINE_PARSE_NOT_G5';
-    if (options.selftest) {
+    if (options['persistence-selftest']) {
+      report.scope = 'PERSISTENCE_FIXTURES_NOT_G5';
+      report.persistence_selftest = await persistenceSelftest(run);
+      report.verdict = 'SELFTEST_PASS'; exitCode = 0;
+    } else if (options.selftest) {
       report.scope = 'OFFLINE_FILE_FIXTURES_NOT_G5';
       report.selftest = await offlineSelftest(options.fixtures, options, run, report);
       report.verdict = 'SELFTEST_PASS'; exitCode = 0;
