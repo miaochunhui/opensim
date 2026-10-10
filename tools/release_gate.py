@@ -8,6 +8,7 @@ Filesystem test fixtures prove gate behaviour, never real release acceptance.
 from __future__ import annotations
 
 import argparse
+import ast
 from datetime import datetime, timezone
 import hashlib
 import ipaddress
@@ -17,8 +18,11 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import struct
 import subprocess
 import sys
+import types
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_ROOT = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1")
@@ -30,6 +34,7 @@ TOOLS = (
     "tools/browser_check.mjs", "tools/browser_audit.mjs",
     "tools/browser_performance.mjs", "tools/public_gate.py",
     "tools/release_app.py", "tools/release_gate.py", "tools/sync_release.py",
+    "tools/workbench_acceptance.py",
 )
 GATES = ("G1-structure", "G2-layout", "G3-accessibility", "G4-keyboard",
          "G5-performance", "G6-content")
@@ -520,8 +525,108 @@ def audit_reference(pin: dict) -> tuple[dict, Path]:
     return value, path
 
 
+def audit_dependencies(report: dict, path: Path, expected: dict, source_root: Path) -> dict:
+    """Reuse pinned workbench pure validators, never its runner or network entrypoints."""
+    name = "tools/workbench_acceptance.py"
+    require(source_root.is_absolute() and source_root.is_dir() and not source_root.is_symlink(),
+            "Invalid explicit audit validator source root")
+    source = source_root / name
+    require(not (source_root / "tools").is_symlink(), "Audit validator ancestor symlink")
+    body = read_file(source)
+    require(sha(body) == expected.get("tool_sha256", {}).get(name),
+            "Old/unknown pure audit validator hash")
+    module = types.ModuleType("opensim_pinned_audit_validation")
+    # Compile only the pinned pure predicates; no imports, runner or module-level actions.
+    pure = {"EvidenceError", "need", "matching", "positive", "decode", "unique_object",
+            "finite_tree", "validate_audit_payload", "validate_audit_coverage", "png_record"}
+    tree = ast.parse(body, filename=str(source))
+    nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+             and node.name in pure]
+    require({node.name for node in nodes} == pure, "Pinned pure audit validator API missing")
+    def producer_file(directory, relative_name, label):
+        file = external(directory / relative(relative_name))
+        data, stamp = _audit_file(file, 1)
+        return data, {"path": str(file), "bytes": len(data), "sha256": sha(data),
+                      "dev": str(stamp[0]), "ino": str(stamp[1]), "nlink": stamp[-1]}
+    def file_record(file, directory):
+        require(file.is_relative_to(directory), "Pure validator file escaped run")
+        return producer_file(directory, str(file.relative_to(directory)), "audit")[1]
+    module.__dict__.update(json=json, math=math, re=re, struct=struct, zlib=zlib,
+                           datetime=datetime, Path=Path, producer_file=producer_file,
+                           file_record=file_record)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), module.__dict__)
+    directory, url = path.parent, report.get("url")
+    matrix = report.get("matrix", [])
+    viewports = {(320, 568), (768, 1024), (1064, 768), (1440, 900)}
+    require(isinstance(matrix, list) and len(matrix) == 4 and
+            all(isinstance(row, dict) for row in matrix) and
+            {(row.get("width"), row.get("height")) for row in matrix} == viewports,
+            "Incomplete native audit matrix")
+    pictures = report.get("screenshots", [])
+    require(isinstance(pictures, list) and pictures and all(isinstance(row, dict) for row in pictures),
+            "Missing native audit screenshots")
+    files = [relative(row.get("file", "")) for row in pictures]
+    require(len(set(files)) == len(files), "Audit duplicate screenshot file")
+    posts = sorted(directory.glob("http-solve-*.json"))
+    covers = sorted(directory.glob("*.coverage.json"))
+    dependencies = set(posts + covers + [directory / name for name in files])
+    before = {file: _audit_file(external(file), 1) for file in dependencies}
+    try:
+        payloads = module.validate_audit_payload(report, directory, expected["source_sha256"], url)
+        coverage = module.validate_audit_coverage(report, directory, url)
+        pngs = [module.png_record(row, directory) for row in pictures]
+    except module.EvidenceError as exc:
+        raise GateError(f"Audit dependency {exc.coordinate}: {exc}") from exc
+    by_file = {row["file"]: row for row in pictures}
+    covered_tiles = set()
+    for cover in covers:
+        value = decode(before[cover][0])
+        phase = cover.name.removesuffix(".coverage.json")
+        main = by_file.get(phase + ".png", {})
+        require(main.get("url") == url and main.get("state") == phase and
+                (main.get("width"), main.get("height")) in viewports,
+                "Audit coverage state/viewport differs")
+        width, height = main["width"], main["height"]
+        document, tiles = value.get("document", {}), value.get("tiles", [])
+        require(value.get("status") == "PASS" and value.get("scale") == 1 and
+                value.get("horizontal_coverage") == "COMPLETE" and
+                type(document.get("height")) is int and document["height"] > 0 and
+                type(document.get("width")) is int and 0 < document["width"] <= width and
+                isinstance(tiles, list) and tiles, "Audit incomplete native tile coverage")
+        covered = 0
+        for index, tile in enumerate(tiles):
+            name = f"{phase}-tile-{index:03}.png"
+            picture = by_file.get(name, {})
+            y = tile.get("document_y")
+            require(tile.get("file") == name and name not in covered_tiles and
+                    type(y) is int and 0 <= y <= covered and y <= max(0, document["height"] - height) and
+                    tile.get("viewport") == {"width": width, "height": height} and
+                    picture.get("state") == name.removesuffix(".png") and picture.get("url") == url and
+                    (picture.get("width"), picture.get("height")) == (width, height),
+                    "Audit tile inventory/state/coverage gap differs")
+            covered_tiles.add(name)
+            covered = max(covered, y + height)
+        require(covered >= document["height"] and value.get("vertical_coverage") == covered,
+                "Audit incomplete native vertical coverage")
+    require(covered_tiles == {name for name in files if "-tile-" in name},
+            "Audit tile set differs from coverage inventory")
+    for row in pictures:
+        require(row.get("url") == url and row.get("state") == row["file"].removesuffix(".png") and
+                (row.get("width"), row.get("height")) in viewports,
+                "Audit screenshot URL/state/viewport differs")
+    require(set(posts) == set(directory.glob("http-solve-*.json")) and
+            set(covers) == set(directory.glob("*.coverage.json")) and
+            all(_audit_file(external(file), 1) == stamp for file, stamp in before.items()) and
+            read_file(source) == body, "Audit dependency inventory/bytes drift")
+    return {"validator_sha256": sha(body), "successful_posts": len(payloads),
+            "post_artifacts": len(posts), "coverage_artifacts": len(covers), "pngs": len(pngs),
+            "dependencies": [{"path": str(file), "sha256": sha(data), "stat": list(stamp)}
+                             for file, (data, stamp) in sorted(before.items())],
+            "response_digest_scope": "STORED_PARSED_PAYLOAD_AND_CDP_DIGEST_NOT_RAW_BODY_REHASH"}
+
+
 def read_audit_scope(pin: dict, expected: dict, process_rc: int,
-                     now: datetime | None = None) -> dict:
+                     now: datetime | None = None, *, source_root: Path = ROOT) -> dict:
     """Read automatic evidence only, never certify, approve NA, or authorize deployment."""
     now = now or datetime.now(timezone.utc)
     require(isinstance(expected, dict) and isinstance(expected.get("commit"), str) and
@@ -534,7 +639,9 @@ def read_audit_scope(pin: dict, expected: dict, process_rc: int,
             re.fullmatch(r"[a-f0-9]{12}", expected["page_build"]) and
             isinstance(expected.get("tool_sha256"), dict) and
             isinstance(expected["tool_sha256"].get("tools/browser_audit.mjs"), str) and
-            re.fullmatch(r"[a-f0-9]{64}", expected["tool_sha256"]["tools/browser_audit.mjs"]),
+            re.fullmatch(r"[a-f0-9]{64}", expected["tool_sha256"]["tools/browser_audit.mjs"]) and
+            isinstance(expected["tool_sha256"].get("tools/workbench_acceptance.py"), str) and
+            re.fullmatch(r"[a-f0-9]{64}", expected["tool_sha256"]["tools/workbench_acceptance.py"]),
             "Missing independently pinned audit identity")
     report, path = audit_reference(pin)
     before = encode(report)
@@ -613,7 +720,8 @@ def read_audit_scope(pin: dict, expected: dict, process_rc: int,
             completion.get("receipt") == "completion.json" and completion.get("log") == "logs/audit.log",
             "Audit missing final completion")
     require(not os.path.lexists(path.parent / "report.failure.json"), "Audit failure sidecar present")
-    receipt_path, log_path = path.parent / "completion.json", path.parent / "logs/audit.log"
+    receipt_path = external(path.parent / "completion.json")
+    log_path = external(path.parent / "logs/audit.log")
     receipt_body, log_body = read_file(receipt_path), read_file(log_path)
     receipt = decode(receipt_body)
     require(receipt.get("protocol") == "durable-final-v2" and receipt.get("status") == "COMPLETE" and
@@ -625,14 +733,16 @@ def read_audit_scope(pin: dict, expected: dict, process_rc: int,
     text = log_body.decode("utf-8")
     require(text.startswith(prefix) and text.endswith("\n") and text.count("\n") == 1 and
             external(Path(text[len(prefix):-1])).resolve() == path.resolve(), "Audit candidate log differs")
-    screenshots(report, path)
-    require(encode(audit_reference(pin)[0]) == before and read_file(receipt_path) == receipt_body and
-            read_file(log_path) == log_body and not os.path.lexists(path.parent / "report.failure.json"),
+    dependencies = audit_dependencies(report, path, expected, source_root)
+    require(encode(audit_reference(pin)[0]) == before and read_file(external(receipt_path)) == receipt_body and
+            read_file(external(log_path)) == log_body and
+            not os.path.lexists(path.parent / "report.failure.json"),
             "Audit terminal dependency drift")
     return {"state": "AUTOMATIC_SCOPE_OBSERVED", "scope": "AUDIT_AUTOMATION_NOT_RELEASE",
             "release_verdict": "NOT_CERTIFIED", "production_changes": False, "report": dict(pin),
             "commit": report["commit"], "page_build": report["page_build"]["id"],
             "process_rc": process_rc, "native_verdict": report["verdict"], "checks": observed,
+            "artifact_validation": dependencies,
             "remaining": remaining, "not_applicable": na, "native_gates": gates,
             "coverage_status": "AUTOMATED_PARTIAL" if remaining or na else "AUTOMATED_SCOPE_PASS"}
 
@@ -853,7 +963,8 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
             "Missing required producer launcher receipts")
     execution_values = {kind: execution(executions[kind], evidence[kind], expected, tool, now)
                         for kind, tool in producer_tools.items()}
-    audit_scope = read_audit_scope(evidence["audit"], expected, execution_values["audit"]["rc"], now)
+    audit_scope = read_audit_scope(evidence["audit"], expected, execution_values["audit"]["rc"], now,
+                                  source_root=root)
     page = reports["page"][0]
     require(set(page) == {"schema", "commit", "source_sha256", "page_build", "html",
                          "page_check", "timestamp_origin", "source_epoch"},
@@ -1030,7 +1141,8 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
     require(identity(root, commit) == expected, "Checkout changed during release gate")
     for kind, pin in evidence.items():
         if kind == "audit":
-            require(read_audit_scope(pin, expected, execution_values[kind]["rc"], now) == audit_scope,
+            require(read_audit_scope(pin, expected, execution_values[kind]["rc"], now,
+                                     source_root=root) == audit_scope,
                     "Audit automatic scope drift during gate")
         else:
             reference(pin)

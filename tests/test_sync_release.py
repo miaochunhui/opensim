@@ -125,7 +125,7 @@ class SyncTests(unittest.TestCase):
 
     def test_prepare_output_conflict_refused_before_writes(self):
         out = self.f.directory / "never-prepared"
-        with self.assertRaisesRegex(gate.GateError, "trusted human-acceptance"):
+        with self.assertRaisesRegex(gate.GateError, "PARTIAL audit cannot certify G3-accessibility"):
             sync.prepare_guard(self.f.repo, self.f.commit, self.f.ledger_path, out)
         self.assertFalse(out.exists())
 
@@ -155,11 +155,11 @@ class SyncTests(unittest.TestCase):
     def test_missing_bundle_preserves_request(self):
         before = self.desired_path.read_bytes()
         report = self.cli()
-        self.assertIn("trusted human-acceptance", report["failure"]["reason"])
+        self.assertIn("PARTIAL audit cannot certify G3-accessibility", report["failure"]["reason"])
         self.assertEqual(self.desired_path.read_bytes(), before)
 
     def test_forged_certified_receipt_cannot_authorize_sync(self):
-        self.assertIn("trusted human-acceptance", self.cli()["failure"]["reason"])
+        self.assertIn("PARTIAL audit cannot certify G3-accessibility", self.cli()["failure"]["reason"])
 
     def test_release_api_bundle_missing_negative_control(self):
         api = sync.load_api(self.api, self.f.identity["tool_sha256"]["tools/release_app.py"])

@@ -27,7 +27,7 @@ systemctl、DNS、证书或 edge 工具。controller 的文件存在也不代表
 
 - `tools/render_page.py`、`web/app.js`、`web/app.css`、`solver.py`、`server.py`。
 - 工具摘要覆盖 acceptance、numerics、render、browser、audit、performance、
-  public_gate、release_app、release_gate、sync_release，不省略缺件。
+  public_gate、release_app、release_gate、sync_release、workbench_acceptance，不省略缺件。
 
 `opensim-release-evidence-v1` ledger 精确字段为
 `schema/identity/evidence/executions/gates/manual/exceptions`。
@@ -142,6 +142,28 @@ sudo -n -u infra python3 -B /data/dev/opensim-sync-v1/tests/test_release_gate.py
 本轮 v2 回读 261 checks/408 PNG、2 NA、9 个 remaining 保留，
 原 workbench 仍 FAIL/rc1（perf G5-IDENTITY），不是组合 PASS。
 五源 byte build 不变不等于工具 inventory 不变，主席整合后须重新冻结候选。
+
+S1 三处依赖缺口补验：同一显式 source_root 必须包含完整 SHA pinned 的
+`tools/workbench_acceptance.py`，缺件拒绝，无跨 checkout fallback。
+只提取其 `validate_audit_payload`、`validate_audit_coverage`、`png_record`
+及必要纯断言，不执行模块 import、runner、网络或产品求解入口。
+所有依赖均先核 external 祖先、单链接和稳定 inode/bytes，再校验并末次回读。
+核成功 POST 非空且与实际 http-solve 文件完整集合相符、payload 五源/solver/
+时间/非空 mesh/field、CDP 摘要一致；显式 HTTP503/empty 不混成成功算例。
+现有产物没有 raw response body，故只称 parsed payload 与 CDP 摘要绑定，
+**不称独立重算响应 SHA**。四视口注入/状态覆盖、所有 PNG IHDR 尺寸、
+URL/state、实际 coverage tiles 连续性与完整集合分别核验，不要求扩成八视口。
+receipt/log 首次及末次读取均核祖先 symlink；真实原生回读已消费
+25 个成功 POST、33 个 HTTP 产物、44 份 coverage 和 408 PNG，
+仍 AUTOMATED_PARTIAL/NOT_CERTIFIED。完整候选须重新冻结新增 helper inventory。
+
+测试入口逐项写外置 `progress.log`，另写非终态 `run-start.json`，终态报告
+记录执行前后的测试/工具 SHA；任何执行期间漂移直接 FAIL。
+错误尺寸在 required viewport/state 前置门拒绝，不能要求后置 PNG 报错；
+联动 sync 测试同样核首个 `PARTIAL audit cannot certify G3-accessibility`，
+保留 REFUSED、无生产变更和请求字节保护。最终 human 信任分支未获得
+可达的完整证据路径，不把前置拒绝冒称该分支已执行。
+先前61项回归及6项反例的同一报错断言失败保留，不追认为新版本通过。
 
 ## 固定 Release API 与同步边界
 

@@ -31,11 +31,11 @@ PEERS = {
 }
 
 
-def png() -> bytes:
+def png(width: int = 1, height: int = 1) -> bytes:
     def chunk(kind, body):
         return struct.pack("!I", len(body)) + kind + body + struct.pack("!I", zlib.crc32(kind + body))
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack("!IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) +
-            chunk(b"IDAT", zlib.compress(b"\0\0\0\0")) + chunk(b"IEND", b""))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(b"\0" * ((width * 3 + 1) * height))) + chunk(b"IEND", b""))
 
 
 def put(path: Path, body: bytes) -> None:
@@ -55,6 +55,48 @@ def command(argv: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return result
 
 
+def native_assets(directory: Path, report: dict, expected: dict, collected: str) -> None:
+    """Real files for the native contract, explicitly synthetic and never product evidence."""
+    report["matrix"], report["screenshots"], report["injections"] = [], [], []
+    for width, height in ((320, 568), (768, 1024), (1064, 768), (1440, 900)):
+        report["matrix"].append({"width": width, "height": height})
+        body = png(width, height)
+        for state in ("loading-empty", "ready", "error", "empty", "long",
+                      "error-recovery", "empty-recovery", "long-recovery"):
+            phase = f"{width}-{state}"
+            for name in (phase, phase + "-tile-000"):
+                put(directory / (name + ".png"), body)
+                report["screenshots"].append({"file": name + ".png", "sha256": gate.sha(body),
+                    "width": width, "height": height, "url": report["url"], "state": name})
+            put(directory / (phase + ".coverage.json"), gate.encode({
+                "status": "PASS", "scale": 1, "horizontal_coverage": "COMPLETE",
+                "document": {"width": width, "height": height}, "vertical_coverage": height,
+                "tiles": [{"file": phase + "-tile-000.png", "document_y": 0,
+                           "viewport": {"width": width, "height": height}}]}))
+        for mode in ("hold", "error", "empty", "long"):
+            phase = f"{width}-loading-empty" if mode == "hold" else f"{width}-{mode}"
+            report["injections"].append({"mode": mode, "phase": phase,
+                "request_id": "FIXTURE-" + phase, "url": report["url"].rstrip("/") + "/api/solve",
+                "status": 503 if mode == "error" else 200, "body_sha256": "c" * 64,
+                "real_mesh_nodes": 1, "injected_warning_length": 100})
+    report["coverage_counts"] = {"matrix": 4, "screenshots": len(report["screenshots"]),
+                                 "checks": len(report["checks"]), "injected_requests": 16}
+    # The digest is a CDP metadata fixture, not a raw HTTP response rehash.
+    url = report["url"].rstrip("/") + "/api/solve"
+    post = {"url": url, "status": 200, "injection": None, "bytes": 100,
+            "body_sha256": "c" * 64, "test_fixture": "SYNTHETIC_NOT_HTTP_OR_FEM",
+            "payload": {"mesh": {"nodes_mm": [[0, 0]]}, "fields": {"velocity_m_s": [0]},
+                        "reproducibility": {"source_sha256": expected["source_sha256"],
+                            "solver_sha256": expected["source_sha256"]["solver.py"], "computed_at": collected}}}
+    put(directory / "http-solve-000.json", gate.encode(post))
+    report["post_source_checks"] = [{"artifact": "http-solve-000.json", "url": url,
+        "source_sha256": expected["source_sha256"], "body_sha256": "c" * 64, "verdict": "PASS"}]
+    for index, status, injection in ((1, 503, "error"), (2, 200, "empty")):
+        put(directory / f"http-solve-{index:03}.json", gate.encode({
+            "url": url, "status": status, "injection": injection, "payload": None,
+            "bytes": 0 if injection == "empty" else 10, "body_sha256": "d" * 64}))
+
+
 class Fixture:
     def __init__(self, approval: dict | None = None):
         self.directory = gate.OUTPUT_ROOT / ("fixture-" + uuid4().hex)
@@ -63,6 +105,10 @@ class Fixture:
         self.now = datetime.now(timezone.utc)
         self.time = self.now.isoformat()
         for name in set((*gate.SOURCES, *gate.TOOLS, "requirements.txt")):
+            if name == "tools/workbench_acceptance.py":
+                put(self.repo / name, gate.git(Path("/data/dev/opensim"), "show",
+                    "75beb17b230f86c016621234c3b9df96809ec04f:" + name))
+                continue
             source = ROOT / name
             if not source.exists():
                 source = PEERS[name]
@@ -126,14 +172,14 @@ class Fixture:
                           {"rule": rule, "status": "NOT_TESTED"} for rule in
                           ("WEB-A11Y-009", "PHYSICAL-TOUCH", "SCREENSHOT-REVIEW",
                            "FULL-STANDARD-MATRIX", "G5-performance")],
-                      "url": gate.PUBLIC_URL,
+                      "url": gate.PUBLIC_URL + "/",
                       "page_build": {"id": self.identity["page_build"],
                                      "footer": "FIXTURE build " + self.identity["page_build"]},
                       "gates": {name: {"status": "PARTIAL" if name == "G3-accessibility" else "PASS",
                                        "release_status": "NOT_CERTIFIED"}
                                 for name in ("G3-accessibility", "G6-content")},
                       "checks": []})
-        observed = {"url": gate.PUBLIC_URL, "verdict": "PASS", "fixture_asset_override": False,
+        observed = {"url": audit["url"], "verdict": "PASS", "fixture_asset_override": False,
                     "footer": audit["page_build"]["footer"],
                     "local_source_sha256": self.identity["source_sha256"],
                     "committed_source_sha256": self.identity["source_sha256"],
@@ -200,8 +246,10 @@ class Fixture:
                             "computed_at": self.time})
         for kind, report in (("page", page), ("local", local), ("numerics", numerics),
                              ("browser", browser), ("audit", audit), ("performance", perf), ("public", public)):
-            if kind in {"browser", "audit"}:
+            if kind == "browser":
                 report["screenshots"] = [self.screenshot(kind)]
+            if kind == "audit":
+                native_assets(self.directory / kind, report, self.identity, self.time)
             self.store(kind, report)
         self.ledger = {"schema": "opensim-release-evidence-v1", "identity": self.identity,
                        "evidence": {k: self.pin(k) for k in
@@ -229,7 +277,7 @@ class Fixture:
                     "reproduce": "FIXTURE_NOT_BROWSER_CHECK"})
                 if kind == "audit":
                     self.reports[kind]["checks"][-1].update(
-                        viewport={"width": 320, "height": 568}, state="FIXTURE_NOT_BROWSER",
+                        url=audit["url"], viewport={"width": 320, "height": 568}, state="320-ready",
                         reproduce=["FIXTURE_NOT_BROWSER_CHECK"])
                     self.reports[kind]["checks"][-1].pop("name")
                 selected.append(check_name)
@@ -260,6 +308,7 @@ class Fixture:
 
     def store(self, kind: str, report: dict) -> None:
         if kind == "audit":
+            report["coverage_counts"]["checks"] = len(report["checks"])
             final = self.directory / "audit/report.json"
             line = "AUDIT candidate_verdict={} candidate_rc={} report={}\n".format(
                 report["verdict"], report.get("exit_code", 0), final).encode()
@@ -544,7 +593,7 @@ class NativeAuditTests(unittest.TestCase):
         self.report.update(schema_version=1, tool="opensim-browser-audit", release_verdict="NOT_CERTIFIED",
                            test_fixture="SYNTHETIC_FILE_CONTRACT_NOT_PRODUCT")
         self.report["checks"] = [{"rule": "WEB-INPUT-005", "status": "PASS", "url": gate.PUBLIC_URL,
-                                 "viewport": {"width": 320, "height": 568}, "state": "FIXTURE",
+                                 "viewport": {"width": 320, "height": 568}, "state": "320-ready",
                                  "reproduce": ["FIXTURE_NOT_BROWSER"]}]
         self.report["gates"] = {
             "G3-accessibility": {"status": "PARTIAL", "release_status": "NOT_CERTIFIED"},
@@ -554,7 +603,8 @@ class NativeAuditTests(unittest.TestCase):
                                    *[{"rule": rule, "status": "NOT_TESTED"} for rule in
                                      ("PHYSICAL-TOUCH", "SCREENSHOT-REVIEW", "FULL-STANDARD-MATRIX", "G5-performance")]]
         self.report["page_capabilities"] = {"dialogs": 0, "mobile_menus": 0}
-        identity = {"url": gate.PUBLIC_URL, "verdict": "PASS", "fixture_asset_override": False,
+        self.report["checks"][0]["url"] = self.report["url"]
+        identity = {"url": self.report["url"], "verdict": "PASS", "fixture_asset_override": False,
                     "footer": self.report["page_build"]["footer"],
                     "local_source_sha256": self.f.identity["source_sha256"],
                     "committed_source_sha256": self.f.identity["source_sha256"],
@@ -565,11 +615,12 @@ class NativeAuditTests(unittest.TestCase):
                         "/web/app.css": self.f.identity["source_sha256"]["web/app.css"]}}
         self.report["identity_checks"] = [{**copy.deepcopy(identity), "stage": stage}
                                           for stage in ("before", "after")]
+        native_assets(self.f.directory / "native-audit", self.report, self.f.identity, self.f.time)
         self.persist()
 
     def persist(self):
         self.path = self.f.directory / "native-audit/report.json"
-        put(self.path.parent / "fixture.png", png())
+        self.report["coverage_counts"]["checks"] = len(self.report["checks"])
         line = "AUDIT candidate_verdict={} candidate_rc={} report={}\n".format(
             self.report["verdict"], self.report.get("exit_code", 0), self.path)
         body = line.encode()
@@ -584,7 +635,7 @@ class NativeAuditTests(unittest.TestCase):
             "report": "report.json", "report_sha256": self.pin["sha256"], "log_sha256": gate.sha(body)}))
 
     def read(self, rc=0):
-        return gate.read_audit_scope(self.pin, self.f.identity, rc)
+        return gate.read_audit_scope(self.pin, self.f.identity, rc, source_root=self.f.repo)
 
     def test_native_scope_preserves_partial_na_and_original_bytes(self):
         before = self.path.read_bytes()
@@ -738,7 +789,8 @@ class NativeAuditTests(unittest.TestCase):
         for rc, expected_rc in ((0, 0), (3, 1)):
             argv = [sys.executable, "-B", str(Path(__file__).resolve()), "--audit-child",
                     "--audit-report", str(self.path), "--audit-sha256", self.pin["sha256"],
-                    "--expected", str(expected), "--producer-rc", str(rc)]
+                    "--expected", str(expected), "--producer-rc", str(rc),
+                    "--source-root", str(self.f.repo)]
             child = subprocess.run(argv, capture_output=True, text=True, cwd=ROOT)
             put(self.f.directory / f"child-{rc}.stdout", child.stdout.encode())
             put(self.f.directory / f"child-{rc}.stderr", child.stderr.encode())
@@ -785,12 +837,93 @@ class NativeAuditTests(unittest.TestCase):
         self.assertEqual(child.returncode, 1)
         self.assertIn("cannot claim full PASS", report["failure"]["reason"])
 
+    def test_native_dependencies_require_pinned_same_checkout_validator(self):
+        for value in (None, "old", "0" * 64):
+            expected = copy.deepcopy(self.f.identity)
+            expected["tool_sha256"]["tools/workbench_acceptance.py"] = value
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(gate.GateError, "identity|validator hash"):
+                    gate.read_audit_scope(self.pin, expected, 0, source_root=self.f.repo)
+        empty = self.f.directory / "no-validator"
+        empty.mkdir()
+        with self.assertRaises(FileNotFoundError):
+            gate.read_audit_scope(self.pin, self.f.identity, 0, source_root=empty)
+
+    def test_native_post_artifacts_complete_actual_source_and_cdp_digest(self):
+        post_path = self.path.parent / "http-solve-000.json"
+        original = post_path.read_bytes()
+        for field, value, reason in (("body_sha256", "0" * 64, "CDP digest"),
+                                     ("status", 503, "successful actual solve"),
+                                     ("url", "http://wrong/api/solve", "successful actual solve")):
+            post = gate.decode(original)
+            post[field] = value
+            put(post_path, gate.encode(post))
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(gate.GateError, reason):
+                    self.read()
+        post = gate.decode(original)
+        post["payload"]["reproducibility"]["source_sha256"]["solver.py"] = "0" * 64
+        put(post_path, gate.encode(post))
+        with self.assertRaisesRegex(gate.GateError, "Source identity differs"):
+            self.read()
+        put(post_path, original)
+        put(self.path.parent / "http-solve-999.json", original)
+        with self.assertRaisesRegex(gate.GateError, "successful POST inventory differs"):
+            self.read()
+
+    def test_native_missing_successful_post_rejected(self):
+        post = self.path.parent / "http-solve-000.json"
+        post.rename(post.with_name("retained-missing-post.json"))
+        with self.assertRaises(FileNotFoundError):
+            self.read()
+
+    def test_native_logs_ancestor_symlink_rejected_preserves_target(self):
+        logs = self.path.parent / "logs"
+        retained = self.path.parent / "retained-logs"
+        logs.rename(retained)
+        before = (retained / "audit.log").read_bytes()
+        logs.symlink_to(retained, target_is_directory=True)
+        with self.assertRaisesRegex(gate.GateError, "Evidence symlink rejected"):
+            self.read()
+        self.assertEqual((retained / "audit.log").read_bytes(), before)
+
+    def test_native_png_dimensions_state_and_tile_set_rejected(self):
+        pictures = copy.deepcopy(self.report["screenshots"])
+        for field, value, reason in (("width", 1, "required viewport/state screenshot missing"),
+                                     ("url", "http://wrong/", "screenshot missing"),
+                                     ("state", "UNKNOWN", "screenshot missing")):
+            self.report["screenshots"] = copy.deepcopy(pictures)
+            self.report["screenshots"][0][field] = value
+            self.persist()
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(gate.GateError, reason):
+                    self.read()
+        self.report["screenshots"] = pictures[:1]
+        self.report["coverage_counts"]["screenshots"] = 1
+        self.persist()
+        with self.assertRaisesRegex(gate.GateError, "tile inventory/coverage gap"):
+            self.read()
+
+    def test_native_tile_gap_and_injections_rejected(self):
+        cover = self.path.parent / "320-ready.coverage.json"
+        value = gate.decode(cover.read_bytes())
+        value["tiles"][0]["document_y"] = 1
+        put(cover, gate.encode(value))
+        with self.assertRaisesRegex(gate.GateError, "tile inventory/coverage gap"):
+            self.read()
+        value["tiles"][0]["document_y"] = 0
+        put(cover, gate.encode(value))
+        self.report["injections"].pop()
+        self.persist()
+        with self.assertRaisesRegex(gate.GateError, "incomplete injection inventory"):
+            self.read()
+
 
 def audit_child(args) -> int:
     try:
         expected = gate.decode(gate.read_file(gate.external(args.expected)))
         result = gate.read_audit_scope({"path": str(args.audit_report), "sha256": args.audit_sha256},
-                                      expected, args.producer_rc)
+                                      expected, args.producer_rc, source_root=args.source_root)
         print(gate.encode(result).decode(), end="", flush=True)
         return 0
     except Exception as exc:
@@ -815,7 +948,7 @@ def audit_readback(args) -> int:
                      workbench.get("release_verdict") == "NOT_CERTIFIED" and
                      workbench["before"]["commit"] == workbench["after"]["commit"] == args.commit,
                      "Workbench historical candidate mismatch")
-        names = (*gate.SOURCES, "tools/browser_audit.mjs")
+        names = (*gate.SOURCES, "tools/browser_audit.mjs", "tools/workbench_acceptance.py")
         before = {name: gate.read_file(args.source_root / name) for name in names}
         bodies = {name: gate.committed(args.source_root, args.commit, name) for name in names}
         fingerprint = hashlib.sha256()
@@ -823,7 +956,8 @@ def audit_readback(args) -> int:
             fingerprint.update(name.encode() + b"\0" + bodies[name] + b"\0")
         expected = {"commit": args.commit, "source_sha256": {n: gate.sha(bodies[n]) for n in gate.SOURCES},
                     "page_build": fingerprint.hexdigest()[:12], "tool_sha256": {
-                        "tools/browser_audit.mjs": gate.sha(bodies["tools/browser_audit.mjs"])}}
+                        n: gate.sha(bodies[n]) for n in
+                        ("tools/browser_audit.mjs", "tools/workbench_acceptance.py")}}
         producer = workbench["producers"]["audit"]
         step, = [row for row in workbench["steps"] if row["name"] == "audit"]
         gate.require(producer["candidate_commit"] == args.commit and producer["tool_sha256"] ==
@@ -854,7 +988,8 @@ def audit_readback(args) -> int:
         put(out / "expected.json", gate.encode(expected))
         argv = [sys.executable, "-B", str(Path(__file__).resolve()), "--audit-child",
                 "--audit-report", str(path), "--audit-sha256", pin["sha256"],
-                "--expected", str(out / "expected.json"), "--producer-rc", str(step["rc"])]
+                "--expected", str(out / "expected.json"), "--producer-rc", str(step["rc"]),
+                "--source-root", str(args.source_root)]
         child = subprocess.run(argv, cwd=ROOT, capture_output=True)
         gate.write_new(out / "reader.stdout", child.stdout)
         put(out / "reader.stderr", child.stderr)
@@ -887,21 +1022,43 @@ def audit_readback(args) -> int:
 def run_suite(suite: unittest.TestSuite, out: Path, label: str) -> int:
     gate.external(out, gate.OUTPUT_ROOT)
     out.mkdir(parents=True, exist_ok=False)
-    stream = io.StringIO()
-    result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)
-    rc = 0 if result.wasSuccessful() and result.testsRun > 0 else 1
+    paths = {Path(__file__).resolve(), Path(gate.__file__).resolve()}
+    for name in ("sync_release", "__main__"):
+        module = sys.modules.get(name)
+        filename = getattr(module, "__file__", None)
+        if filename:
+            paths.add(Path(filename).resolve())
+    before = {str(path): gate.sha(gate.read_file(path)) for path in sorted(paths)}
+    started_at = datetime.now(timezone.utc).isoformat()
+    gate.write_new(out / "run-start.json", gate.encode({
+        "state": "RUNNING_NOT_FINAL", "started_at": started_at,
+        "source_sha256": before, "scope": "FIXTURE_NOT_RELEASE"}))
+    progress = out / "progress.log"
+    with progress.open("x", encoding="utf-8") as stream:
+        result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)
+        stream.flush()
+        os.fsync(stream.fileno())
+    after = {str(path): gate.sha(gate.read_file(path)) for path in sorted(paths)}
+    stable = before == after
+    rc = 0 if result.wasSuccessful() and result.testsRun > 0 and stable else 1
     line = (f"{label} verdict={'PASS' if rc == 0 else 'FAIL'} tests={result.testsRun} "
             f"failures={len(result.failures)} errors={len(result.errors)} rc={rc} "
-            f"scope=FIXTURE_NOT_RELEASE collected_at={datetime.now(timezone.utc).isoformat()} out={out}")
-    gate.write_new(out / "execution.log", (stream.getvalue() + "\n" + line + "\n").encode())
+            f"source_stable={stable} scope=FIXTURE_NOT_RELEASE "
+            f"collected_at={datetime.now(timezone.utc).isoformat()} out={out}")
+    log = gate.read_file(progress)
+    gate.write_new(out / "execution.log", log + ("\n" + line + "\n").encode())
     gate.write_new(out / "report.json", gate.encode({
         "verdict": "PASS" if rc == 0 else "FAIL", "tests": result.testsRun, "exit_code": rc,
         "failures": len(result.failures), "errors": len(result.errors),
+        "started_at": started_at, "source_before": before, "source_after": after,
+        "source_stable": stable,
         "scope": "FIXTURE_NOT_RELEASE", "production_changes": False,
         "line": line, "finished_at": datetime.now(timezone.utc).isoformat()}))
     print(line)
     if rc:
-        print(stream.getvalue(), file=sys.stderr)
+        print(log.decode("utf-8"), file=sys.stderr)
+        if not stable:
+            print("SOURCE_DRIFT: test/tool files changed during execution", file=sys.stderr)
     return rc
 
 
@@ -909,6 +1066,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--native-audit", action="store_true")
+    parser.add_argument("--s1-negatives", action="store_true")
     parser.add_argument("--audit-child", action="store_true")
     parser.add_argument("--audit-report", type=Path)
     parser.add_argument("--audit-sha256")
@@ -925,6 +1083,15 @@ if __name__ == "__main__":
         raise SystemExit(audit_readback(args))
     if args.out is None:
         parser.error("--out required")
+    if args.s1_negatives:
+        suite = unittest.TestSuite(NativeAuditTests(name) for name in (
+            "test_native_dependencies_require_pinned_same_checkout_validator",
+            "test_native_post_artifacts_complete_actual_source_and_cdp_digest",
+            "test_native_missing_successful_post_rejected",
+            "test_native_logs_ancestor_symlink_rejected_preserves_target",
+            "test_native_png_dimensions_state_and_tile_set_rejected",
+            "test_native_tile_gap_and_injections_rejected"))
+        raise SystemExit(run_suite(suite, args.out, "OPENSIM_RELEASE_GATE_S1_NEGATIVES"))
     classes = [NativeAuditTests] if args.native_audit else [ReleaseGateTests, NativeAuditTests]
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(cls) for cls in classes)
     if args.native_audit:
