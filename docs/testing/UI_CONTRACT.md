@@ -17,6 +17,10 @@
 求解与异步文件读取都核 revision；期间改参数则拒绝结果/文件，保持修改，
 释放控件，明确失败并允许恢复。导航退出后的新页面重新实际求解。
 
+非法导入共用 `badImports()` 与 `rejected(marker, true)`：等待 busy 释放后，
+必须确认错误区域仍为 activeElement、文件选择已清空；失败不得新增求解。
+恢复通过原生 Tab/Enter 触发一次新的真实求解，不用 DOM focus()/click() 代替。
+
 配置摘要按 Python 规范化浮点 JSON 序列化核验，分辨率为整数。
 运行源码顺序沿用 `tools.render_page.SOURCE_PATHS`，不排序替代页面指纹序列。
 
@@ -137,3 +141,22 @@ favicon、主仓、infra、CAD/openopt、凭据、身份或权限；无生产与
 完整 browser 的固定外置边界不同，按用户裁决写 `browser/ui-20261010-unique/`，
 不改工具固定边界。`release_verdict=NOT_CERTIFIED` 保持；未获得真实触屏及
 screen-reader 例外，不代签、不将自动化 PASS 宣称为发布认证。
+
+## 导入焦点专项
+
+`S5-UI-01` 原为确定测试覆盖缺口，不是已复现的产品失焦。新增
+`--import-focus` 复用同一非法导入路径，仅执行初始真求解、坏 JSON 导入、
+两种精准反例及原生键盘恢复，总计两次真求解，不执行完整 UI 矩阵。
+移走焦点的反例使用真实 Tab；文件选择残留反例只替换 rejection API
+的状态读回，明确标为 `REJECTION_API_STATE_DOUBLE`，不冒称真实文件残留。
+两者都必须被同一判据拒绝；不修改产品 JS 或权限、凭据、生产对象。
+
+```bash
+sudo -n -u infra python3 -B tests/test_ui_contract.py --focus-tests --out /hf3fs-jd/data/tmp/opensim-fluid-v1/resume-s5-ui-focus-20261010/NEW
+```
+
+入口复用 workbench 的执行日志、source 前后清单及持久回读，不另造 runner。
+`red-v1` 是外置路径别名传递错误，未执行浏览器业务，原样保留；修路径后
+`red-v2` 的真实 Tab 反例报 `Missing expected rejection`，证明旧判据漏验。
+后续 focused 证据与提交交接均在同根新目录；完整 combo 由主席整合后执行。
+真人触屏、软键盘、桌面/移动读屏仍未验且未获例外，`NOT_CERTIFIED` 不变。

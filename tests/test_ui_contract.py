@@ -28,6 +28,8 @@ from server import ApplicationServer
 from tools.render_page import SOURCE_PATHS
 
 OUT = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-ui")
+FOCUS_OUT = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/resume-s5-ui-focus-20261010")
+FOCUS_DEST = None
 WRITE_SET = ("web/app.js", "web/app.css", "tools/ui_contract_test.mjs",
              "tests/test_ui_contract.py", "docs/testing/UI_CONTRACT.md")
 DELTA_SET = ("tools/ui_contract_test.mjs", "tests/test_ui_contract.py", "docs/testing/UI_CONTRACT.md")
@@ -39,8 +41,8 @@ def sha(data):
 
 def write_report(destination, report):
     destination = Path(destination).resolve()
-    if OUT.resolve() not in destination.parents or destination.exists():
-        raise ValueError("Use a new external seat-ui report")
+    if not any(root.resolve() in destination.parents for root in (OUT, FOCUS_OUT)) or destination.exists():
+        raise ValueError("Use a new external UI report")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("x", encoding="utf-8") as stream:
         stream.write(json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2) + "\n")
@@ -69,6 +71,43 @@ def run_contract(destination, app, *options):
 
 
 class UIContractTests(unittest.TestCase):
+    def test_import_error_focus_and_native_keyboard_recovery(self):
+        destination = FOCUS_DEST or FOCUS_OUT / ("focused-" +
+            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8])
+        app = ApplicationServer(("127.0.0.1", 0))
+        worker = threading.Thread(target=app.serve_forever, daemon=True)
+        worker.start()
+        try:
+            result = run_contract(destination, app, "--import-focus")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            reports = list(destination.glob("run-*/report.json"))
+            self.assertEqual(len(reports), 1)
+            report = json.loads(reports[0].read_text())
+            self.assertEqual((report["verdict"], report["state"], report["exit_code"]), ("PASS", "FINAL", 0))
+            self.assertEqual(report["mode"], "IMPORT_FOCUS_REGRESSION_NOT_FULL_ACCEPTANCE")
+            self.assertEqual(report["actual_solver_calls"], 2)
+            self.assertEqual(report["release_verdict"], "NOT_CERTIFIED")
+            self.assertEqual([row["name"] for row in report["checks"]],
+                             ["actual-320px-FEM", "bad-import-invalid-json"])
+            detail = report["checks"][-1]["detail"]
+            self.assertEqual((detail["rejection"]["busy"], detail["rejection"]["active"],
+                              detail["rejection"]["file"]), ("false", "error", ""))
+            self.assertEqual(detail["focus_negatives"]["lost_focus"], "REAL_NATIVE_TAB")
+            self.assertEqual(detail["focus_negatives"]["retained_file"], "REJECTION_API_STATE_DOUBLE")
+            self.assertFalse(detail["focus_negatives"]["product_mutated"])
+            self.assertEqual((detail["recovery_state"]["phase"], detail["recovery_state"]["busy"],
+                              detail["recovery_state"]["file"]), ("ready", "false", ""))
+            self.assertFalse(detail["recovery_state"]["exportDisabled"])
+            self.assertEqual(report["sources"], {
+                source: sha((ROOT / source).read_bytes()) for source in SOURCE_PATHS})
+            self.assertEqual(sha((reports[0].parent / "evidence.json").read_bytes()), report["evidence_sha256"])
+            self.assertEqual(sha((reports[0].parent / "run.log").read_bytes()), report["run_log_sha256"])
+        finally:
+            app.shutdown()
+            app.server_close()
+            worker.join(5)
+            self.assertFalse(worker.is_alive(), "Owned import-focus server did not stop")
+
     def test_minimal_durable_smoke(self):
         destination = OUT / ("durable-smoke-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                              + "-" + uuid4().hex[:8])
@@ -357,14 +396,81 @@ def verify_browser(filename, destination):
     return 0
 
 
+def focused_tests(destination):
+    """Reuse the workbench launcher/durable receipts; execute only the import-focus test."""
+    from tools import workbench_acceptance as gate
+
+    destination = Path(destination).resolve()
+    gate.need(FOCUS_OUT.resolve() in destination.parents, "Use a new import-focus evidence directory")
+    output = gate.new_output(destination)
+    before = gate.inventory(ROOT)
+    browser_output = FOCUS_OUT / output.relative_to(FOCUS_OUT.resolve()) / "browser"
+    argv = [sys.executable, "-B", str(Path(__file__).resolve()), "--_focus-test",
+            "--out", str(browser_output)]
+    gate.write_json(output / "source-before.json", before)
+    gate.write_json(output / "START.json", {
+        "owner": "S5", "state": "RUNNING", "argv": argv, "started_at": gate.now(),
+        "scope": "IMPORT_FOCUS_ONLY_NO_PRODUCT_CHANGES_NO_FULL_MATRIX"})
+    step = gate.execute(argv, ROOT, output, "import-focus-tests")
+    gate.write_json(output / "execution.json", step)
+    after = gate.inventory(ROOT)
+    gate.write_json(output / "source-after.json", after)
+    text = Path(step["stderr"]["path"]).read_text(encoding="utf-8")
+    match = re.search(r"Ran ([1-9][0-9]*) tests?", text)
+    count = int(match[1]) if match else None
+    passed = step["rc"] == 0 and before == after and count == 1 and "\nOK" in text
+    summary = {
+        "schema_version": 1, "state": "COMPLETE", "verdict": "PASS" if passed else "FAIL",
+        "scope": "IMPORT_FOCUS_ONLY_NOT_FULL_UI_OR_RELEASE", "launcher_rc": step["rc"],
+        "tests_run": count, "source_unchanged": before == after, "execution": step,
+        "release_verdict": "NOT_CERTIFIED", "collected_at": gate.now()}
+    if passed:
+        try:
+            reports = list((output / "browser").glob("run-*/report.json"))
+            gate.need(len(reports) == 1, "Import-focus report inventory differs")
+            value, record = gate.read_report(reports[0], output)
+            execution, receipt = gate.read_report(output / "browser" / "execution.json", output)
+            summary["producer_readback"] = gate.validate_durable_producer(
+                "ui", value, execution["rc"], reports[0].parent)
+            summary["browser_report"] = record
+            summary["browser_execution"] = receipt
+            summary["actual_solver_calls"] = value["actual_solver_calls"]
+            summary["checks_executed"] = len(value["checks"])
+        except Exception as error:
+            passed = False
+            summary["verdict"] = "FAIL"
+            summary["first_cause"] = {
+                "stage": "producer-readback", "message": str(error),
+                "type": type(error).__name__}
+    if not passed:
+        summary["first_cause_log"] = step["stderr"]
+    gate.write_json(output / "summary.json", summary)
+    line = (f"S5_UI_FOCUS verdict={summary['verdict']} launcher_rc={step['rc']} tests_run={count} "
+            f"source_unchanged={before == after} collected_at={summary['collected_at']}")
+    gate.DurableStore().create(output / "progress.log", (line + "\n").encode("ascii"))
+    print(line)
+    print(f"SUMMARY path={output / 'summary.json'}")
+    return 0 if passed else (step["rc"] or 1)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scan", type=Path)
     parser.add_argument("--verify-browser", type=Path)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--focus-tests", action="store_true")
+    parser.add_argument("--_focus-test", action="store_true", help=argparse.SUPPRESS)
     options = parser.parse_args()
+    if options.focus_tests and options.out:
+        sys.exit(focused_tests(options.out))
+    if options._focus_test and options.out:
+        FOCUS_DEST = options.out
+        suite = unittest.defaultTestLoader.loadTestsFromName(
+            "test_import_error_focus_and_native_keyboard_recovery", UIContractTests)
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        sys.exit(0 if result.wasSuccessful() and result.testsRun == 1 and not result.skipped else 1)
     if options.scan:
         sys.exit(scan(options.scan))
     if options.verify_browser and options.out:
         sys.exit(verify_browser(options.verify_browser, options.out))
-    parser.error("Use unittest, --scan FILE, or --verify-browser REPORT --out FILE")
+    parser.error("Use unittest, --focus-tests --out DIR, --scan FILE, or --verify-browser REPORT --out FILE")

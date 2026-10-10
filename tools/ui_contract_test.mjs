@@ -18,6 +18,7 @@ import { inflateSync } from 'node:zlib';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = '/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-ui';
+const FOCUS_OUT = '/hf3fs-jd/data/tmp/opensim-fluid-v1/resume-s5-ui-focus-20261010';
 const CHROME = '/home/mch/.cache/ms-playwright/chromium-1187/chrome-linux/chrome';
 const SOURCES = ['tools/render_page.py', 'web/app.js', 'web/app.css', 'solver.py', 'server.py'];
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -71,7 +72,7 @@ const contrast = (a, b) => (Math.max(luminance(a), luminance(b)) + 0.05) /
 function args(argv) {
   const options = { chrome: CHROME };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--minimal') options.minimal = true;
+    if (['--minimal', '--import-focus'].includes(argv[i])) options[argv[i].slice(2)] = true;
     else {
       requireCheck(['--url', '--out', '--chrome', '--finalize-fault', '--finalize-io'].includes(argv[i]) && argv[i + 1],
         `Invalid argument ${argv[i]}`);
@@ -84,8 +85,12 @@ function args(argv) {
     !url.username && !url.password && url.pathname === '/' && !url.search && !url.hash,
   'Only the owned credential-free loopback root is allowed');
   options.out = path.resolve(options.out);
-  requireCheck(options.out === OUT || options.out.startsWith(OUT + path.sep),
-    'Evidence must stay under seat-ui');
+  const roots = [OUT, ...(options['import-focus'] ? [FOCUS_OUT] : [])];
+  requireCheck(roots.some(root => options.out === root || options.out.startsWith(root + path.sep)),
+    'Evidence must stay under seat-ui or the focused import review root');
+  requireCheck(!options['import-focus'] ||
+    (!options.minimal && !options['finalize-fault'] && !options['finalize-io']),
+  'Import focus cannot be combined with unrelated regressions');
   if (options['finalize-fault']) {
     requireCheck(options.minimal && [
       'log-write', 'log-readback', 'evidence-write', 'evidence-readback',
@@ -334,13 +339,15 @@ class Browser {
     await this.send('DOM.setFileInputFiles', { nodeId, files: [filename] });
     return filename;
   }
-  async rejected(marker) {
+  async rejected(marker, imported = false) {
     return this.wait('Loud rejection and released controls', async () => {
       const state = await this.state();
       if (state.busy !== 'false') return false;
       requireCheck(state.phase === 'failed' && state.statusPhase === 'failed' &&
         state.exportDisabled && state.error && state.locked.every(control => !control.disabled) &&
         !/当前配置求解成功/.test(state.summary), 'False success or locked/old export after rejection', state);
+      if (imported) requireCheck(state.active === 'error' && state.file === '',
+        'Import rejection lost error focus or retained file selection', state);
       requireCheck(this.calls.length >= marker, 'Lost actual solve capture');
       return state;
     });
@@ -432,6 +439,61 @@ function realResult(call, sources) {
     integrated_flow_m3_s: flow, nodes: mesh.nodes_mm.length, elements: mesh.triangles.length };
 }
 
+async function badImports(browser, variants, focusNegatives = false) {
+  for (const variant of variants) {
+    await browser.check(`bad-import-${variant}`, async () => {
+      const sample = structuredClone(browser.calls.at(-1).result);
+      let data = sample;
+      if (variant === 'null') data = null;
+      if (variant === 'empty') data = '';
+      if (variant === 'invalid-json') data = '{';
+      if (variant === 'unknown') data = { ...sample.config, unexpected: 1 };
+      if (variant === 'null-config') sample.config = null;
+      if (variant === 'null-stamp') sample.reproducibility = null;
+      if (variant === 'missing-time') delete sample.reproducibility.computed_at;
+      if (variant === 'null-source') sample.reproducibility.source_sha256 = null;
+      if (variant === 'nonfinite') data = JSON.stringify({ ...sample.config, pressure_pa: 'OVERFLOW' })
+        .replace('"OVERFLOW"', '1e999');
+      if (variant === 'null-field') sample.fields.velocity_m_s[0] = null;
+      const marker = browser.calls.length;
+      await browser.file(data, `bad-${variant}`);
+      const state = await browser.rejected(marker, true);
+      requireCheck(browser.calls.length === marker && state.file === '',
+        'Invalid file triggered solve or remained selected');
+      if (focusNegatives) {
+        requireCheck(state.active === 'error', 'Focus negative lacks a real focused import error', state);
+        // Remove focus using real keyboard traversal, not a scripted product mutation.
+        await browser.key('Tab');
+        const displaced = await browser.state();
+        requireCheck(displaced.active !== 'error' && displaced.file === '' &&
+          displaced.busy === 'false' && displaced.phase === 'failed',
+        'Focus negative did not isolate lost error focus', displaced);
+        await assert.rejects(() => browser.rejected(marker, true), error =>
+          error.message === 'Import rejection lost error focus or retained file selection' &&
+          error.detail.active === displaced.active && error.detail.file === '');
+        await browser.file(data, `bad-${variant}-focus-return`);
+        await browser.rejected(marker, true);
+        // Exercise the same rejection API with only file readback changed.
+        const retained = Object.create(browser);
+        retained.state = async () => ({ ...state, file: 'C:\\fakepath\\bad-import.json' });
+        await assert.rejects(() => retained.rejected(marker, true), error =>
+          error.message === 'Import rejection lost error focus or retained file selection' &&
+          error.detail.active === 'error' && error.detail.file !== '');
+        requireCheck(browser.calls.length === marker, 'Focus negatives unexpectedly triggered a solve');
+      }
+      const recovery = await browser.solve();
+      requireCheck(browser.calls.length === marker + 1, 'Import recovery did not perform one new actual solve');
+      realResult(recovery, browser.report.sources);
+      return { no_http_solve: true, rejection: state, recovery: recovery.artifact,
+        recovery_state: await browser.state(),
+        focus_negatives: focusNegatives ? {
+          lost_focus: 'REAL_NATIVE_TAB', retained_file: 'REJECTION_API_STATE_DOUBLE',
+          product_mutated: false, no_additional_http: true,
+        } : null };
+    });
+  }
+}
+
 async function exercise(browser, report, options) {
   await browser.send('Emulation.setDeviceMetricsOverride', {
     width: 320, height: 568, deviceScaleFactor: 1, mobile: false,
@@ -442,6 +504,10 @@ async function exercise(browser, report, options) {
     await browser.screenshot('initial-320');
     return { ...baseline, state: await browser.state() };
   });
+  if (options['import-focus']) {
+    await badImports(browser, ['invalid-json'], true);
+    return;
+  }
   const defects = [
     ['missing-provenance', result => { delete result.reproducibility; }],
   ];
@@ -527,31 +593,8 @@ async function exercise(browser, report, options) {
         exported: await browser.exportCurrent(fresh.result) };
     });
   }
-  for (const variant of ['null', 'empty', 'invalid-json', 'unknown', 'null-config', 'null-stamp',
-    'missing-time', 'null-source', 'nonfinite', 'null-field']) {
-    await browser.check(`bad-import-${variant}`, async () => {
-      const sample = structuredClone(browser.calls.at(-1).result);
-      let data = sample;
-      if (variant === 'null') data = null;
-      if (variant === 'empty') data = '';
-      if (variant === 'invalid-json') data = '{';
-      if (variant === 'unknown') data = { ...sample.config, unexpected: 1 };
-      if (variant === 'null-config') sample.config = null;
-      if (variant === 'null-stamp') sample.reproducibility = null;
-      if (variant === 'missing-time') delete sample.reproducibility.computed_at;
-      if (variant === 'null-source') sample.reproducibility.source_sha256 = null;
-      if (variant === 'nonfinite') data = JSON.stringify({ ...sample.config, pressure_pa: 'OVERFLOW' })
-        .replace('"OVERFLOW"', '1e999');
-      if (variant === 'null-field') sample.fields.velocity_m_s[0] = null;
-      const marker = browser.calls.length;
-      await browser.file(data, `bad-${variant}`);
-      await browser.rejected(marker);
-      requireCheck(browser.calls.length === marker && (await browser.state()).file === '',
-        'Invalid file triggered solve or remained selected');
-      await browser.solve();
-      return { no_http_solve: true, recovery: browser.calls.at(-1).artifact };
-    });
-  }
+  await badImports(browser, ['null', 'empty', 'invalid-json', 'unknown', 'null-config', 'null-stamp',
+    'missing-time', 'null-source', 'nonfinite', 'null-field']);
   await browser.check('busy-reentrant-import-reset-export', async () => {
     const marker = browser.calls.length, downloads = browser.downloads.length;
     browser.injection = { name: 'held-real-solve', hold: true };
@@ -1047,7 +1090,8 @@ async function main() {
     for (const source of SOURCES) report.sources[source] = sha(await fs.readFile(path.join(ROOT, source)));
     report.tool_sha256 = sha(await fs.readFile(fileURLToPath(import.meta.url)));
     report.target_url = options.url;
-    report.mode = options.minimal ? 'MINIMAL_REGRESSION_NOT_FULL_ACCEPTANCE' : report.mode;
+    report.mode = options['import-focus'] ? 'IMPORT_FOCUS_REGRESSION_NOT_FULL_ACCEPTANCE' :
+      options.minimal ? 'MINIMAL_REGRESSION_NOT_FULL_ACCEPTANCE' : report.mode;
     browser = new Browser(options, run, report);
     await browser.launch();
     await exercise(browser, report, options);
