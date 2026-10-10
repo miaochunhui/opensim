@@ -1,0 +1,9 @@
+# UNINSTALLED TEMPLATE. Never watches Git commits or arbitrary tree changes.
+[Unit]
+Description=OpenSim explicit desired-release request only
+
+[Path]
+PathChanged=/var/lib/opensim-sync/desired-release.json
+Unit=opensim-sync.service
+
+# No Install section: this template is not an enabled publication mechanism.

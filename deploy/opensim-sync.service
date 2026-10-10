@@ -1,0 +1,19 @@
+# UNINSTALLED TEMPLATE. Installation and root controller authorization are absent.
+[Unit]
+Description=OpenSim explicit desired-release validation (never deployment)
+After=network.target
+
+[Service]
+Type=oneshot
+User=infra
+Group=infra
+WorkingDirectory=/opt/opensim-sync
+# A reviewed non-root entry must pin request bytes; no writable checkout/root broker.
+ExecStart=/usr/bin/python3 -I -B /opt/opensim-sync/tools/sync_release.py --desired /var/lib/opensim-sync/desired-release.json --desired-sha256 ${DESIRED_RELEASE_SHA256} --out /hf3fs-jd/data/tmp/opensim-fluid-v1/seat-sync/service-result.json
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-sync
+RestrictAddressFamilies=AF_UNIX
+UMask=0027
