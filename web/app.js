@@ -662,6 +662,40 @@
     });
     return control;
   }
+  function setupEvidenceCopy() {
+    const button = ui.convergence.querySelector("#copy-evidence-button");
+    if (!button) return;
+    const code = ui.convergence.querySelector("#evidence-preview > code");
+    const status = ui.convergence.querySelector("#copy-evidence-status");
+    if (!code || !status) throw new CaseError("数值报告复制控件不完整，交互未启动。");
+    let copying = false;
+    button.addEventListener("click", async () => {
+      if (copying) return;
+      copying = true;
+      button.setAttribute("aria-disabled", "true");
+      status.dataset.state = "copying";
+      status.textContent = "正在复制数值报告预览。";
+      try {
+        const text = code.textContent;
+        if (!text) throw new CaseError("数值报告预览为空，未复制。");
+        if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+          throw new CaseError("浏览器不支持安全剪贴板，请在代码块内手动选择并复制。");
+        }
+        await navigator.clipboard.writeText(text);
+        status.dataset.state = "copied";
+        status.textContent = "已复制数值报告预览；缩进和换行保持原样，完整报告请查看来源文件。";
+      } catch (error) {
+        console.error("OpenSim evidence copy failed:", error);
+        status.dataset.state = "failed";
+        status.textContent = error instanceof CaseError
+          ? `复制失败：${error.message}`
+          : "复制失败：浏览器拒绝或无法写入剪贴板。请检查权限后重试，或在代码块内手动选择并复制。";
+      } finally {
+        copying = false;
+        button.setAttribute("aria-disabled", "false");
+      }
+    });
+  }
   function requireNode(id) {
     const element = document.getElementById(id);
     if (!element) throw new CaseError(`页面缺少必需控件 #${id}，交互未启动。`);
@@ -715,6 +749,7 @@
       ui.importInput.addEventListener("change", () => { void importCase(); });
       // Independent evidence belongs to the generated page, not to a single solve.
       if (!ui.convergence.textContent.trim()) ui.convergence.textContent = "未采集";
+      setupEvidenceCopy();
       if (typeof ResizeObserver !== "function") throw new CaseError("浏览器不支持画布尺寸观察，请使用现代浏览器。");
       observer = new ResizeObserver(redraw);
       observer.observe(ui.canvas);

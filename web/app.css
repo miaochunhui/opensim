@@ -318,6 +318,8 @@ legend { max-inline-size: 100%; margin-block-end: var(--space-3); padding: 0; fo
 #error { border-color: var(--danger); color: var(--danger); background: var(--danger-soft); }
 /* Collapse only empty live regions, never a runtime failure. */
 #status:empty, #error:empty { padding: 0; border: 0; }
+.evidence-copy-status { margin-block: var(--space-3); }
+.evidence-copy-status[data-state="failed"] { color: var(--danger); font-weight: 600; }
 
 .canvas-panel {
   min-inline-size: 0;

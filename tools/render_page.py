@@ -232,7 +232,11 @@ def _evidence_html(evidence: Path | None) -> str:
           <details class="evidence-report">
             <summary>查看数值报告预览</summary>
             <p>各集合最多展示三项，长文本和深层数据仅作预览；完整证据以来源文件为准。</p>
-            <pre tabindex="0" aria-label="独立数值报告预览"><code>{preview}</code></pre>
+            <button type="button" id="copy-evidence-button" class="secondary-button"
+                    aria-controls="evidence-preview" aria-describedby="copy-evidence-status">复制数值报告预览</button>
+            <p id="copy-evidence-status" class="evidence-copy-status" role="status" aria-live="polite"
+               aria-atomic="true" data-state="idle">复制保留缩进和换行；完整报告请查看来源文件。</p>
+            <pre id="evidence-preview" tabindex="0" aria-label="独立数值报告预览"><code>{preview}</code></pre>
           </details>"""
 
 
