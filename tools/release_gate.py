@@ -120,16 +120,155 @@ def read_file(path: Path) -> bytes:
     return body
 
 
-def write_new(path: Path, body: bytes) -> None:
+def write_new(path: Path, body: bytes, *, owned: dict | None = None) -> None:
     external(path, OUTPUT_ROOT)
     require(bool(body), "Empty output rejected")
     path.parent.mkdir(parents=True, exist_ok=True)
     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                            0o644), "wb") as stream:
+        if owned is not None:
+            info = os.fstat(stream.fileno())
+            owned[path] = (info.st_dev, info.st_ino)
         stream.write(body)
         stream.flush()
         os.fsync(stream.fileno())
     require(read_file(path) == body, f"Output readback differs: {path}")
+    sync_directory(path.parent)
+
+
+def sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def new_result_paths(out: Path) -> None:
+    external(out, OUTPUT_ROOT)
+    require(out.suffix == ".json", "Result output must have .json suffix")
+    for path in (out, out.with_suffix(".log")):
+        require(not os.path.lexists(path), f"Existing output protected: {path}")
+
+
+def revoke_exact(path: Path, body: bytes, owned: dict) -> None:
+    """Revoke only this invocation's exact bytes and inode, never old output."""
+    require(path in owned, f"No ownership claim for evidence revocation: {path}")
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+                (info.st_dev, info.st_ino) == owned[path] and
+                stream.read(LIMIT + 1) == body, f"Exact evidence revocation drift: {path}")
+        current = path.lstat()
+        require((current.st_dev, current.st_ino) == owned[path] and current.st_nlink == 1,
+                f"Evidence replaced before revocation: {path}")
+        path.unlink()
+    sync_directory(path.parent)
+
+
+def finalize_result(report: dict, out: Path, *, status_key: str,
+                    failed_status: str, label: str) -> int:
+    """Action results are provisional until log/report readback and process rc."""
+    from uuid import uuid4
+
+    new_result_paths(out)
+    original = dict(report)
+    report = dict(report, invocation_id=uuid4().hex,
+                  finalization="FINAL_PROCESS_RC_REQUIRED")
+    owned: dict = {}
+    log = out.with_suffix(".log")
+    log_body = (
+        f"{label} action={report[status_key]} action_rc={report['exit_code']} "
+        f"finalization=PROVISIONAL invocation_id={report['invocation_id']}\n" +
+        original.get("failure", {}).get("reason", "") + "\n"
+    ).encode("utf-8")
+    attempted_body = None
+    failed_path = log
+    try:
+        write_new(log, log_body, owned=owned)
+        report["execution_log"] = {"path": str(log), "sha256": sha(log_body)}
+        failed_path = out
+        attempted_body = encode(report)
+        write_new(out, attempted_body, owned=owned)
+        require(read_file(log) == log_body and read_file(out) == attempted_body,
+                "Final result/log drift before process completion")
+        print(f"{label} {status_key}={report[status_key]} rc={report['exit_code']} "
+              f"finalization=FINAL_PROCESS_RC_REQUIRED invocation_id={report['invocation_id']} "
+              f"report_sha256={sha(attempted_body)} collected_at={report['collected_at']} report={out}",
+              flush=True)
+    except Exception as exc:
+        evidence_failure = {"type": type(exc).__name__, "reason": str(exc),
+                            "errno": getattr(exc, "errno", None), "path": str(failed_path)}
+        report.update({status_key: failed_status, "exit_code": 1, "finalization": "FAILED",
+                       "action_result": original, "evidence_failure": evidence_failure})
+        if not original.get("failure"):
+            report["failure"] = evidence_failure
+        if "release_verdict" in report:
+            report["release_verdict"] = "NOT_CERTIFIED"
+        # A post-write fsync/readback failure can leave a complete success JSON.
+        # An O_EXCL failure never establishes ownership, even for identical bytes.
+        if out in owned and attempted_body is not None:
+            try:
+                revoke_exact(out, attempted_body, owned)
+            except Exception as recovery:
+                print(f"Exact evidence revocation failed: {recovery}; "
+                      "reject all artifacts from this failed process", file=sys.stderr)
+        if not os.path.lexists(out):
+            try:
+                write_new(out, encode(report), owned=owned)
+            except Exception as recovery:
+                print(f"Failure report persistence failed: {recovery}", file=sys.stderr)
+        print(f"Evidence cause: {exc}", file=sys.stderr)
+        if report.get("failure"):
+            print("First cause: " + report["failure"]["reason"], file=sys.stderr)
+        try:
+            print(f"{label} {status_key}={failed_status} rc=1 finalization=FAILED "
+                  f"invocation_id={report['invocation_id']} report={out}", flush=True)
+        except Exception as recovery:
+            print(f"Failure marker output failed: {recovery}", file=sys.stderr)
+        return 1
+    if report.get("failure"):
+        print("First cause: " + report["failure"]["reason"], file=sys.stderr)
+    return report["exit_code"]
+
+
+def verify_process_result(observation: dict, label: str,
+                          process: subprocess.CompletedProcess) -> dict:
+    """Bind launcher-observed rc to final bytes; this is never user approval."""
+    require(set(observation) == {"schema", "argv", "rc", "report", "stdout", "stderr"} and
+            observation["schema"] == "opensim-process-observation-v1" and
+            type(observation["rc"]) is int, "Missing actual process observation")
+    require(isinstance(observation["argv"], list) and observation["argv"] and
+            all(isinstance(item, str) for item in observation["argv"]),
+            "Missing actual process argv")
+    require(isinstance(process, subprocess.CompletedProcess) and
+            observation["argv"] == process.args and observation["rc"] == process.returncode,
+            "Actual launcher argv/rc differs from observation")
+    report, _ = reference(observation["report"])
+    stdout, _ = artifact(observation["stdout"])
+    log_artifact(observation["stderr"])
+    actual_stdout = process.stdout.encode("utf-8") if isinstance(process.stdout, str) else process.stdout
+    actual_stderr = process.stderr.encode("utf-8") if isinstance(process.stderr, str) else process.stderr
+    require(isinstance(actual_stdout, bytes) and isinstance(actual_stderr, bytes) and
+            stdout == actual_stdout and sha(actual_stderr) == observation["stderr"]["sha256"],
+            "Actual launcher stdout/stderr differs from artifacts")
+    require(type(report.get("exit_code")) is int and
+            report["exit_code"] == observation["rc"] == 0 and
+            report.get("finalization") == "FINAL_PROCESS_RC_REQUIRED",
+            "Process rc/final report disagreement or unsuccessful finalization")
+    identifier = report.get("invocation_id")
+    require(isinstance(identifier, str) and re.fullmatch(r"[a-f0-9]{32}", identifier),
+            "Missing invocation identity")
+    log_body, _ = artifact(report.get("execution_log"))
+    require(f"invocation_id={identifier}".encode() in log_body and
+            b"finalization=PROVISIONAL" in log_body, "Result/log invocation drift")
+    lines = stdout.decode("utf-8").splitlines()
+    require(any(line.startswith(label + " ") and "rc=0 " in line and
+                f"invocation_id={identifier} " in line and
+                f"report_sha256={observation['report']['sha256']} " in line and
+                "finalization=FINAL_PROCESS_RC_REQUIRED " in line for line in lines),
+            "Missing exact process final marker/report hash")
+    return report
 
 
 def git(root: Path, *args: str) -> bytes:
@@ -708,6 +847,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--approval-sha256")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
+    try:
+        new_result_paths(args.out)
+    except Exception as exc:
+        print(f"Output admission refused: {exc}", file=sys.stderr)
+        return 1
     report = {"schema": "opensim-release-gate-v1", "verdict": "BLOCKED",
               "release_verdict": "NOT_CERTIFIED", "production_changes": False,
               "collected_at": datetime.now(timezone.utc).isoformat()}
@@ -722,20 +866,12 @@ def main(argv: list[str] | None = None) -> int:
         report["failure"] = {"type": type(exc).__name__, "reason": str(exc)}
     rc = 0 if report["verdict"] == "PASS" else 1
     report["exit_code"] = rc
-    line = (f"OPENSIM_RELEASE_GATE verdict={report['verdict']} "
-            f"certification={report['release_verdict']} rc={rc} "
-            f"collected_at={report['collected_at']} report={args.out}")
     try:
-        write_new(args.out, encode(report))
-        write_new(args.out.with_suffix(".log"),
-                  (line + "\n" + report.get("failure", {}).get("reason", "") + "\n").encode())
+        return finalize_result(report, args.out, status_key="verdict",
+                               failed_status="BLOCKED", label="OPENSIM_RELEASE_GATE")
     except Exception as exc:
-        print(f"Evidence write failure: {exc}; first verdict={line}", file=sys.stderr)
+        print(f"Finalization refused: {exc}; first result={report}", file=sys.stderr)
         return 1
-    print(line)
-    if "failure" in report:
-        print("First cause: " + report["failure"]["reason"], file=sys.stderr)
-    return rc
 
 
 if __name__ == "__main__":

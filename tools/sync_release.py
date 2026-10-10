@@ -22,6 +22,7 @@ import release_gate as gate
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLLER = Path("/usr/local/libexec/opensim-release-app.py")
+PREPARE_ROOT = gate.ARTIFACT_ROOT / "seat-release"
 REQUEST_FIELDS = {"schema", "request_id", "action", "commit", "ledger", "gate_receipt",
                   "approval_pin", "bundle", "manifest_sha256", "source_epoch",
                   "release", "before_receipt"}
@@ -131,7 +132,7 @@ def plan(root: Path, desired_path: Path, desired_sha: str, api_path: Path | None
     gate.fresh(receipt, datetime.now(timezone.utc), 600)
     api = load_api(api_path or root / "tools/release_app.py",
                    verified["identity"]["tool_sha256"]["tools/release_app.py"])
-    bundle = gate.external(Path(desired["bundle"]))
+    bundle = prepare_output_guard(api, Path(desired["bundle"]))
     manifest = api.validate_bundle(bundle.resolve(), desired["manifest_sha256"], desired["commit"])
     match_manifest(manifest, desired, verified["identity"])
     epoch = int(gate.git(root, "show", "-s", "--format=%ct", desired["commit"]).strip())
@@ -163,15 +164,19 @@ def apply_guard() -> None:
     raise Refused("Root controller authorization/protocol not accepted; no broker or sudo dispatch")
 
 
-def prepare_output_guard(api, bundle: Path) -> None:
-    gate.external(bundle, gate.OUTPUT_ROOT)
-    gate.require(api.ARTIFACTS.resolve() == gate.OUTPUT_ROOT.resolve(),
-                 "REFUSED: prepare API output root conflicts with authorized seat-sync root")
+def prepare_output_guard(api, bundle: Path) -> Path:
+    """Only bundles use the explicitly authorized, fixed peer artifact root."""
+    gate.require(isinstance(api.ARTIFACTS, Path) and api.ARTIFACTS == PREPARE_ROOT,
+                 "REFUSED: prepare API output root differs from fixed allowed seat-release root")
+    gate.external(bundle, PREPARE_ROOT)
+    resolved = api.external(bundle)
+    gate.require(resolved == bundle.resolve(), "Prepare API physical output root drift")
+    return resolved
 
 
 def prepare_guard(root: Path, commit: str, ledger_path: Path, bundle: Path,
                   approval_pin: dict | None = None, api_path: Path | None = None) -> dict:
-    """Gate first; reject an API whose output root conflicts with this seat."""
+    """Gate first; peer bundle root is separate from seat-sync result output."""
     result = gate.evaluate(root, commit, ledger_path, approval_pin)
     api = load_api(api_path or root / "tools/release_app.py",
                    result["identity"]["tool_sha256"]["tools/release_app.py"])
@@ -186,8 +191,10 @@ def prepare_guard(root: Path, commit: str, ledger_path: Path, bundle: Path,
                  prepared["commit"] == commit and prepared["page_build"] == result["identity"]["page_build"],
                  "Prepare receipt does not match precise release API")
     manifest = api.validate_bundle(Path(prepared["bundle"]), prepared["manifest_sha256"], commit)
-    gate.require(manifest["source_sha256"] == result["identity"]["source_sha256"],
-                 "Prepared sources differ from gate")
+    epoch = int(gate.git(root, "show", "-s", "--format=%ct", commit).strip())
+    match_manifest(manifest, {"commit": commit, "source_epoch": epoch}, result["identity"])
+    gate.require(gate.identity(root, commit) == result["identity"],
+                 "Sources changed during gated prepare")
     return prepared
 
 
@@ -200,6 +207,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
+    try:
+        gate.new_result_paths(args.out)
+    except Exception as exc:
+        print(f"Output admission refused: {exc}", file=sys.stderr)
+        return 1
     report = {"schema": "opensim-sync-result-v1", "state": "REFUSED",
               "scope": "NOT_DEPLOYED", "production_changes": False,
               "collected_at": datetime.now(timezone.utc).isoformat()}
@@ -213,19 +225,12 @@ def main(argv: list[str] | None = None) -> int:
         report["failure"] = {"type": type(exc).__name__, "reason": str(exc)}
     rc = 0 if report["state"] == "FIXED_RELEASE_PLAN" else 1
     report["exit_code"] = rc
-    line = (f"OPENSIM_SYNC_RELEASE state={report['state']} rc={rc} "
-            f"production_changes=false collected_at={report['collected_at']} report={args.out}")
     try:
-        gate.write_new(args.out, gate.encode(report))
-        gate.write_new(args.out.with_suffix(".log"),
-                       (line + "\n" + report.get("failure", {}).get("reason", "") + "\n").encode())
+        return gate.finalize_result(report, args.out, status_key="state",
+                                    failed_status="REFUSED", label="OPENSIM_SYNC_RELEASE")
     except Exception as exc:
-        print(f"Sync evidence write failure: {exc}; first result={line}", file=sys.stderr)
+        print(f"Sync finalization refused: {exc}; first result={report}", file=sys.stderr)
         return 1
-    print(line)
-    if "failure" in report:
-        print("First cause: " + report["failure"]["reason"], file=sys.stderr)
-    return rc
 
 
 if __name__ == "__main__":

@@ -10,8 +10,11 @@
 `sync_release.py --apply` 当前返回 `REFUSED`，不调用 root、sudo、
 systemctl、DNS、证书或 edge 工具。controller 的文件存在也不代表授权。
 
-本席七件独占文件之外不写盘。所有新夹具、报告、日志都在
+代码只写本席七件独占文件。新夹具、gate/sync 报告、日志都在
 `/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-sync/`，旧失败保留。
+按用户明确授权，真实 prepare bundle 独立写固定
+`/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-release/sync-prepare-<id>/bundle`；
+不改 peer API、ARTIFACTS、现有 bundle 或其它席资产。
 两个 `opensim-sync.service/.path` 仅为**未安装草案**，没有 enabled
 发布链、postcommit hook、全树同步器或宽权限 broker。
 固定输出名和缺失的 request-hash 注入入口亦未运营化；不能直接安装草案。
@@ -116,9 +119,12 @@ payload 只有 `source/...`、numerics、build HTML/page-check；
 
 本席调用前核 API 文件 hash、函数签名、SOURCES/EXPORTS/PAYLOAD/
 CONTROLLER；不用旧 bytecode、不以未核 API 代替 gate。
-第1席 prepare 当前限 `seat-release`，本席限 `seat-sync`：
-准备输出冲突时明确 REFUSED，**不篡改 ARTIFACTS 或换假目标**。
-接口未改且可信完整门未开时，不声称 gate→prepare 链已完成。
+第1席 prepare bundle 固定 `seat-release`，gate/sync 报告固定 `seat-sync`。
+调用前先核 API 的实际 ARTIFACTS 精确等于固定 allowed root，再核 bundle
+路径及物理落点；错误 `seat-sync` bundle、宽根或未知 API root 均拒绝，
+**不篡改 ARTIFACTS 或换假目标**。
+真实离线 prepare/validate_bundle 成功只证明 SOURCE_AND_NUMERICS_ONLY，
+可信完整门未开时，不声称 gate→prepare 发布链已完成。
 测试只读其真实固定夹具 bundle，核完整 manifest/文件 hash 和错误 pin。
 
 desired request schema 为 `opensim-desired-release-v1`，精确字段：
@@ -138,6 +144,38 @@ gate receipt 不能仅自称 CERTIFIED，必须重新运行同版严格门。
 另行开发，不能靠“工具已提交”认定上线。
 
 ## 可复跑测试
+
+### 结果落盘终态
+
+两个 CLI 在动作前拒绝已有 `.json` 或配对 `.log` 输出，不覆盖旧证据。
+日志先标 `PROVISIONAL`；报告包含 invocation ID、日志 path/hash 和
+`FINAL_PROCESS_RC_REQUIRED`，它仍须与 launcher 实际进程 rc、
+stdout 最终 marker/report hash 一致才可接纳。
+`verify_process_result()` 强制接收 launcher 的实际 `CompletedProcess`，
+逐项比对 argv、rc、stdout/stderr bytes 和外置 hash，
+只核进程和产物绑定，**不验证用户身份或批准**。
+可编辑 observation JSON 也不能自证进程来源，调用者须保留实际
+`subprocess.run()` 返回值及原始日志，不能靠文件中的 rc 字面量放行。
+
+日志/实际 stdout ENOSPC、报告写完后的 fsync/readback/输出失败均返回 1；
+失败报告保留 `action_result`、原 `failure` 和独立 `evidence_failure`。
+撤销仅针对本次 O_EXCL 创建、相同 dev/inode、逐字节仍一致的候选报告；
+外部替换或原有同字节报告不撤销、不覆盖。撤销失败明确报错，
+失败进程的任何文件不得单独作为成功证据。日志永久 provisional，
+不制造“落盘写成功等于进程/发布成功”的另一套终态。
+失败时先向 stderr 输出证据故障及原首因；stdout 再次故障也明确报出，
+不让失败 marker 写入失败吞掉原首因。
+
+旧目录冲突拒绝证据保留。用户明确允许真实 API 的固定 `seat-release`
+bundle 后，离线集成从真实主仓提交的外置干净 Git 快照导出，分别调用当前主仓和
+peer 的 pinned prepare，回读 validate_bundle、manifest/source_epoch、
+五源 byte build、edited_at、数值 bytes、实际 render 子进程 rc，
+并核调用前后 source/API 不变。launcher rc/原始 stdout/stderr、最终
+报告与日志 hash 都在 `seat-sync`。这不是假接口，也不改 peer 常量；
+实际操作仍无安装、权限授权、服务运行或生产发布。
+主仓既有 ignored bytecode 也受 strict clean 门约束，不删除他人缓存、
+不放宽门；快照以本地 Git clone 保留同一真实 commit，无网络下载，
+并核原树 ignored 状态和所有导出源码前后不变。
 
 每次使用新的输出目录，不覆盖历史：
 
