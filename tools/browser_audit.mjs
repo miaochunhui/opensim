@@ -55,6 +55,162 @@ export async function outputDirectory(value) {
   return run;
 }
 
+function ioFailure(error, stage, target) {
+  return { rule: "AUDIT-EVIDENCE", message: error.message, stack: error.stack,
+    code: error.code ?? null, syscall: error.syscall ?? null,
+    path: error.path ?? target, stage };
+}
+
+// Exclusive files plus file/directory fsync; never overwrite existing evidence.
+async function durableFile(target, bytes, owned, step) {
+  let handle;
+  try {
+    step.stage = "open"; step.path = target;
+    handle = await fs.open(target, fs.constants.O_WRONLY | fs.constants.O_CREAT |
+      fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    owned.set(target, { stat: await handle.stat(), bytes });
+    step.stage = "write";
+    await handle.writeFile(bytes);
+    step.stage = "file-fsync";
+    await handle.sync();
+  } finally { if (handle) await handle.close(); }
+  step.stage = "readback";
+  assert.equal(await fs.readFile(target, "utf8"), bytes, `Evidence readback drift: ${target}`);
+}
+
+async function syncDirectory(target, step) {
+  step.stage = "directory-fsync"; step.path = target;
+  const handle = await fs.open(target, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  try { await handle.sync(); } finally { await handle.close(); }
+}
+
+export async function revokeExact(target, owned) {
+  const entry = owned.get(target);
+  if (!entry) return { path: target, status: "NOT_CREATED" };
+  const same = actual => actual.isFile() && actual.dev === entry.stat.dev &&
+    actual.ino === entry.stat.ino && actual.birthtimeMs === entry.stat.birthtimeMs;
+  let actual;
+  try { actual = await fs.lstat(target); }
+  catch (error) { if (error.code === "ENOENT") return { path: target, status: "ALREADY_ABSENT" }; throw error; }
+  if (!same(actual)) {
+    return { path: target, status: "IDENTITY_CHANGED_NOT_REMOVED" };
+  }
+  const expected = Buffer.from(entry.bytes), maximum = 8 * 1024 * 1024;
+  if (expected.length > maximum) return { path: target, status: "READ_BOUND_EXCEEDED_NOT_REMOVED" };
+  let handle;
+  try {
+    handle = await fs.open(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const before = await handle.stat();
+    if (!same(before)) return { path: target, status: "IDENTITY_CHANGED_NOT_REMOVED" };
+    if (before.size !== expected.length) return { path: target, status: "BYTES_CHANGED_NOT_REMOVED" };
+    const bytes = Buffer.alloc(expected.length + 1);
+    let count = 0;
+    while (count < bytes.length) {
+      const read = await handle.read(bytes, count, bytes.length - count, count);
+      if (!read.bytesRead) break;
+      count += read.bytesRead;
+    }
+    const after = await handle.stat(), named = await fs.lstat(target);
+    if (!same(after) || !same(named)) return { path: target, status: "IDENTITY_CHANGED_NOT_REMOVED" };
+    if (count !== expected.length || !bytes.subarray(0, count).equals(expected) ||
+        before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs ||
+        after.size !== named.size || after.mtimeMs !== named.mtimeMs || after.ctimeMs !== named.ctimeMs) {
+      return { path: target, status: "BYTES_CHANGED_NOT_REMOVED" };
+    }
+    // No POSIX compare-and-unlink primitive: this is not hostile-writer isolation.
+    // The uniquely owned run directory plus bounded descriptor read guards known drift.
+    await fs.unlink(target);
+  } finally { if (handle) await handle.close(); }
+  return { path: target, status: "EXACT_OWNED_FILE_REMOVED", dev: actual.dev, ino: actual.ino };
+}
+
+export async function finalizeReport(run, report, rc, fixture = null) {
+  const step = {}, owned = new Map(), finalPath = path.join(run, "report.json");
+  const receiptPath = path.join(run, "completion.json"), logPath = path.join(run, "logs", "audit.log");
+  const protocol = "durable-final-v2";
+  try {
+    const provisional = { ...report, verdict: "PROVISIONAL_NOT_ACCEPTED", exit_code: 2,
+      completion: { protocol, status: "PROVISIONAL", candidate_exit_code: rc } };
+    await durableFile(path.join(run, "report.provisional.json"), json(provisional), owned, step);
+    await syncDirectory(run, step);
+    const line = `AUDIT candidate_verdict=${report.verdict} candidate_rc=${rc} report=${finalPath}`;
+    // Fixture faults change real filesystem objects, not fs methods or exceptions.
+    if (fixture === "log-directory") await fs.mkdir(logPath);
+    if (fixture === "log-enospc") {
+      const full = await fs.open("/dev/full", "w");
+      step.stage = "fixture-real-log-write"; step.path = "/dev/full";
+      try { await full.writeFile(line); } finally { await full.close(); }
+    }
+    if (fixture === "log-fsync") {
+      const full = await fs.open("/dev/full", "r");
+      step.stage = "fixture-real-log-fsync"; step.path = "/dev/full";
+      try { await full.sync(); } finally { await full.close(); }
+    }
+    await durableFile(logPath, line + "\n", owned, step);
+    await syncDirectory(path.dirname(logPath), step);
+    report.exit_code = rc;
+    report.completion = { protocol, status: "FINAL", receipt: "completion.json",
+      log: "logs/audit.log", log_sha256: hash(line + "\n") };
+    const finalBytes = json(report), candidatePath = path.join(run, "report.candidate.json");
+    await durableFile(candidatePath, finalBytes, owned, step);
+    step.stage = "publish-final"; step.path = finalPath;
+    await fs.link(candidatePath, finalPath);
+    owned.set(finalPath, owned.get(candidatePath));
+    if (fixture === "post-publish-fsync") {
+      const full = await fs.open("/dev/full", "r");
+      step.stage = "post-publish-fsync"; step.path = "/dev/full";
+      try { await full.sync(); } finally { await full.close(); }
+    }
+    if (fixture === "post-publish-replaced") {
+      await fs.unlink(finalPath);
+      await fs.mkdir(finalPath);
+      await fs.writeFile(path.join(finalPath, "unrelated.txt"), "preserve unrelated bytes\n", { flag: "wx" });
+    }
+    if (fixture === "post-publish-same-inode") {
+      const before = await fs.lstat(finalPath);
+      const changed = finalBytes.replace(/"exit_code": 0/, "\"exit_code\": 9");
+      assert.notEqual(changed, finalBytes, "Same-inode fixture requires successful candidate");
+      await fs.writeFile(finalPath, changed);
+      const after = await fs.lstat(finalPath);
+      assert.equal(before.ino, after.ino, "Fixture must actually preserve inode");
+      assert.equal(before.size, after.size, "Fixture must change bytes without changing length");
+      report.same_inode_fixture = { before_ino: before.ino, after_ino: after.ino,
+        changed_sha256: hash(changed), bytes: after.size };
+    }
+    await syncDirectory(run, step);
+    step.stage = "final-readback"; step.path = finalPath;
+    assert.equal(await fs.readFile(finalPath, "utf8"), finalBytes, "Final report drift");
+    const receipt = { protocol, status: "COMPLETE", exit_code: rc,
+      report: "report.json", report_sha256: hash(finalBytes), log_sha256: hash(line + "\n") };
+    await durableFile(receiptPath, json(receipt), owned, step);
+    await syncDirectory(run, step);
+    step.stage = "receipt-readback"; step.path = receiptPath;
+    assert.deepEqual(JSON.parse(await fs.readFile(receiptPath, "utf8")), receipt);
+    return { rc, report: finalPath, line: `AUDIT verdict=${report.verdict} rc=${rc} report=${finalPath}` };
+  } catch (error) {
+    const failure = ioFailure(error, step.stage, step.path);
+    report.first_failure ??= failure;
+    report.finalization_failure = failure;
+    report.verdict = "FAIL"; report.exit_code = 2;
+    report.completion = { protocol, status: "FAILED", revocations: [], secondary_failures: [] };
+    for (const target of [receiptPath, finalPath]) {
+      try { report.completion.revocations.push(await revokeExact(target, owned)); }
+      catch (secondary) { report.completion.secondary_failures.push(ioFailure(secondary, "exact-revocation", target)); }
+    }
+    const failurePath = path.join(run, "report.failure.json");
+    try {
+      await syncDirectory(run, step);
+      await durableFile(failurePath, json(report), new Map(), step);
+      await syncDirectory(run, step);
+    } catch (secondary) {
+      report.completion.secondary_failures.push(ioFailure(secondary, step.stage, step.path));
+      console.error(`AUDIT FAILURE_REPORT_UNAVAILABLE ${json(report)}`);
+    }
+    console.error(`AUDIT FAIL stage=${failure.stage} code=${failure.code} path=${failure.path} ${failure.message}`);
+    return { rc: 2, report: failurePath, line: `AUDIT verdict=FAIL rc=2 report=${failurePath}` };
+  }
+}
+
 class CDP extends EventEmitter {
   constructor(socket) {
     super();
@@ -559,7 +715,7 @@ export function inspectDOM(focusedOnly = false) {
   const native = 'a[href],button,input:not([type="hidden"]),select,textarea,summary';
   const controls = Array.from(document.querySelectorAll(native + ',[role="button"],[role="checkbox"],[role="switch"],[role="tab"],[tabindex]'))
     .filter(el => painted(el) && el.tabIndex >= 0 && enabled(el));
-  const text = [], boundaries = [], issues = [], unknown = [], focus = [];
+  const text = [], boundaries = [], issues = [], unknown = [], focus = [], spacing = [];
   const issue = (rule, message, element, detail = {}) => issues.push({ rule, message,
     selector: selector(element), rect: rect(element), ...detail });
   const notTested = (rule, reason, element) => unknown.push({ rule, reason, selector: selector(element) });
@@ -571,6 +727,31 @@ export function inspectDOM(focusedOnly = false) {
       Array.from(el.querySelectorAll('img[alt]')).map(img => img.alt).join(' ').trim();
   };
   if (!focusedOnly) {
+    const targets = controls.filter(el => el.matches(native + ",[role=button],[role=checkbox],[role=switch],[role=tab]"))
+      .filter(el => {
+        const r = rect(el);
+        return r.bottom + scrollY > 0 && r.right > 0 && r.x < innerWidth && getComputedStyle(el).pointerEvents !== "none";
+      });
+    const fragments = el => [el, ...Array.from(el.labels ?? []).filter(painted)]
+      .flatMap(item => Array.from(item.getClientRects()).filter(r => r.width > 0 && r.height > 0)
+        .map(r => ({ x: r.x, y: r.y, right: r.right, bottom: r.bottom, width: r.width, height: r.height })));
+    for (let i = 0; i < targets.length; i++) {
+      const a = targets[i], ra = fragments(a);
+      for (const b of targets.slice(i + 1)) {
+        if (a.contains(b) || b.contains(a)) {
+          notTested("WEB-INPUT-002", "Nested independent activation model requires manual hit-area proof", a);
+          continue;
+        }
+        const rb = fragments(b);
+        const gap = Math.min(...ra.flatMap(x => rb.map(y => Math.hypot(
+          Math.max(0, x.x - y.right, y.x - x.right), Math.max(0, x.y - y.bottom, y.y - x.bottom)))));
+        const sample = { first: selector(a), second: selector(b), first_rects: ra, second_rects: rb,
+          gap_css_px: gap, threshold_css_px: 8,
+          method: "Minimum Euclidean edge distance of native control and associated label fragments; no parent exemption" };
+        spacing.push(sample);
+        if (gap < 8 - 0.001) issue("WEB-INPUT-002", "Independent touch targets separated by less than 8 CSS px", a, sample);
+      }
+    }
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node;
     while ((node = walker.nextNode())) {
@@ -715,7 +896,7 @@ export function inspectDOM(focusedOnly = false) {
     issue('WEB-BASE-004', 'Page horizontal overflow', document.documentElement, {
       scroll_width: document.documentElement.scrollWidth, client_width: document.documentElement.clientWidth });
   }
-  return { text, boundaries, issues, unknown, focus, clipped,
+  return { text, boundaries, issues, unknown, focus, spacing, clipped,
     controls: controls.map(el => ({ selector: selector(el), name: name(el), tag: el.tagName, rect: rect(el) })),
     active: active && selector(active), active_tag: active?.tagName,
     title: document.title, lang: document.documentElement.lang,
@@ -746,6 +927,13 @@ export async function auditSnapshot(browser, report, label, keyboard = true) {
   report.contrast_totals.text_samples += observation.text.length;
   report.contrast_totals.gradient_samples += observation.text.filter(item => item.background?.gradient).length;
   report.contrast_totals.boundary_samples += observation.boundaries.length;
+  report.spacing_samples ??= [];
+  report.spacing_samples.push({ state: browser.phase, viewport: browser.viewportSize, pairs: observation.spacing });
+  record(report, browser, "WEB-INPUT-002", observation.issues.some(item => item.rule === "WEB-INPUT-002") ? "FAIL" :
+    observation.unknown.some(item => item.rule === "WEB-INPUT-002") || !observation.spacing.length ? "NOT_TESTED" : "PASS",
+  "Actual independent target edge spacing, including native label activation areas", {
+    pairs: observation.spacing.length, minimum_css_px: observation.spacing.length ? Math.min(...observation.spacing.map(item => item.gap_css_px)) : null,
+    scope: "Enabled painted native controls/links/summary and declared role controls; native popup/pseudo and delegated parent hit areas not certified" });
   record(report, browser, 'G3-accessibility', observation.issues.length ? 'FAIL' : 'PASS',
     'Enumerated solid-text/control/semantic/reading-order scan; partial, not full G3',
     { text_samples: observation.text.length, control_samples: observation.boundaries.length,
@@ -849,6 +1037,11 @@ export async function coverageSummary(browser, report) {
     item.actual_count = count;
   }
   const unresolved = report.checks.filter(item => item.status === 'NOT_TESTED');
+  const spacingCoverage = report.coverage.find(item => item.rule === "WEB-INPUT-002");
+  spacingCoverage.status = report.checks.some(item => item.rule === "WEB-INPUT-002" && item.status === "FAIL") ? "FAIL" :
+    unresolved.some(item => item.rule === "WEB-INPUT-002") ? "PARTIAL" : "PASS";
+  spacingCoverage.reason = "Actual native/declared target and associated label fragment edge distance >=8 CSS px in enumerated states; no automatic larger-parent exemption. Native popup/pseudo and undeclared delegated hit areas not certified.";
+  spacingCoverage.measured_pairs = report.spacing_samples.reduce((total, entry) => total + entry.pairs.length, 0);
   for (const rule of ['WEB-A11Y-001', 'WEB-A11Y-002']) {
     const item = report.coverage.find(entry => entry.rule === rule);
     const failures = report.checks.filter(c => c.rule === rule && c.status === 'FAIL');
@@ -1039,7 +1232,7 @@ export async function smoke(browser, report) {
 }
 
 async function main() {
-  let browser, run, rc = 2;
+  let browser, run, rc = 2, finalizeFixture;
   const report = { tool: 'opensim-browser-audit', schema_version: 1, standard: 'shared-r41',
     started_at: new Date().toISOString(), verdict: 'RUNNING', checks: [], screenshots: [],
     release_verdict: 'NOT_CERTIFIED',
@@ -1054,7 +1247,7 @@ async function main() {
     for (let i = 0; i < args.length; i++) {
       if (['--smoke', '--help', '--fixture'].includes(args[i])) options[args[i].slice(2)] = true;
       else {
-        assert(['--url', '--out', '--chrome'].includes(args[i]) && args[i + 1], `Unknown/missing option ${args[i]}`);
+        assert(['--url', '--out', '--chrome', '--finalize-fixture'].includes(args[i]) && args[i + 1], `Unknown/missing option ${args[i]}`);
         options[args[i].slice(2)] = args[++i];
       }
     }
@@ -1068,8 +1261,13 @@ async function main() {
     const url = authorizedURL(options.url);
     report.url = url;
     assert(!options.fixture || new URL(url).protocol === 'http:', 'Fixture mode is loopback only');
-    report.mode = options.smoke ? 'AUDIT_SMOKE_NOT_ACCEPTANCE' :
-      options.fixture ? 'HARNESS_FIXTURE_NOT_PRODUCT' : 'G3_G6_AUTOMATIC_EXTENSION_NOT_RELEASE';
+    finalizeFixture = options["finalize-fixture"];
+    assert(!finalizeFixture || options.fixture && options.smoke &&
+      ["log-directory", "log-enospc", "log-fsync", "post-publish-fsync", "post-publish-replaced", "post-publish-same-inode"].includes(finalizeFixture),
+    "Finalization fault fixtures require explicit loopback --fixture --smoke");
+    report.finalization_fixture = finalizeFixture ?? null;
+    report.mode = options.fixture ? 'HARNESS_FIXTURE_NOT_PRODUCT' :
+      options.smoke ? 'AUDIT_SMOKE_NOT_ACCEPTANCE' : 'G3_G6_AUTOMATIC_EXTENSION_NOT_RELEASE';
     if (!options.smoke) {
       report.coverage = [
         { gate: 'G3-accessibility', status: 'PARTIAL', reason: 'Enumerated solid CSS text/boundary/outline, DOM semantics and real keyboard paths; not a full external audit engine' },
@@ -1081,7 +1279,7 @@ async function main() {
         { rule: 'WEB-A11Y-002', status: 'PARTIAL', reason: 'Solid border/fill/outline only; complex paint, canvas/icons and box-shadow focus untested' },
         { rule: 'WEB-A11Y-003', status: 'PARTIAL', reason: 'Actual Tab/Shift+Tab, Enter solve/reset/view/details paths; export/import/native picker and all arrow-key models delegated to existing acceptance or NOT_TESTED' },
         { rule: 'WEB-A11Y-005', status: 'PARTIAL', reason: 'Selected structural sibling groups and CSS order only; nested bidirectional visual interpretation untested' },
-        { rule: 'WEB-INPUT-002', status: 'NOT_TESTED', reason: 'Target spacing/parent hit-area equivalence not audited' },
+        { rule: 'WEB-INPUT-002', status: 'NOT_TESTED', reason: 'Pending actual native/declared target fragment spacing scan; no parent-area exemption without proof' },
         { rule: 'PHYSICAL-TOUCH', status: 'NOT_TESTED', reason: 'No physical touch or soft keyboard' },
         { rule: 'FULL-STANDARD-MATRIX', status: 'NOT_TESTED', reason: 'Extension uses required 320/768/1064/1440; remaining 360/390/1024/1280 and breakpoint/zoom modes belong to browser_check.mjs' },
         { gate: 'G5-performance', status: 'NOT_TESTED', reason: 'No production network/CPU/cache/transfer budgets' },
@@ -1135,6 +1333,7 @@ async function main() {
       try { await browser.close(); }
       catch (error) {
         report.cleanup_failure = { message: error.message, errors: error.errors?.map(e => e.message) };
+        report.first_failure ??= { rule: "AUDIT-CLEANUP", ...report.cleanup_failure };
         report.verdict = 'FAIL'; rc = 2;
       }
     }
@@ -1145,12 +1344,11 @@ async function main() {
         matrix: report.matrix.length, checks: report.checks.length, screenshots: report.screenshots.length,
         focus_samples: report.focus_samples.length, hover_samples: report.hover_samples.length,
         injected_requests: report.injections?.length ?? 0,
+        spacing_pairs: report.spacing_samples?.reduce((total, entry) => total + entry.pairs.length, 0) ?? 0,
       };
-      await fs.writeFile(path.join(run, 'report.json'), json(report), { flag: 'wx' });
-      assert.equal(JSON.parse(await fs.readFile(path.join(run, 'report.json'), 'utf8')).exit_code, rc);
-      const line = `AUDIT verdict=${report.verdict} rc=${rc} report=${path.join(run, 'report.json')}`;
-      await fs.writeFile(path.join(run, 'logs', 'audit.log'), line + '\n', { flag: 'wx' });
-      console.log(line);
+      const completed = await finalizeReport(run, report, rc, finalizeFixture);
+      rc = completed.rc;
+      console.log(completed.line);
     }
     process.exitCode = rc;
   }

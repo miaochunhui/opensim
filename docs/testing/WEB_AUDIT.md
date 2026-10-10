@@ -10,6 +10,7 @@ sudo -n -u infra python3 -B tests/test_browser_audit.py --product-smoke
 sudo -n -u infra python3 -B tests/test_browser_audit.py --product-audit
 sudo -n -u infra node tools/browser_audit.mjs --url http://127.0.0.1:PORT/ --out /hf3fs-jd/data/tmp/opensim-fluid-v1/seat-audit
 sudo -n -u infra python3 -B tests/test_browser_audit.py
+sudo -n -u infra python3 -B tests/test_browser_audit.py --io-selftest
 ```
 
 第一条在指定工作树启动新 loopback 临时端口，使用外置真实数值证据，
@@ -52,6 +53,14 @@ view 状态同时有 aria-pressed 与下划线。以上替代不声称所有空�
 不是任意复杂网格或双向排版的完备证明。
 没有使用 AX 树冒充屏幕阅读器。
 
+`WEB-INPUT-002` 按实际启用、已绘制的原生/声明角色目标与关联 label
+分段矩形，计算不同激活目标之间的最短欧氏边界距离，门槛 8 CSS px。
+所有测量保留在 `spacing_samples`，包含状态、视口、双目标选择器和矩形。
+隐藏、禁用、屏外隐藏入口、只读滚动容器不当独立触控目标；普通链接仍测。
+嵌套目标模型不明记 `NOT_TESTED`，不存在默认的“共享父容器”豁免；父级
+委托命中区、原生弹窗及 pseudo 子目标不声称已认证。正负例实际测出
+view 两按钮至少 8px 与 0px，不用 CSS gap 字面值代替实际浏览器矩形。
+
 每个状态有 DOM 明细、首屏 PNG 和按实际滚动位置的全页分段截图/coverage。
 恢复态也保留完整截图。截图不缩放、不改布局；底段可能重叠，不冒称
 无重叠拼图。矩阵记录主/次区域真实矩形，核移动堆叠和宽屏并列。
@@ -77,11 +86,38 @@ G6 所列四视口状态/恢复/截图/构图全过才为范围内 PASS，否则
 主代理组合已有 browser_check 报告时应验证同源码/同 build 和真实截图、
 POST产物，不按 commit 名称或旧实例端口直接组合。
 
+## 报告收尾协议
+
+`durable-final-v2` 首先以独占创建保存 `report.provisional.json`，其
+`exit_code=2`、`PROVISIONAL_NOT_ACCEPTED` 永远不能作为成功证据。
+写入并回读最终候选日志，文件 fsync、日志目录 fsync 成功后，才创建
+完整候选报告，再通过无覆盖 hard link 发布 `report.json` 并同步目录。
+回读后独占保存 `completion.json`，记录报告与日志 SHA256 和 CLI rc，
+文件/目录同步及回读完成才返回最终退出码。不支持同步或硬链接须失败，
+不静默降级；候选、provisional 和旧失败全部保留。
+
+组合者必须同时核 CLI rc、`report.completion.status=FINAL`、receipt 的
+`status=COMPLETE` 及报告/日志实际字节摘要一致，不得仅接受 report rc0。
+任何收尾异常均 rc2，`report.failure.json` 保存原始 errno、syscall、path、
+stage、首因及撤销明细；更早浏览器错误不被后续 I/O 错误替换。
+只撤本次创建的 receipt/final：有界 8MiB、O_NOFOLLOW/O_NONBLOCK 描述符
+回读，前后核 dev/ino/birthtime、尺寸、mtime/ctime、命名路径及原始字节。
+同 inode 改写或替换目录均原样保留，并使完成证据不成立。
+POSIX 无 compare-and-unlink，以上针对唯一拥有的 run 目录与已观测漂移，
+不是恶意并发写入隔离或断电/全盘丢失保证。存储连失败报告也不能保存时
+stderr 输出首因与次因，不冒称已保存。
+
+`--finalize-fixture` 仅配合明确的 loopback `--fixture --smoke` 使用。
+真实负例覆盖日志路径被目录占用、`/dev/full` 的 ENOSPC 和 fsync EINVAL、
+发布后 fsync 故障精确撤销、发布后未知目录保护及同 inode 同长度改写保护。
+夹具修改实际文件对象，不 mock fs 方法/异常；不宽 chmod、不改产品或标准。
+
 ## 夹具与失败
 
 unittest 使用实际 Python renderer、app 和 solver 的临时 HTTP 服务。
 正例仅在测试 HTTP 响应附加黑白对比尺；负例改变测试响应为低文字/边界/
 焦点对比、移除一个焦点、逆序布局、隐藏错误和截断长内容。
+负例另将实际独立 view 控件间距压至 0px，必须检出 `WEB-INPUT-002`。
 代码不修改产品 JS/CSS/render/server 或标准，HTML 不手写。
 夹具必须声明 `HARNESS_FIXTURE_NOT_PRODUCT`，不计产品验收。
 服务健康身份需匹配指定工作树源码，数值证据需匹配 solver 摘要。
