@@ -108,6 +108,12 @@ def targets(records: list[dict]) -> list[dict]:
     return [item for item in records if item["Name"].lower() == DESIRED["Name"]]
 
 
+def safe_snapshot(records: list[dict]) -> list[dict] | None:
+    hits = targets(records)
+    # Rejected child-controlled strings are not safe evidence content.
+    return hits if all(exact(item) for item in hits) else None
+
+
 def classify(records: list[dict]) -> list[dict]:
     hits = targets(records)
     if len(hits) > 1:
@@ -505,7 +511,7 @@ def execute(args, ledger: Ledger) -> str:
     ledger.created_record_id = ledger.ownership()
     api = API(args.fixture_dir)
     before = api.describe()
-    ledger.before = targets(before)
+    ledger.before = safe_snapshot(before)
     ledger.append(mode, "BEFORE")
     hits = classify(before)
     owned = ledger.created_record_id
@@ -517,7 +523,7 @@ def execute(args, ledger: Ledger) -> str:
                        for e in ledger.events):
                 raise Refuse("owned_record_missing_without_delete_ack")
             after = api.describe()
-            ledger.after = targets(after)
+            ledger.after = safe_snapshot(after)
             ledger.append(mode, "AFTER")
             if not same_zone(before, after) or any(r["RecordId"] == owned for r in after):
                 raise Refuse("revert_absence_verification_drift")
@@ -533,9 +539,9 @@ def execute(args, ledger: Ledger) -> str:
         api.call("DeleteRecord", {"Domain": ZONE, "RecordId": owned})
         ledger.append(mode, "DELETE_ACK")
         after = api.describe()
-        ledger.after = targets(after)
+        ledger.after = safe_snapshot(after)
         ledger.append(mode, "AFTER")
-        if ledger.after or not same_zone([r for r in before if r["RecordId"] != owned], after):
+        if targets(after) or not same_zone([r for r in before if r["RecordId"] != owned], after):
             raise Refuse("revert_postdelete_verification_failed")
         return "REVERTED"
     if owned is not None and (not hits or hits[0]["RecordId"] != owned):
@@ -543,7 +549,7 @@ def execute(args, ledger: Ledger) -> str:
     if hits:
         ledger.verified_record_id = hits[0]["RecordId"]
         after = api.describe()
-        ledger.after = targets(after)
+        ledger.after = safe_snapshot(after)
         ledger.append(mode, "AFTER")
         if not same_zone(before, after):
             raise Refuse("no_change_verification_drift")
@@ -563,7 +569,7 @@ def execute(args, ledger: Ledger) -> str:
     ledger.created_record_id = rid
     ledger.append(mode, "CREATE_ACK")
     after = api.describe()
-    ledger.after = targets(after)
+    ledger.after = safe_snapshot(after)
     ledger.append(mode, "AFTER")
     if not same_zone(before + [{"RecordId": rid, **DESIRED}], after):
         raise Refuse("apply_postcreate_verification_failed")

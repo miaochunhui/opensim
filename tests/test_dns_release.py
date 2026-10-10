@@ -301,6 +301,17 @@ class DNSReleaseTests(unittest.TestCase):
                                  "opensim_fields_or_status_conflict")
         self.assertEqual(self.mutations(), [])
 
+    def test_rejected_child_record_text_never_enters_receipt_or_ledger(self):
+        marker = "offline-sensitive-child-value"
+        for field in ("Value", "Line", "LineId", "Type", "Status"):
+            with self.subTest(field=field):
+                self.arrange([{"RecordId": 10, **dns.DESIRED, field: marker}])
+                receipt = self.run_cli(expect_rc=2)
+                self.assertEqual(receipt["outcome"], "FAILED")
+                self.assertNotIn(marker, json.dumps(receipt))
+                self.assertNotIn(marker, self.ledger.read_text())
+                self.assertEqual(self.mutations(), [])
+
     def test_api_failure_preserves_rc_without_streams(self):
         self.arrange(variant="api_failure")
         receipt = self.run_cli(expect_rc=2)

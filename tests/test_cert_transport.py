@@ -130,7 +130,8 @@ class CertTransportTests(unittest.TestCase):
                 recipient_pin=self.recipient_pin if recipient_pin is None else recipient_pin,
                 now=NOW if now is None else now)
 
-    def frame_with_payload(self, content: bytes, signature: bytes, cipher="-aes-256-gcm") -> bytes:
+    def frame_with_payload(self, content: bytes, signature: bytes, cipher="-aes-256-gcm",
+                           oaep_digest="sha256", mgf_digest="sha256") -> bytes:
         payload = transport.canonical({"content": transport.encode(content),
                                        "signature": transport.encode(signature)})
         request = transport.validate_request(self.request, NOW)
@@ -138,7 +139,8 @@ class CertTransportTests(unittest.TestCase):
             encrypted = crypto("negative_authenticated_encrypt", [
                 "cms", "-encrypt", "-binary", "-outform", "DER", cipher,
                 "-recip", transport.fd_path(recipient_fd), "-keyopt", "rsa_padding_mode:oaep",
-                "-keyopt", "rsa_oaep_md:sha256"], data=payload, descriptors=(recipient_fd,))
+                "-keyopt", "rsa_oaep_md:" + oaep_digest, "-keyopt", "rsa_mgf1_md:" + mgf_digest],
+                data=payload, descriptors=(recipient_fd,))
         return transport.canonical({"version": 1, "request_pin": self.pin,
                                     "ciphertext": transport.encode(encrypted)})
 
@@ -172,6 +174,38 @@ class CertTransportTests(unittest.TestCase):
         self.assertTrue(b"id-smime-ct-authEnvelopedData" in details)
         self.assertTrue(b"aes-256-gcm" in details)
         self.assertTrue(b"rsaesOaep" in details)
+
+    def test_oaep_and_mgf1_sha1_defaults_refused_before_private_decryption(self):
+        for oaep, mgf in (("sha1", "sha1"), ("sha256", "sha1"), ("sha1", "sha256")):
+            with self.subTest(oaep=oaep, mgf=mgf):
+                frame = self.frame_with_payload(self.content(), self.sign_content(self.content()),
+                                                oaep_digest=oaep, mgf_digest=mgf)
+                outer = transport.parse(frame, {"version", "request_pin", "ciphertext"})
+                with self.assertRaisesRegex(transport.ProtocolError, "UNSUPPORTED_CIPHER_SUITE"):
+                    transport.validate_cipher_suite(transport.decode(outer["ciphertext"]))
+        frame = self.frame_with_payload(self.content(), self.sign_content(self.content()),
+                                        mgf_digest="sha1")
+        original = transport.openssl
+        attempted = []
+
+        def observe(operation, args, **kwargs):
+            attempted.append(operation)
+            return original(operation, args, **kwargs)
+
+        with patch.object(transport, "openssl", side_effect=observe), \
+                self.assertRaisesRegex(transport.ProtocolError, "UNSUPPORTED_CIPHER_SUITE"):
+            self.session.accept(frame, self.ca, now=NOW)
+        self.assertNotIn("authenticated_decrypt", attempted)
+
+    def test_offer_refuses_expired_wall_and_monotonic_time(self):
+        for name in ("time", "monotonic"):
+            session = transport.RecipientSession(transport.digest(self.bundle))
+            with patch.object(transport.time, name,
+                              return_value=NOW + 10000 if name == "time" else session._deadline + 1):
+                with self.assertRaisesRegex(transport.ProtocolError, "EXPIRED"):
+                    session.offer()
+            self.assertEqual(session.state, "CLOSED")
+            self.assertEqual(session._key, b"")
 
     def test_replay_after_success(self):
         frame = self.seal()

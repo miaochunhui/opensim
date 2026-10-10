@@ -198,6 +198,95 @@ def require_der_frame(body: bytes) -> None:
         raise ProtocolError("TRUNCATED_OR_TRAILING_DER_FRAME")
 
 
+def der_items(body: bytes) -> list[tuple[int, bytes]]:
+    """Read only the bounded, definite-length DER subset used by this protocol."""
+    items, offset = [], 0
+    while offset < len(body):
+        if len(items) >= 16 or offset + 2 > len(body):
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        tag, size = body[offset], body[offset + 1]
+        offset += 2
+        if tag & 0x1f == 0x1f:
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        if size & 0x80:
+            count = size & 0x7f
+            if not 1 <= count <= 4 or offset + count > len(body) or body[offset] == 0:
+                raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+            size = int.from_bytes(body[offset:offset + count], "big")
+            offset += count
+            if size < 128:
+                raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        if offset + size > len(body):
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        items.append((tag, body[offset:offset + size]))
+        offset += size
+    return items
+
+
+def validate_cipher_suite(body: bytes) -> None:
+    """Reject implicit SHA1 defaults and multi-recipient/algorithm substitutions."""
+    oid_sha256 = bytes.fromhex("608648016503040201")
+    oid_oaep = bytes.fromhex("2a864886f70d010107")
+    oid_mgf1 = bytes.fromhex("2a864886f70d010108")
+    oid_pspecified = bytes.fromhex("2a864886f70d010109")
+
+    def sequence(raw: bytes) -> list[tuple[int, bytes]]:
+        items = der_items(raw)
+        if len(items) != 1 or items[0][0] != 0x30:
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        return der_items(items[0][1])
+
+    def sha256_algorithm(raw: bytes) -> bool:
+        return sequence(raw) in ([(6, oid_sha256)], [(6, oid_sha256), (5, b"")])
+
+    try:
+        outer = sequence(body)
+        if (len(outer) != 2 or outer[0] != (6, bytes.fromhex("2a864886f70d0109100117"))
+                or outer[1][0] != 0xa0):
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        envelope = sequence(outer[1][1])
+        if (len(envelope) != 4 or [tag for tag, _ in envelope] != [2, 0x31, 0x30, 4]
+                or envelope[0][1] != b"\0"):
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        recipients = der_items(envelope[1][1])
+        if len(recipients) != 1 or recipients[0][0] != 0x30:
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        recipient = der_items(recipients[0][1])
+        if (len(recipient) != 4 or [tag for tag, _ in recipient] != [2, 0x30, 0x30, 4]
+                or recipient[0][1] != b"\0"):
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        algorithm = der_items(recipient[2][1])
+        if len(algorithm) != 2 or algorithm[0] != (6, oid_oaep) or algorithm[1][0] != 0x30:
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        parameters = der_items(algorithm[1][1])
+        if len(parameters) not in (2, 3) or [tag for tag, _ in parameters[:2]] != [0xa0, 0xa1]:
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        if not sha256_algorithm(parameters[0][1]):
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        mask = sequence(parameters[1][1])
+        if len(mask) != 2 or mask[0] != (6, oid_mgf1) or mask[1][0] != 0x30:
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        if der_items(mask[1][1]) not in ([(6, oid_sha256)], [(6, oid_sha256), (5, b"")]):
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        if len(parameters) == 3 and (parameters[2][0] != 0xa2 or
+                sequence(parameters[2][1]) != [(6, oid_pspecified), (4, b"")]):
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        content = der_items(envelope[2][1])
+        if (len(content) != 3 or content[0] != (6, bytes.fromhex("2a864886f70d010701"))
+                or content[1][0] != 0x30 or content[2][0] != 0x80):
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        cipher = der_items(content[1][1])
+        if (len(cipher) != 2 or cipher[0] != (6, bytes.fromhex("60864801650304012e"))
+                or cipher[1][0] != 0x30):
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+        gcm = der_items(cipher[1][1])
+        if (len(gcm) != 2 or gcm[0][0] != 4 or len(gcm[0][1]) != 12
+                or gcm[1] != (2, b"\x10") or len(envelope[3][1]) != 16):
+            raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+    except (IndexError, ValueError, TypeError):
+        raise ProtocolError("UNSUPPORTED_CIPHER_SUITE") from None
+
+
 def leaf_and_chain(bundle: bytes) -> tuple[bytes, bytes]:
     certificates = PEM_CERT.findall(bundle)
     if len(certificates) < 2 or PEM_CERT.sub(b"", bundle).strip():
@@ -281,7 +370,8 @@ def seal(request_body: bytes, source_key_fd: int, certificate: bytes, *, replay:
         encrypted = openssl("authenticated_encrypt", [
             "cms", "-encrypt", "-binary", "-outform", "DER", "-aes-256-gcm",
             "-recip", fd_path(recipient_fd), "-keyopt", "rsa_padding_mode:oaep",
-            "-keyopt", "rsa_oaep_md:sha256"], data=payload, descriptors=(recipient_fd,))
+            "-keyopt", "rsa_oaep_md:sha256", "-keyopt", "rsa_mgf1_md:sha256"],
+            data=payload, descriptors=(recipient_fd,))
     validate_request(request_body, now)
     frame = canonical({"version": 1, "request_pin": request_pin, "ciphertext": encode(encrypted)})
     if len(frame) > MAX_BYTES:
@@ -322,10 +412,18 @@ class RecipientSession:
 
     def offer(self) -> tuple[bytes, str, str]:
         """Pins must reach the source via a trusted controller, NOT relay assertions."""
-        if self._state != "OPEN":
-            raise ProtocolError("SESSION_ALREADY_CONSUMED")
-        request = parse(self._request, REQUEST_FIELDS)
-        return self._request, digest(self._request), request["recipient_pin"]
+        with self._lock:
+            if self._state != "OPEN":
+                raise ProtocolError("SESSION_ALREADY_CONSUMED")
+            if time.monotonic() >= self._deadline:
+                self._key, self._state = b"", "CLOSED"
+                raise ProtocolError("EXPIRED_MONOTONIC_SESSION")
+            try:
+                request = validate_request(self._request)
+            except ProtocolError:
+                self._key, self._state = b"", "CLOSED"
+                raise
+            return self._request, digest(self._request), request["recipient_pin"]
 
     def close(self) -> None:
         with self._lock:
@@ -350,15 +448,7 @@ class RecipientSession:
                 raise ProtocolError("ENVELOPE_REQUEST_MISMATCH")
             encrypted = decode(outer["ciphertext"])
             require_der_frame(encrypted)
-            details = openssl("cipher_suite_check", [
-                "cms", "-cmsout", "-print", "-inform", "DER"], data=encrypted)
-            required = (
-                rb"contentType: id-smime-ct-authEnvelopedData \(1\.2\.840\.113549\.1\.9\.16\.1\.23\)",
-                rb"contentEncryptionAlgorithm:\s+algorithm: aes-256-gcm \(2\.16\.840\.1\.101\.3\.4\.1\.46\)",
-                rb"keyEncryptionAlgorithm:\s+algorithm: rsaesOaep \(1\.2\.840\.113549\.1\.1\.7\)",
-            )
-            if not all(re.search(pattern, details) for pattern in required):
-                raise ProtocolError("UNSUPPORTED_CIPHER_SUITE")
+            validate_cipher_suite(encrypted)
             with memory_file(key) as key_fd:
                 plaintext = openssl("authenticated_decrypt", [
                     "cms", "-decrypt", "-binary", "-inform", "DER", "-inkey", fd_path(key_fd)],

@@ -57,6 +57,9 @@ single session before parsing any response, including invalid responses. It
 checks wall time and monotonic deadline, rejects truncated/trailing DER input,
 enforces the AuthEnvelopedData /
 AES-256-GCM / RSA-OAEP suite from the OpenSSL CMS structure (no CBC downgrade),
+including explicit SHA256 OAEP and MGF1 parameters with empty label, one
+recipient, 12-byte nonce and 16-byte GCM tag. A bounded DER reader checks those
+fields before private decryption; implicit SHA1 defaults are rejected.
 decrypts/authenticates, checks the
 exact inner request and pinned source chain, verifies the source signature,
 then verifies chain under independently supplied synthetic CA trust (not the
@@ -64,6 +67,8 @@ presented root), server purpose, exact sole DNS SAN, time validity with a
 seven-day margin, and DER certificate/key equality. No retry after tampering,
 failure or success; concurrent attempts admit at most one. Closing or restarting
 loses the recipient; this module has no session restoration API.
+Offers also enforce wall and monotonic expiry under the session lock and close
+expired sessions before exporting even the public request.
 
 Encryption alone is not source authentication. The pinned source certificate,
 signature and independently supplied trust are all needed. This is not a
