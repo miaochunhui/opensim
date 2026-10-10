@@ -10,6 +10,7 @@ from pathlib import Path
 from tools.integration_acceptance import (
     EXTERNAL, ROOT, VIEWPORTS, identity, read_report, validate_browser, validate_local,
 )
+from tools.render_page import _source_metadata
 
 
 class IntegrationEvidenceTests(unittest.TestCase):
@@ -28,14 +29,23 @@ class IntegrationEvidenceTests(unittest.TestCase):
             },
         }
 
-    def browser(self):
+    def browser(self, directory):
+        # This parser fixture is not rendered-product or valid PNG acceptance.
+        content = (
+            b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR"
+            + (320).to_bytes(4, "big") + (568).to_bytes(4, "big") + b"x" * 100
+        )
+        (directory / "parser-fixture.png").write_bytes(content)
         return {
             "mode": "OPENSIM_ACCEPTANCE", "verdict": "AUTOMATED_PASS",
             "commit": "candidate",
             "tool_sha256": hashlib.sha256((ROOT / "tools/browser_check.mjs").read_bytes()).hexdigest(),
             "checks": [{"status": "PASS"}],
             "matrix": [{"name": name, "status": "PASS"} for name in VIEWPORTS],
-            "screenshots": [{"path": "fixture.png"}],
+            "result_count": 1,
+            "page_build": {"build_text": _source_metadata()[2]},
+            "screenshots": [{"file": "parser-fixture.png", "width": 320, "height": 568,
+                             "sha256": hashlib.sha256(content).hexdigest()}],
         }
 
     def test_local_accepts_complete_source_bound_report(self):
@@ -63,18 +73,24 @@ class IntegrationEvidenceTests(unittest.TestCase):
                 validate_local(value, ROOT)
 
     def test_browser_requires_full_matrix_commit_tool_and_terminal_checks(self):
-        good = self.browser()
-        validate_browser(good, ROOT, "candidate")
-        for key, value in [
-            ("commit", "old"), ("tool_sha256", "0" * 64),
-            ("mode", "OPENSIM_INPUT_PROBE"), ("checks", []),
-            ("matrix", good["matrix"][:-1]), ("screenshots", []),
-            ("checks", [{"status": "FAIL"}]),
-        ]:
-            bad = copy.deepcopy(good)
-            bad[key] = value
-            with self.subTest(key=key), self.assertRaises(ValueError):
-                validate_browser(bad, ROOT, "candidate")
+        with tempfile.TemporaryDirectory(prefix="integration-browser-", dir=EXTERNAL) as temporary:
+            directory = Path(temporary)
+            good = self.browser(directory)
+            validate_browser(good, ROOT, "candidate", directory)
+            for key, value in [
+                ("commit", "old"), ("tool_sha256", "0" * 64),
+                ("mode", "OPENSIM_INPUT_PROBE"), ("checks", []),
+                ("matrix", good["matrix"][:-1]), ("screenshots", []),
+                ("checks", [{"status": "FAIL"}]), ("result_count", 0),
+                ("page_build", {"build_text": "old"}),
+            ]:
+                bad = copy.deepcopy(good)
+                bad[key] = value
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    validate_browser(bad, ROOT, "candidate", directory)
+            (directory / "parser-fixture.png").write_bytes(b"not-a-screenshot")
+            with self.assertRaises(ValueError):
+                validate_browser(good, ROOT, "candidate", directory)
 
     def test_report_readback_has_exact_nonempty_artifact_hash(self):
         with tempfile.TemporaryDirectory(prefix="integration-test-", dir=EXTERNAL) as directory:

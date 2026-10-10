@@ -14,8 +14,12 @@
 sudo -n -u infra python3 -B /data/dev/opensim/tools/integration_acceptance.py --out /hf3fs-jd/data/tmp/opensim-fluid-v1/integration-new
 ```
 
-加上 `--full-browser --local-url http://127.0.0.1:8776/` 会运行完整旧浏览器矩阵。
-使用前须以当前候选源码启动新的本地实例，不能利用旧进程通过健康检查替代真计算。
+加上 `--full-browser` 会运行完整浏览器矩阵，并以本次数值报告启动专属
+随机本地端口实例，完成后只关闭自己的实例。可选 `--local-url` 指向
+已经启动的候选实例，但不建议依赖历史端口。
+截图使用浏览器工具限定的专属 `browser/integration-<唯一标识>` 目录，
+汇总报告保留真实位置并回读每个 PNG 的字节摘要与尺寸。
+不能利用旧进程通过健康检查替代真计算。
 
 终判 `LOCAL_INTEGRATION_PASS` 仅表示已选择的本地阶段通过。
 `release_verdict` 始终为 `NOT_CERTIFIED`。G3、G5、真实触屏与屏幕阅读器、

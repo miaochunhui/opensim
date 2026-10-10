@@ -10,20 +10,25 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
+import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 EXTERNAL = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1")
 VIEWPORTS = {
     "mobile-narrow", "mobile-common", "mobile-wide", "tablet-portrait",
     "desktop-small", "desktop-browser-common", "desktop-standard", "desktop-wide",
 }
+BROWSER_OUTPUT = EXTERNAL / "browser"
 
 
 def digest(data: bytes) -> str:
@@ -125,7 +130,7 @@ def validate_local(value: dict, root: Path) -> None:
         raise ValueError("Unit runner did not emit a nonempty completion marker")
 
 
-def validate_browser(value: dict, root: Path, commit: str) -> None:
+def validate_browser(value: dict, root: Path, commit: str, directory: Path) -> None:
     if value.get("mode") != "OPENSIM_ACCEPTANCE" or value.get("verdict") != "AUTOMATED_PASS":
         raise ValueError("Expected a complete real OpenSim browser run, not a probe/selftest")
     if value.get("commit") != commit:
@@ -148,6 +153,27 @@ def validate_browser(value: dict, root: Path, commit: str) -> None:
         raise ValueError("Browser viewport matrix has unfinished or failed rows")
     if not isinstance(screenshots, list) or not screenshots:
         raise ValueError("Browser screenshot evidence empty")
+    if type(value.get("result_count")) is not int or value["result_count"] <= 0:
+        raise ValueError("Browser evidence has no real computation count")
+    from tools.render_page import _source_metadata
+    if _source_metadata()[2] not in value.get("page_build", {}).get("build_text", ""):
+        raise ValueError("Browser page build differs from current source")
+    for row in screenshots:
+        if not isinstance(row, dict) or not isinstance(row.get("file"), str):
+            raise ValueError("Browser screenshot lacks a file record")
+        relative = Path(row["file"])
+        file = directory / relative
+        if relative.name != row["file"] or file.is_symlink():
+            raise ValueError("Screenshot file is not bounded to the browser run")
+        content = file.read_bytes()
+        if (
+            len(content) <= 100 or content[:8] != b"\x89PNG\r\n\x1a\n"
+            or content[12:16] != b"IHDR" or digest(content) != row.get("sha256")
+            or int.from_bytes(content[16:20], "big") != row.get("width")
+            or int.from_bytes(content[20:24], "big") != row.get("height")
+            or row["width"] <= 0 or row["height"] <= 0
+        ):
+            raise ValueError(f"Screenshot content/hash/dimensions differ: {row['file']}")
 
 
 def execute(argv: list[str], cwd: Path, output: Path, name: str) -> dict:
@@ -169,7 +195,7 @@ def execute(argv: list[str], cwd: Path, output: Path, name: str) -> dict:
     }
 
 
-def run(root: Path, output: Path, full_browser: bool, local_url: str) -> dict:
+def run(root: Path, output: Path, full_browser: bool, local_url: str | None) -> dict:
     report = {
         "schema_version": 1, "scope": "LOCAL_INTEGRATION_NOT_RELEASE",
         "started_at": timestamp(), "verdict": "RUNNING", "steps": [], "artifacts": {},
@@ -181,6 +207,7 @@ def run(root: Path, output: Path, full_browser: bool, local_url: str) -> dict:
             "Production apply/revert and persistent automatic deployment",
         ],
     }
+    app = thread = handler = None
     try:
         before = identity(root)
         report["before"] = before
@@ -198,19 +225,30 @@ def run(root: Path, output: Path, full_browser: bool, local_url: str) -> dict:
         validate_local(value, root)
         report["artifacts"]["local"] = artifact
         if full_browser:
+            if local_url is None:
+                from server import ApplicationServer
+                handler = logging.FileHandler(output / "browser-server.log", encoding="utf-8")
+                logging.getLogger().addHandler(handler)
+                app = ApplicationServer(("127.0.0.1", 0), evidence=local / "numerics.json")
+                thread = threading.Thread(target=app.serve_forever, daemon=True)
+                thread.start()
+                local_url = f"http://127.0.0.1:{app.server_port}/"
+                report["owned_server"] = {"url": local_url, "source_root": str(root)}
+            browser_output = BROWSER_OUTPUT / ("integration-" + uuid.uuid4().hex)
+            report["browser_output"] = str(browser_output)
             step = execute(
                 ["node", str(root / "tools/browser_check.mjs"), "--url", local_url,
-                 "--out", str(output / "browser")],
+                 "--out", str(browser_output)],
                 root, output, "browser",
             )
             report["steps"].append(step)
             if step["rc"]:
                 raise RuntimeError(f"full browser failed rc={step['rc']}; see {step['stderr']['path']}")
-            reports = list((output / "browser").glob("run-*/report.json"))
+            reports = list(browser_output.glob("run-*/report.json"))
             if len(reports) != 1:
                 raise ValueError(f"Expected exactly one browser report, got {len(reports)}")
-            value, artifact = read_report(reports[0], output)
-            validate_browser(value, root, before["commit"])
+            value, artifact = read_report(reports[0], browser_output)
+            validate_browser(value, root, before["commit"], reports[0].parent)
             report["artifacts"]["browser"] = artifact
         after = identity(root)
         report["after"] = after
@@ -220,6 +258,19 @@ def run(root: Path, output: Path, full_browser: bool, local_url: str) -> dict:
     except Exception as exc:
         report["verdict"] = "FAIL"
         report["failure"] = {"type": type(exc).__name__, "message": str(exc)}
+    finally:
+        if app is not None:
+            app.shutdown()
+            app.server_close()
+            if thread is not None:
+                thread.join(timeout=10)
+                report["owned_server"]["stopped"] = not thread.is_alive()
+                if thread.is_alive():
+                    report["verdict"] = "FAIL"
+                    report["cleanup_failure"] = "Owned browser server did not stop"
+        if handler is not None:
+            logging.getLogger().removeHandler(handler)
+            handler.close()
     report["finished_at"] = timestamp()
     report["tool_sha256"] = digest(Path(__file__).read_bytes())
     return report
@@ -229,14 +280,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--full-browser", action="store_true")
-    parser.add_argument("--local-url", default="http://127.0.0.1:8776/")
+    parser.add_argument("--local-url",
+                        help="Optional existing loopback instance; otherwise start an owned test server")
     args = parser.parse_args()
-    url = urlsplit(args.local_url)
-    if (
-        url.scheme != "http" or url.hostname not in ("127.0.0.1", "localhost", "::1")
-        or url.username or url.password or url.query or url.fragment or url.path != "/"
-    ):
-        parser.error("Only a credential-free loopback HTTP root URL is accepted")
+    if args.local_url:
+        url = urlsplit(args.local_url)
+        if (
+            url.scheme != "http" or url.hostname not in ("127.0.0.1", "localhost", "::1")
+            or url.username or url.password or url.query or url.fragment or url.path != "/"
+        ):
+            parser.error("Only a credential-free loopback HTTP root URL is accepted")
     output = output_directory(args.out)
     report = run(ROOT, output, args.full_browser, args.local_url)
     file = output / "integration.json"
