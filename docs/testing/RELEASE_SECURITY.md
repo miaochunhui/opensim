@@ -1,13 +1,14 @@
 # Release 独立安全复核
 
-本席只审 app `b0ec93257ab3` 与 DNS `3b2ecbe1e51f`，不修改被审源码。
-结论：原版 **FAIL**，1 类 P1、5 类 P2，7 个独立安全断言报红。
+本席独立审 app、DNS 与离线 transport，不修改被审源码。
+原版 app `b0ec93257ab3` / DNS `3b2ecbe1e51f` **FAIL**，
+1 类 P1、5 类 P2、7 个独立安全断言报红；修复版另列，不追认旧红。
 固定第 6 槽补位，不新增代理。未修改被审源码或生产。
 测试与证据只在 `/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-security/`。
 
 ## 独立反证方法
 
-`tests/test_release_security.py` 导出真实文件系统 fixture 提交，实际运行数值
+`tests/test_release_security.py` 冻结候选源码后创建真实文件系统 fixture 提交，实际运行数值
 验证和页面构建，安装并核对真实 release、unit、receipt 字节。
 仅外置 fixture 路由被替换；manifest、receipt、读写、校验、锁不被 mock 掉。
 DNS API 经本测试文件的固定离线子进程，核固定 payload、真实修改外置
@@ -21,11 +22,19 @@ zone 状态并留调用账；生产分支 SSH 被固定假传输替换，绝不�
 但最终判据采用 `frozen-original-v1`，不依赖工作树当时是否并发变动。
 
 复跑须使用尚不存在的 `--out`；`--only` 可重复点名测试。
-`--app-root` 与 `--dns-source` 指定仓库；对应 `--app-revision`、
-`--dns-revision` 必须显式选择修复提交，默认仍是原始被审版本。
-只有主席明确授权的未提交复验使用 revision `WORKTREE`：冻结前、读入、
+`--app-root`、`--dns-source`、`--transport-root` 指定仓库/文件；
+CLI 默认 `/data/dev/opensim` 当前候选，revision 默认 `WORKTREE`，
+不再默认旧漏洞源。`--baseline` 显式选原 app/DNS/transport 提交；
+显式 revision 参数优先，可选 Git commit，`--transport-only` 仅跑协议类。
+`--all` 跑两类完整门，与 discover 的用例集合相同。
+当前候选与发布导出件一起冻结：冻结前、读入、
 落盘后各核摘要，并在测试结束记录当前输入摘要与冻结摘要是否一致。
 HEAD 在这种记录中只是工作树基线，不冒充未提交 bytes 的提交身份。
+开始测试前再次对拍整个冻结集合；中途源变动只记录漂移，不混入执行。
+`unittest discover` 通过 `load_tests` 创建新的 `discover-UUID` 外置目录，
+执行 app/DNS 和 transport 两类真实测试，并从同一个 unittest result
+落实际 count/failure/error/skip、report.json、execution.log 及冻结摘要。
+没有 dns=None 退化、skip 或 expectedFailure；当前残留漏洞仍必须红。
 `--scan-only` 只扫描两份独占写集并验证扫描/脱敏阳性对照；
 用现有 infra 扫描器和 memory 值形态引擎，不读取真实凭据，
 不冒充真实凭据逐值扫描，空/缺件集合拒绝通过。
@@ -120,7 +129,7 @@ preparation.json；最终额外有 frozen-source/ 与 frozen-source.json。
 旧失败目录保留，无重试覆盖。实际测试命令：
 
 ```bash
-sudo -n -u infra python3 -B tests/test_release_security.py --out /hf3fs-jd/data/tmp/opensim-fluid-v1/seat-security/frozen-original-v1
+sudo -n -u infra python3 -B tests/test_release_security.py --baseline --out /hf3fs-jd/data/tmp/opensim-fluid-v1/seat-security/frozen-original-v1
 ```
 
 该路径是已完成 run，不可原样重跑覆盖，复跑须换新的目录名。
@@ -148,7 +157,8 @@ caller 新 pin。这是新的批准输入，不是破解旧 pin；commit 字段�
 凭据、私钥、网络/公网、生产 rollback；本席没有启动 loopback app
 或重做完整计算 probe，真实数值验证仅在 fixture 准备阶段执行。
 有限时序注入不证明无全部竞态，合作锁不防恶意 root，未测试跨机 DNS CAS。
-DNS changed-version 尚待批准修复 SHA；不能从旧 FAIL 宣称 DNS 修复版已验。
+DNS production mutation 未有可信 bootstrap 时必须继续关闭；
+修复版离线门不能代替生产所有权、跨机 CAS 或实际撤回验收。
 
 ### App Changed-Version 回归
 
@@ -193,7 +203,124 @@ stderr 宣称 no final success report，但磁盘确有成功报告。
    结束协议修复需复验前置写失败、完整写后读回/fsync失败、report发布
    失败、已有输出目录和首因保留，以及消费方拒绝孤立成功文件。
 
-该修复版尾部红灯第一时间已回主席，尚未验终结协议新版本。
+该修复版尾部红灯第一时间已回主席；主席补精确报告撤销后，
+`app-postwrite-fixed-v2` 为 6 项/0 failure/error/rc0，原失败保留。
+`current-default-finalization-v1` 进一步在主仓当前候选上实跑三项：
+最终目录 fsync 故障、完整报告首轮读回故障、持续读回/撤销故障，
+3/3 PASS；app SHA256 前缀为 `7529226288b0`（完整值见冻结报告），
+前后/结束输入摘要相同。
+
+持续 I/O 失效时精确撤销也可能失败，实盘可残留报告自报 rc0，
+但实际 CLI1、stdout 空、stderr 明确 invocation unverified。
+这是明确的完成协议边界，不假称能在坏盘上保证撤销；
+消费方必须使用真实进程 rc，不能从 report.exit_code 独立批准。
+测试只证明生产工具公开失败且不输出最终成功，不证明外部消费者都已接门。
+
+## 当前候选与协议反证
+
+2026-10-10 现读主仓基线 `9567f7d6a292`，
+app 内容来自 `01311b9`、DNS `e2854d6`、transport `66411f0`。
+冻结当前 WORKTREE 不依赖 DNS 专席的旧路径，独立导出当前页面/solver，
+用真实外置 FS、固定子进程及实际 OpenSSL，未读真密钥、未联网。
+
+| run | count | failures | errors | rc | 判定 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| app-postwrite-fixed-v2 | 6 | 0 | 0 | 0 | PASS |
+| combined-fixed-v1 | 32 | 1 | 0 | 2 | DNS child Value 仍泄漏 |
+| transport-independent-v1 | 10 | 3 | 0 | 2 | 原口径原红保留 |
+| discover-b70ab41b30b7* | 42 | 3 | 0 | 1 | 当前源真实 discover |
+| discover-d0f7a7b9bb6b* | 48 | 5 | 0 | 1 | 扩展当前源真实 discover |
+| discover-a3f9a4b80bf0* | 49 | 6 | 0 | 1 | 整合安全修复前主仓 |
+| discover-6c55f8803b6f* | 49 | 0 | 0 | 0 | 主仓 8becc3b 默认当前门 |
+| current-default-finalization-v1 | 3 | 0 | 0 | 0 | 当前 app 尾部故障 |
+| baseline-cli-control-v1 | 1 | 1 | 0 | 2 | baseline 能看见原伪账本红 |
+| transport-baseline-expanded-v2 | 14 | 4 | 0 | 2 | 完整 OAEP 参数门缺失 |
+| transport-baseline-multirecipient-v1 | 1 | 1 | 0 | 2 | 原版多 recipient 控制红 |
+| followup-app-dns-v1 | 34 | 0 | 0 | 0 | 修复树 DNS + 主仓 app |
+| followup-transport-v1 | 15 | 0 | 0 | 0 | 修复树协议完整门 |
+| followup-all-v1 | 49 | 0 | 0 | 0 | 修复树同进程联合冻结门 |
+
+全部 0 skip，目录均为证据根下新路径，旧失败无覆盖。
+discover 表中的星号是 UUID 后缀缩写，证据根下对应唯一目录；
+完整路径由当次判定行输出，不是测试使用 glob。
+discover 首轮 42 项的 3 fail 为 DNS child Value 与 OAEP/MGF1 SHA1，
+其余包括 app 终结、DNS 生产阻断/硬链接/父目录换链均通过。
+扩展 discover 的 5 fail 为 DNS 泄漏及四个 OAEP 参数负例，不是旧源码默认。
+最终 49 项 discover 的 6 fail 增加双 recipient；冻结时主仓仍未合六件安全
+修复，因此真红保留，不用异树默认规避。主仓 UI 更新不改变已冻结的执行件。
+各报告记录完整冻结位置与 before/after/测试后摘要，无中途偷换源码。
+`combined-fixed-v1` 只剩 DNS child Value；该红灯由主席接手，不再写被审六件。
+
+### P2 Transport 只核 OAEP OID，未核固定参数
+
+坐标为冻结 `466463b804fc`
+`tools/cert_transport.py:353` 至 `:365`。主仓 `66411f0` 内容摘要相同：
+`e4ba8193f694`（完整值见冻结报告）。
+接收端只正则核 AuthEnvelopedData/AES256GCM/rsaesOaep OID，
+未验证 OAEP hash、MGF1 hash、pSource label 的完整结构/唯一性。
+
+独立生成合成 CA、EC 源 key 和 RSA recipient，真实签名、真实 CMS 封包。
+四个负例分别为 SHA1/SHA1、SHA256/SHA1、SHA512/SHA512、SHA256/SHA256
+加非空 label `01`；四者均真实调用 authenticated_decrypt、验签/链/配对
+并返回 OFFLINE_PROTOCOL_PASS。固定 SHA256/SHA256 空 label 阳性对照通过。
+不是破解 GCM 或签名，也未发现生产解密；是固定套件声明与接收行为不符。
+
+具体复现与产物：`transport-baseline-expanded-v2/` 下四个
+`test_transport_*` 参数测试目录，各有公开 `suite-*.json` 结构及
+`downgrade.json` 或 `suite-refusal.json`，记录 attempted=true/refused=null/
+validation_report=OFFLINE_PROTOCOL_PASS；私钥及 payload 未落盘。
+建议在私密解密前结构化核唯一 recipient、准确 OAEP SHA256、
+MGF1 SHA256、空 pSpecified label、参数/OID 唯一性和 DER 完整性，
+不能只增加一个可匹配任意位置的 sha256 字符串。源码修复由主席负责。
+新增双 recipient 使用两个实际合成 RSA recipient 生成真实 CMS，
+原版 accept 返回 OFFLINE_PROTOCOL_PASS，单项控制红灯保留。
+
+### 修复树独立回归
+
+2026-10-10 主席明确冻结 `/data/dev/opensim-security-followup-v1` 六件 dirty
+修复给本席只读；不把 HEAD `9567f7d` 冒充修复 bytes 的提交身份。
+DNS 源/测试/文档和 transport 源/测试/文档分别外置冻结，执行前与结束
+均核摘要。`followup-app-dns-v1` 34/34、`followup-transport-v1` 15/15，
+原 32/10 对应反证及新增故障/参数/多 recipient 控制均真实执行，0 skip。
+
+DNS 源 SHA256 前缀 `878d1f2fae48`，
+transport 源 SHA256 前缀 `41c115675552`。
+app 源摘要仍为上列 `752922...`。完整六件及导出件摘要在各
+frozen-source.json/frozen-transport.json，input_after_tests 均 matches_frozen=true。
+
+DNS 合成 child 冲突 Value 不再进 ledger 或 CLI receipt；
+transport 的 SHA1、MGF1 SHA1、SHA512、非空 label 和双 recipient 都在
+authenticated_decrypt 前拒绝，固定套件仍通过真实验签/链/配对。
+过期 offer 现在 close，accept 合理抛 SESSION_ALREADY_CONSUMED 即 PASS。
+这些通过只绑定上述冻结 bytes，不能用专项 51/48 自报替代主仓收口。
+主仓合入 `8becc3b` 后已不传任何源覆写运行 default discover，
+`discover-6c55f8803b6f*` 49/49 PASS、rc0、0 failure/error/skip。
+十三件当前输入路径全部指向 `/data/dev/opensim`；冻结前/后/结束摘要
+全匹配，报告/日志/两份冻结清单实际存在。没有依赖历史 DNS worktree。
+`followup-all-v1` 同一进程一次冻结 app 与六件修复及导出件，
+49/49 PASS、rc0，完整 report.json/execution.log 和冻结清单均实际存在。
+本轮点名扫描曾因文档公开完整 SHA/UUID 触发 long-hex，旧 FAIL 留盘；
+文档改为短指纹，完整摘要与 UUID 保留在外置报告，不放宽扫描规则。
+
+### 过期公开 offer 改判
+
+原 `transport-independent-v1` 第三条断言只要求过期 offer 不导出，
+不足以认定 P2：request/recipient certificate 本身是公开材料，
+accept 在 monotonic 过期后仍拒绝私密响应，不能据此声称泄露。
+原 10/3fail 产物不改；新
+`test_transport_expired_offer_cannot_accept_private_response` 真实先 seal，
+再推进 deadline、观察公开 offer，并断言 accept 拒绝/会话消耗或关闭。
+discover 与扩展 baseline 该项 PASS；不是 skip 或 expectedFailure。
+
+### Transport 未准入边界
+
+同一 ReplayGuard 阻断重复读取，换 guard 后可再 seal 是文档明确的
+进程内边界，需要 root-owned 持久授权拒绝旧事务，不能称持久重放保护。
+固定 caller pin 下替换 recipient 在读源私钥前拒绝；若调用者自行批准
+攻击者 pins，是改变可信输入，不是旧 pin 绕过。
+真实 OpenSSL 子进程失败的敏感合成诊断不进入异常；未证安全擦除或恶意同 UID 隔离。
+生产动作仍全部拒绝。host 信任锚、可信 controller/source/dependencies、
+持久状态、memfd/core/swap 隔离、权限、真实双端安装/恢复和持续 renew 尚未验。
 
 ## 证书密文转运设计
 
@@ -242,6 +369,5 @@ namespace），Linux `memfd_create(2)` 与 `memfd_secret(2)`（内存 fd 边界�
 若现有链没有可独立认证 recipient 的信任锚，或不能把中转与任意 root
 执行区分，结论就是 **BLOCKED**，不能用“只有密文”解除证书门。
 
-首轮测试、具体漏洞坐标、实际 count/rc、证据链接及证书密文传递只读
-设计判断将在现读产物后补充。ROOT controller、生产 systemd、真实身份链、
-网络、renew 与恶意 root 均没有实际执行或取得许可。
+ROOT controller、生产 systemd、真实身份链、网络、renew 与恶意 root
+均没有实际执行或取得许可。离线协议测试通过也不能解除这些门。

@@ -1,6 +1,8 @@
 """Independent release counterexamples. All state is external; no live secrets.
 
-Run with --out NEW_SEAT_SECURITY_DIRECTORY. The same reviewed file implements
+CLI and unittest discovery freeze the current candidate; --baseline selects the
+original reviewed commits. Run with --out NEW_SEAT_SECURITY_DIRECTORY.
+The same reviewed file implements
 the fixed offline DNS subprocess. Security expectations remain red on vulnerable
 sources; a successful exploit is not relabelled as a passing security gate.
 """
@@ -9,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import ExitStack
 import copy
 import errno
 import hashlib
@@ -28,14 +31,18 @@ from unittest.mock import patch
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
-DNS_SOURCE = Path("/data/dev/opensim/tools/dns_release.py")
+CURRENT_ROOT = Path("/data/dev/opensim")
+DNS_SOURCE = CURRENT_ROOT / "tools/dns_release.py"
 EXTERNAL = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-security")
 WRITESET = ("tests/test_release_security.py", "docs/testing/RELEASE_SECURITY.md")
 REAL_RUN = subprocess.run
 RUN = None
 dns = None
 FROZEN = {}
-APP_SOURCE_ROOT = ROOT
+APP_SOURCE_ROOT = CURRENT_ROOT
+TRANSPORT_ROOT = CURRENT_ROOT
+transport = None
+TRANSPORT_FROZEN = {}
 sys.path.insert(0, str(ROOT))
 from tools import release_app as app
 
@@ -58,7 +65,7 @@ def freeze_sources(out, app_revision, dns_revision, app_root, dns_source):
         working = revision == "WORKTREE"
         commit = command(["/usr/bin/git", "rev-parse", "--verify",
                           ("HEAD" if working else revision) + "^{commit}"], repo).stdout.strip()
-        source_path = repo / relative
+        source_path = dns_source if label == "dns" else repo / relative
         if working:
             before_sha = hashlib.sha256(source_path.read_bytes()).hexdigest()
             body = source_path.read_bytes()
@@ -91,7 +98,136 @@ def freeze_sources(out, app_revision, dns_revision, app_root, dns_source):
     # code bytes are frozen; the transport never executes the real signer.
     dns.ROOT = dns_source.parents[1]
     dns.FIXTURE = dns.ROOT / "tests/test_dns_release.py"
+    export_directory = directory / "exports"
+    export_directory.mkdir()
+    exports = {}
+    for name in app.EXPORTS:
+        source = app_root / name
+        if app_revision == "WORKTREE":
+            before = app.sha(source.read_bytes())
+            body = source.read_bytes()
+        else:
+            result = REAL_RUN(["/usr/bin/git", "show", FROZEN["app"]["commit"] + ":" + name],
+                              cwd=app_root, capture_output=True)
+            if result.returncode:
+                raise RuntimeError(f"Freeze app export rc={result.returncode}: {name}")
+            body = result.stdout
+            before = app.sha(body)
+        destination = export_directory / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("xb") as stream:
+            stream.write(body)
+        os.chmod(destination, 0o444)
+        after = app.sha(source.read_bytes()) if app_revision == "WORKTREE" else before
+        if before != app.sha(body) or after != before or destination.read_bytes() != body:
+            raise RuntimeError(f"App export drift during freeze: {name}")
+        exports[name] = {"path": str(destination), "sha256": before,
+                         "input_path": str(source), "origin": FROZEN["app"]["origin"],
+                         "before_sha256": before, "after_sha256": after}
+    FROZEN["app"]["exports"] = exports
+    references = {}
+    if dns_revision == "WORKTREE":
+        for name in ("tests/test_dns_release.py", "docs/deploy/DNS_RELEASE.md"):
+            source = dns_source.parents[1] / name
+            before = app.sha(source.read_bytes())
+            body = source.read_bytes()
+            destination = directory / "dns-refs" / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("xb") as stream:
+                stream.write(body)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(destination, 0o444)
+            after = app.sha(source.read_bytes())
+            if before != app.sha(body) or before != after or destination.read_bytes() != body:
+                raise RuntimeError(f"DNS reference drift during freeze: {name}")
+            references[name] = {"path": str(destination), "sha256": before,
+                                "input_path": str(source), "origin": "WORKTREE",
+                                "before_sha256": before, "after_sha256": after}
+    FROZEN["dns"]["references"] = references
     dump(out / "frozen-source.json", FROZEN)
+
+
+def freeze_transport(out, revision):
+    global transport, TRANSPORT_FROZEN
+    directory = out / "frozen-transport"
+    directory.mkdir()
+    working = revision == "WORKTREE"
+    commit = command(["/usr/bin/git", "rev-parse", "--verify",
+                      ("HEAD" if working else revision) + "^{commit}"],
+                     TRANSPORT_ROOT).stdout.strip()
+    rows = {}
+    for relative in ("tools/cert_transport.py", "tests/test_cert_transport.py",
+                     "docs/deploy/CERT_TRANSPORT.md"):
+        source = TRANSPORT_ROOT / relative
+        if working:
+            before = app.sha(source.read_bytes())
+            body = source.read_bytes()
+        else:
+            result = REAL_RUN(["/usr/bin/git", "show", commit + ":" + relative],
+                              cwd=TRANSPORT_ROOT, capture_output=True)
+            if result.returncode:
+                raise RuntimeError(f"Freeze transport git rc={result.returncode}: {relative}")
+            body = result.stdout
+            before = app.sha(body)
+        destination = directory / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("xb") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(destination, 0o444)
+        after = app.sha(source.read_bytes()) if working else before
+        if destination.read_bytes() != body or before != app.sha(body) or before != after:
+            raise RuntimeError("Frozen transport readback differs")
+        rows[relative] = {"path": str(destination), "sha256": app.sha(body),
+                          "input_path": str(source),
+                          "before_sha256": before, "after_sha256": after}
+    TRANSPORT_FROZEN = {"commit": commit, "files": rows,
+                        "origin": "WORKTREE" if working else "COMMIT"}
+    dump(out / "frozen-transport.json", TRANSPORT_FROZEN)
+    transport = load_source("security_transport", directory / "tools/cert_transport.py")
+
+
+def ensure_current_run():
+    """Unittest discovery performs actual current-source tests, with no skips."""
+    global RUN, APP_SOURCE_ROOT, TRANSPORT_ROOT
+    if os.geteuid() == 0:
+        raise RuntimeError("Security tests must run as infra, never root")
+    if RUN is None:
+        EXTERNAL.mkdir(parents=True, exist_ok=True)
+        RUN = (EXTERNAL / ("discover-" + uuid4().hex)).resolve()
+        RUN.mkdir()
+        APP_SOURCE_ROOT = CURRENT_ROOT
+        TRANSPORT_ROOT = CURRENT_ROOT
+        freeze_sources(RUN, "WORKTREE", "WORKTREE", CURRENT_ROOT, DNS_SOURCE)
+        freeze_transport(RUN, "WORKTREE")
+        verify_frozen_inputs()
+
+
+def input_observations():
+    rows = dict(FROZEN)
+    rows.update({"export:" + name: row
+                 for name, row in FROZEN.get("app", {}).get("exports", {}).items()})
+    rows.update({"dns-ref:" + name: row
+                 for name, row in FROZEN.get("dns", {}).get("references", {}).items()})
+    if TRANSPORT_FROZEN.get("origin") == "WORKTREE":
+        rows.update({"transport:" + name: {**row, "origin": "WORKTREE"}
+                     for name, row in TRANSPORT_FROZEN["files"].items()})
+    observed = {}
+    for name, row in rows.items():
+        if row["origin"] != "WORKTREE":
+            continue
+        current = hashlib.sha256(Path(row["input_path"]).read_bytes()).hexdigest()
+        observed[name] = {"sha256": current, "matches_frozen": current == row["sha256"]}
+    return observed
+
+
+def verify_frozen_inputs():
+    observed = input_observations()
+    dump(RUN / "input-before-tests.json", observed)
+    if any(not row["matches_frozen"] for row in observed.values()):
+        raise RuntimeError("Candidate changed during multi-file freeze; preserve and stop")
 
 
 def dump(path, value):
@@ -192,8 +328,7 @@ class OfflineTransport:
 class SecurityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if os.geteuid() == 0 or RUN is None:
-            raise RuntimeError("Explicit external run as infra required")
+        ensure_current_run()
         cls.out = RUN
         cls.approot = patch.object(app, "ARTIFACTS", EXTERNAL)
         cls.approot.start()
@@ -203,12 +338,10 @@ class SecurityTests(unittest.TestCase):
         for name in app.EXPORTS:
             path = cls.repo / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            frozen_app_commit = FROZEN["app"]["commit"]
-            source = REAL_RUN(["/usr/bin/git", "show", frozen_app_commit + ":" + name],
-                              cwd=APP_SOURCE_ROOT, capture_output=True)
-            if source.returncode:
-                raise RuntimeError(f"Export frozen source rc={source.returncode}: {name}")
-            dump_body = source.stdout
+            frozen_source = FROZEN["app"]["exports"][name]
+            dump_body = Path(frozen_source["path"]).read_bytes()
+            if app.sha(dump_body) != frozen_source["sha256"]:
+                raise RuntimeError(f"Frozen app export drift: {name}")
             with path.open("xb") as stream:
                 stream.write(dump_body)
         events = []
@@ -524,6 +657,70 @@ class SecurityTests(unittest.TestCase):
         self.assertFalse(report is not None and report.get("exit_code") == 0,
                          "P2: fully written success report survives failed final persistence check")
 
+    def test_app_report_complete_bytes_readback_failure_is_revoked(self):
+        out = self.case / "cli-readback-failure"
+        original = app.read_file
+        injected = False
+
+        def failed_readback(path):
+            nonlocal injected
+            if path == out / "report.json" and not injected:
+                injected = True
+                self.assertEqual(app.decode(original(path))["exit_code"], 0)
+                raise OSError(errno.EIO, "offline completed report readback failure")
+            return original(path)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(app, "read_file", side_effect=failed_readback), \
+                patch.object(app.sys, "stdout", stdout), \
+                patch.object(app.sys, "stderr", stderr):
+            rc = app.main(["--apply", "--bundle", str(self.bundle), "--commit", self.commit,
+                           "--manifest-sha256", self.digest,
+                           "--fixture-root", str(self.case / "host"), "--out", str(out)])
+        report_path = out / "report.json"
+        report = app.decode(report_path.read_bytes()) if report_path.exists() else None
+        dump(self.case / "readback-failure.json",
+             {"rc": rc, "report": report, "fault_injected": injected,
+              "unit_exists": self.layout.unit.exists(), "stdout": stdout.getvalue(),
+              "stderr": stderr.getvalue()})
+        self.assertTrue(injected)
+        self.assertEqual(rc, 1)
+        self.assertTrue(self.layout.unit.exists())
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertFalse(report is not None and report.get("exit_code") == 0)
+
+    def test_app_persistent_revocation_failure_requires_real_process_rc(self):
+        out = self.case / "cli-persistent-readback"
+        original = app.read_file
+        readbacks = 0
+
+        def unavailable_report(path):
+            nonlocal readbacks
+            if path == out / "report.json":
+                readbacks += 1
+                raise OSError(errno.EIO, "offline persistent report readback failure")
+            return original(path)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(app, "read_file", side_effect=unavailable_report), \
+                patch.object(app.sys, "stdout", stdout), \
+                patch.object(app.sys, "stderr", stderr):
+            rc = app.main(["--apply", "--bundle", str(self.bundle), "--commit", self.commit,
+                           "--manifest-sha256", self.digest,
+                           "--fixture-root", str(self.case / "host"), "--out", str(out)])
+        report = app.decode((out / "report.json").read_bytes())
+        # Persistent I/O failure cannot guarantee file revocation. A saved rc=0
+        # is never sufficient authority; the caller must bind the real process rc.
+        dump(self.case / "revocation-boundary.json",
+             {"rc": rc, "file_report_rc": report["exit_code"], "readbacks": readbacks,
+              "stdout": stdout.getvalue(), "stderr": stderr.getvalue(),
+              "file_alone_is_not_acceptance": True})
+        self.assertEqual(rc, 1)
+        self.assertGreaterEqual(readbacks, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("invocation unverified", stderr.getvalue())
+        self.assertTrue(self.layout.unit.exists())
+
     def test_root_controller_checkout_rejected_without_root_execution(self):
         with patch.object(app.os, "geteuid", return_value=0):
             with self.assertRaisesRegex(app.ReleaseError, "checkout controller"):
@@ -686,8 +883,10 @@ class SecurityTests(unittest.TestCase):
               "receipt_contains_marker": marker in json.dumps(receipt),
               "failure_reason": receipt["failure"]["reason"]})
         self.assertEqual(rc, 2)
-        self.assertNotIn(marker, self.ledger.read_text(),
+        self.assertFalse(marker in self.ledger.read_text(),
                          "P2: rejected child-controlled DNS Value is persisted before validation")
+        self.assertFalse(marker in json.dumps(receipt),
+                         "P2: rejected child-controlled DNS Value appears in CLI receipt")
 
     def test_dns_symlink_ledger_rejected_and_target_unchanged(self):
         target = self.case / "other-owner"
@@ -716,6 +915,290 @@ class SecurityTests(unittest.TestCase):
               "scope": "NONROOT_WRITABLE_LEDGER_PARENT_NOT_HOSTILE_ROOT"})
         self.assertFalse((outside / "receipt.jsonl").exists(),
                          "P2: parent symlink replacement bypasses O_NOFOLLOW on final basename")
+
+
+class TransportSecurityTests(unittest.TestCase):
+    """Only synthetic private material in memory; never persist keys or payload."""
+
+    @classmethod
+    def setUpClass(cls):
+        ensure_current_run()
+        if os.geteuid() == 0 or transport is None:
+            raise RuntimeError("Frozen offline protocol and non-root caller required")
+        cls.ca_key = cls.generate_key()
+        cls.key = cls.generate_key()
+        with transport.memory_file(cls.ca_key) as fd:
+            cls.ca = transport.openssl("independent_synthetic_ca", [
+                "req", "-new", "-x509", "-key", transport.fd_path(fd), "-days", "30",
+                "-subj", "/CN=Independent offline CA",
+                "-addext", "basicConstraints=critical,CA:TRUE",
+                "-addext", "keyUsage=critical,keyCertSign,cRLSign"], descriptors=(fd,))
+        cls.bundle = cls.make_bundle(cls.key)
+        cls.now = int(time.time())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.key = cls.ca_key = b""
+
+    @staticmethod
+    def generate_key():
+        return transport.openssl("independent_synthetic_key", [
+            "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256"])
+
+    @classmethod
+    def make_bundle(cls, key):
+        with transport.memory_file(key) as fd:
+            csr = transport.openssl("independent_synthetic_csr", [
+                "req", "-new", "-key", transport.fd_path(fd),
+                "-subj", "/CN=" + transport.DOMAIN,
+                "-addext", "subjectAltName=DNS:" + transport.DOMAIN,
+                "-addext", "extendedKeyUsage=serverAuth"], descriptors=(fd,))
+        with transport.memory_file(csr) as csr_fd, \
+                transport.memory_file(cls.ca) as ca_fd, \
+                transport.memory_file(cls.ca_key) as ca_key_fd:
+            leaf = transport.openssl("independent_synthetic_leaf", [
+                "x509", "-req", "-in", transport.fd_path(csr_fd),
+                "-CA", transport.fd_path(ca_fd), "-CAkey", transport.fd_path(ca_key_fd),
+                "-set_serial", "2", "-days", "14", "-copy_extensions", "copy"],
+                descriptors=(csr_fd, ca_fd, ca_key_fd))
+        return leaf + cls.ca
+
+    def setUp(self):
+        self.case = RUN / self._testMethodName
+        self.case.mkdir()
+        self.session = transport.RecipientSession(transport.digest(self.bundle))
+        self.addCleanup(self.session.close)
+        self.request, self.pin, self.recipient_pin = self.session.offer()
+        self.replay = transport.ReplayGuard()
+
+    def seal(self, *, now=None):
+        with transport.memory_file(self.key) as fd:
+            return transport.seal(self.request, fd, self.bundle,
+                                  replay=self.replay, request_pin=self.pin,
+                                  recipient_pin=self.recipient_pin, now=now)
+
+    def custom_frame(self, oaep_digest="sha256", mgf_digest="sha256", label=None,
+                     extra_recipient=False):
+        content = transport.canonical({
+            "request": transport.encode(self.request),
+            "certificate": transport.encode(self.bundle),
+            "key": transport.encode(self.key)})
+        with transport.memory_file(self.key) as fd:
+            signature = transport.openssl("independent_source_signature", [
+                "dgst", "-sha256", "-sign", transport.fd_path(fd)],
+                data=content, descriptors=(fd,))
+        payload = transport.canonical({"content": transport.encode(content),
+                                       "signature": transport.encode(signature)})
+        recipient = transport.validate_request(self.request)["recipient"]
+        with ExitStack() as stack:
+            fd = stack.enter_context(transport.memory_file(transport.decode(recipient)))
+            options = (["-keyopt", "rsa_oaep_label:" + label] if label else [])
+            if extra_recipient:
+                other = transport.RecipientSession(transport.digest(self.bundle))
+                stack.callback(other.close)
+                other_request, _, _ = other.offer()
+                other_certificate = transport.decode(
+                    transport.validate_request(other_request)["recipient"])
+                other_fd = stack.enter_context(transport.memory_file(other_certificate))
+                options.extend(["-recip", transport.fd_path(other_fd),
+                                "-keyopt", "rsa_padding_mode:oaep",
+                                "-keyopt", "rsa_oaep_md:sha256",
+                                "-keyopt", "rsa_mgf1_md:sha256"])
+            descriptors = (fd, other_fd) if extra_recipient else (fd,)
+            encrypted = transport.openssl("independent_custom_oaep", [
+                "cms", "-encrypt", "-binary", "-outform", "DER", "-aes-256-gcm",
+                "-recip", transport.fd_path(fd), "-keyopt", "rsa_padding_mode:oaep",
+                "-keyopt", "rsa_oaep_md:" + oaep_digest,
+                "-keyopt", "rsa_mgf1_md:" + mgf_digest, *options],
+                data=payload, descriptors=descriptors)
+        details = transport.openssl("independent_public_suite", [
+            "cms", "-cmsout", "-print", "-inform", "DER"], data=encrypted)
+        dump(self.case / ("suite-" + oaep_digest + "-" + mgf_digest + ".json"),
+             {"oaep_digest": oaep_digest, "mgf_digest": mgf_digest,
+              "nonempty_label": bool(label),
+              "recipients": 2 if extra_recipient else 1,
+              "public_cms_structure": details.decode("ascii"),
+              "ciphertext_bytes": len(encrypted), "plaintext_persisted": False})
+        return transport.canonical({"version": 1, "request_pin": self.pin,
+                                    "ciphertext": transport.encode(encrypted)})
+
+    def test_transport_valid_real_openssl_roundtrip(self):
+        report = self.session.accept(self.seal(), self.ca)
+        dump(self.case / "validation.json", report)
+        self.assertEqual(report["verdict"], "OFFLINE_PROTOCOL_PASS")
+        self.assertFalse(report["production_ready"])
+        self.assertEqual(report["private_output"], "NONE")
+
+    def test_transport_independent_fixed_suite_builder_valid_roundtrip(self):
+        report = self.session.accept(self.custom_frame(), self.ca)
+        dump(self.case / "builder-control.json", report)
+        self.assertEqual(report["verdict"], "OFFLINE_PROTOCOL_PASS")
+        self.assertFalse(report["production_ready"])
+
+    def assert_suite_refused_before_decrypt(self, frame):
+        original = transport.openssl
+        attempted = False
+        refused = None
+        report = None
+
+        def observe(operation, args, **kwargs):
+            nonlocal attempted
+            if operation == "authenticated_decrypt":
+                attempted = True
+            return original(operation, args, **kwargs)
+
+        with patch.object(transport, "openssl", side_effect=observe):
+            try:
+                report = self.session.accept(frame, self.ca)
+            except transport.ProtocolError as exc:
+                refused = str(exc)
+        dump(self.case / "suite-refusal.json",
+             {"decryption_attempted": attempted, "refused": refused,
+              "validation_report": report, "scope": "SYNTHETIC_KEYS_ONLY"})
+        self.assertFalse(attempted, "P2: non-fixed OAEP parameters reach private decryption")
+        self.assertIsNotNone(refused)
+
+    def test_transport_oaep_sha512_nonfixed_suite_refused(self):
+        self.assert_suite_refused_before_decrypt(self.custom_frame("sha512", "sha512"))
+
+    def test_transport_nonempty_oaep_label_refused(self):
+        self.assert_suite_refused_before_decrypt(self.custom_frame(label="01"))
+
+    def test_transport_multiple_real_cms_recipients_refused(self):
+        self.assert_suite_refused_before_decrypt(self.custom_frame(extra_recipient=True))
+
+    def test_transport_child_private_diagnostics_do_not_escape(self):
+        marker = b"offline-" + b"sensitive-diagnostic"
+        fake = subprocess.CompletedProcess([], 23, marker, marker)
+        with patch.object(transport.subprocess, "run", return_value=fake):
+            with self.assertRaises(transport.CryptoError) as caught:
+                transport.openssl("independent_negative_child", ["pkey"])
+        self.assertEqual(caught.exception.returncode, 23)
+        self.assertNotIn(marker.decode(), str(caught.exception))
+        self.assertFalse(hasattr(caught.exception, "private_stderr"))
+
+    def test_transport_oaep_sha1_downgrade_rejected_before_decrypt(self):
+        frame = self.custom_frame("sha1", "sha1")
+        attempted_decrypt = False
+        original = transport.openssl
+
+        def observe(operation, args, **kwargs):
+            nonlocal attempted_decrypt
+            if operation == "authenticated_decrypt":
+                attempted_decrypt = True
+            return original(operation, args, **kwargs)
+
+        refused = None
+        report = None
+        with patch.object(transport, "openssl", side_effect=observe):
+            try:
+                report = self.session.accept(frame, self.ca)
+            except transport.ProtocolError as exc:
+                refused = str(exc)
+        dump(self.case / "downgrade.json",
+             {"refused": refused, "decryption_attempted": attempted_decrypt,
+              "validation_report": report, "scope": "SYNTHETIC_KEYS_ONLY"})
+        self.assertFalse(attempted_decrypt,
+                         "P2: RSA-OAEP SHA1 package reaches decryption despite fixed SHA256 suite")
+        self.assertIsNotNone(refused)
+
+    def test_transport_mgf1_sha1_downgrade_rejected_before_decrypt(self):
+        frame = self.custom_frame("sha256", "sha1")
+        original = transport.openssl
+        attempted_decrypt = False
+
+        def observe(operation, args, **kwargs):
+            nonlocal attempted_decrypt
+            if operation == "authenticated_decrypt":
+                attempted_decrypt = True
+            return original(operation, args, **kwargs)
+
+        refused = None
+        report = None
+        with patch.object(transport, "openssl", side_effect=observe):
+            try:
+                report = self.session.accept(frame, self.ca)
+            except transport.ProtocolError as exc:
+                refused = str(exc)
+        dump(self.case / "downgrade.json",
+             {"refused": refused, "decryption_attempted": attempted_decrypt,
+              "validation_report": report, "scope": "SYNTHETIC_KEYS_ONLY"})
+        self.assertFalse(attempted_decrypt,
+                         "P2: MGF1 SHA1 parameters are not checked against SHA256")
+        self.assertIsNotNone(refused)
+
+    def test_transport_fixed_request_pin_rejects_recipient_substitution(self):
+        other = transport.RecipientSession(transport.digest(self.bundle))
+        self.addCleanup(other.close)
+        request, _, recipient_pin = other.offer()
+        with transport.memory_file(self.key) as fd, \
+                patch.object(transport.os, "pread", side_effect=AssertionError(
+                    "Source plaintext read before request authentication")):
+            with self.assertRaisesRegex(transport.ProtocolError, "TRUSTED_CONTEXT"):
+                transport.seal(request, fd, self.bundle, replay=self.replay,
+                               request_pin=self.pin, recipient_pin=recipient_pin)
+
+    def test_transport_source_replay_same_lifetime_denied(self):
+        self.seal()
+        with patch.object(transport.os, "pread", side_effect=AssertionError(
+                "Source read on replay")):
+            with self.assertRaisesRegex(transport.ProtocolError, "ALREADY_CONSUMED"):
+                self.seal()
+
+    def test_transport_source_restart_boundary_is_not_durable_replay_protection(self):
+        first = self.seal()
+        self.replay = transport.ReplayGuard()
+        second = self.seal()
+        dump(self.case / "replay-boundary.json",
+             {"reissued_after_new_guard": bool(first and second),
+              "scope": "DOCUMENTED_PROCESS_LOCAL_NOT_DURABLE",
+              "production_authorization_required": True})
+        self.assertTrue(first and second)
+
+    def test_transport_expired_offer_cannot_accept_private_response(self):
+        frame = self.seal()
+        with patch.object(transport.time, "monotonic",
+                          return_value=self.session._deadline + 1):
+            refused = None
+            exported = False
+            try:
+                self.session.offer()
+                exported = True
+            except transport.ProtocolError as exc:
+                refused = str(exc)
+            with self.assertRaisesRegex(transport.ProtocolError, "EXPIRED|CONSUMED"):
+                self.session.accept(frame, self.ca)
+        dump(self.case / "expired-offer.json",
+             {"public_offer_exported": exported, "refused": refused,
+              "session_state": self.session.state})
+        self.assertIn(self.session.state, ("CONSUMED", "CLOSED"))
+
+    def test_transport_source_expiry_during_crypto_denied(self):
+        request = transport.validate_request(self.request)
+        with patch.object(transport.time, "time",
+                          side_effect=[request["issued"], request["expires"]]):
+            with self.assertRaisesRegex(transport.ProtocolError, "EXPIRED"):
+                self.seal()
+
+    def test_transport_untrusted_source_pin_is_an_external_approval_boundary(self):
+        other = transport.RecipientSession(transport.digest(self.bundle))
+        self.addCleanup(other.close)
+        request, pin, recipient_pin = other.offer()
+        with transport.memory_file(self.key) as fd:
+            frame = transport.seal(request, fd, self.bundle, replay=transport.ReplayGuard(),
+                                   request_pin=pin, recipient_pin=recipient_pin)
+        report = other.accept(frame, self.ca)
+        dump(self.case / "trusted-pin-boundary.json",
+             {"attacker_chosen_pins_accepted": report["verdict"] == "OFFLINE_PROTOCOL_PASS",
+              "scope": "NEW_TRUSTED_APPROVAL_NOT_BYPASS_OF_PINNED_REQUEST",
+              "production_ready": False})
+        self.assertFalse(report["production_ready"])
+
+    def test_transport_production_cli_always_denied_before_subprocess(self):
+        with patch.object(transport.subprocess, "run", side_effect=AssertionError(
+                "No production subprocess")), patch.object(sys, "stderr", io.StringIO()):
+            for action in ("prepare", "transfer", "apply", "renew"):
+                self.assertEqual(transport.main([action]), 1)
 
 
 def scan_files(out):
@@ -772,17 +1255,83 @@ def scan_files(out):
     return report["verdict"] == "PASS"
 
 
+def write_summary(result, started, *, initial_tests=0, initial_failures=0,
+                  initial_errors=0, initial_skips=0, failure_rc=2, log=None):
+    failures = [{"test": test.id(), "traceback": trace}
+                for test, trace in result.failures[initial_failures:] +
+                result.errors[initial_errors:]]
+    passed = not failures and not result.unexpectedSuccesses
+    report = {"scope": "REAL_EXTERNAL_FS_FIXED_OFFLINE_SUBPROCESS_SYNTHETIC_CRYPTO",
+              "verdict": "PASS" if passed else "FAIL",
+              "tests": result.testsRun - initial_tests,
+              "failures": len(result.failures) - initial_failures,
+              "errors": len(result.errors) - initial_errors,
+              "skips": len(result.skipped) - initial_skips,
+              "rc": 0 if passed else failure_rc,
+              "elapsed_seconds": round(time.monotonic() - started, 3),
+              "sources": FROZEN, "transport_sources": TRANSPORT_FROZEN,
+              "source_commit": command(["/usr/bin/git", "rev-parse", "HEAD"], ROOT).stdout.strip(),
+              "production_mutations": 0, "actual_secret_reads": 0, "details": failures,
+              "input_after_tests": input_observations()}
+    if report["tests"] < 1 or report["skips"]:
+        raise RuntimeError("Security acceptance requires executed tests with no skips")
+    dump(RUN / "report.json", report)
+    with (RUN / "execution.log").open("x") as stream:
+        stream.write(log if log is not None else json.dumps(report, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    print(f"RELEASE_SECURITY verdict={report['verdict']} tests={report['tests']} "
+          f"failures={report['failures']} errors={report['errors']} rc={report['rc']} out={RUN}")
+    for row in failures:
+        print("FAILED " + row["test"])
+    return report["rc"]
+
+
+class DiscoveryEvidenceSuite(unittest.TestSuite):
+    """Use the real discovery runner result, including setUpClass failures."""
+
+    def run(self, result, debug=False):
+        started = time.monotonic()
+        initial = (result.testsRun, len(result.failures), len(result.errors), len(result.skipped))
+        super().run(result, debug)
+        if RUN is None:
+            raise RuntimeError("Discovery did not execute current-source security setup")
+        write_summary(result, started, initial_tests=initial[0], initial_failures=initial[1],
+                      initial_errors=initial[2], initial_skips=initial[3], failure_rc=1)
+        return result
+
+
+def load_tests(loader, standard_tests, pattern):
+    return DiscoveryEvidenceSuite([
+        loader.loadTestsFromTestCase(SecurityTests),
+        loader.loadTestsFromTestCase(TransportSecurityTests)])
+
+
 def main():
-    global RUN
+    global RUN, APP_SOURCE_ROOT, TRANSPORT_ROOT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--scan-only", action="store_true")
-    parser.add_argument("--app-revision", default="b0ec932")
-    parser.add_argument("--dns-revision", default="3b2ecbe")
-    parser.add_argument("--app-root", type=Path, default=ROOT)
+    parser.add_argument("--baseline", action="store_true",
+                        help="Explicit original app/DNS/transport commits; old red controls")
+    parser.add_argument("--app-revision")
+    parser.add_argument("--dns-revision")
+    parser.add_argument("--app-root", type=Path)
     parser.add_argument("--dns-source", type=Path, default=DNS_SOURCE)
     parser.add_argument("--only", action="append", default=[])
+    parser.add_argument("--transport-only", action="store_true")
+    parser.add_argument("--all", action="store_true", help="Run both security classes")
+    parser.add_argument("--transport-root", type=Path, default=CURRENT_ROOT)
+    parser.add_argument("--transport-revision")
     args = parser.parse_args()
+    if args.all and (args.transport_only or args.only):
+        parser.error("--all cannot be combined with --transport-only/--only")
+    if os.geteuid() == 0:
+        raise RuntimeError("Security tests must run as infra, never root")
+    app_revision = args.app_revision or ("b0ec932" if args.baseline else "WORKTREE")
+    dns_revision = args.dns_revision or ("3b2ecbe" if args.baseline else "WORKTREE")
+    transport_revision = args.transport_revision or ("466463b8" if args.baseline else "WORKTREE")
+    app_root = args.app_root or (ROOT if args.baseline else CURRENT_ROOT)
     out = args.out.absolute()
     if EXTERNAL.resolve() not in out.resolve().parents or out.is_symlink():
         raise RuntimeError("Fresh output below seat-security required")
@@ -791,41 +1340,29 @@ def main():
         passed = scan_files(out)
         print(f"SECURITY_SCAN verdict={'PASS' if passed else 'FAIL'} out={out}")
         return 0 if passed else 2
-    global APP_SOURCE_ROOT
     RUN = out.resolve()
-    APP_SOURCE_ROOT = args.app_root.resolve(strict=True)
-    freeze_sources(RUN, args.app_revision, args.dns_revision, APP_SOURCE_ROOT,
-                   args.dns_source.resolve(strict=True))
+    APP_SOURCE_ROOT = app_root.resolve(strict=True)
+    TRANSPORT_ROOT = args.transport_root.resolve(strict=True)
+    if args.transport_only:
+        freeze_transport(RUN, transport_revision)
+    else:
+        freeze_sources(RUN, app_revision, dns_revision, APP_SOURCE_ROOT,
+                       args.dns_source.resolve(strict=True))
+        if args.all:
+            freeze_transport(RUN, transport_revision)
+    verify_frozen_inputs()
     started = time.monotonic()
     stream = io.StringIO()
     loader = unittest.defaultTestLoader
-    suite = (unittest.TestSuite(SecurityTests(name) for name in args.only) if args.only else
-             loader.loadTestsFromTestCase(SecurityTests))
+    case_class = TransportSecurityTests if args.transport_only else SecurityTests
+    if args.all:
+        suite = unittest.TestSuite([loader.loadTestsFromTestCase(SecurityTests),
+                                    loader.loadTestsFromTestCase(TransportSecurityTests)])
+    else:
+        suite = (unittest.TestSuite(case_class(name) for name in args.only) if args.only else
+                 loader.loadTestsFromTestCase(case_class))
     result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)
-    failures = [{"test": test.id(), "traceback": trace}
-                for test, trace in result.failures + result.errors]
-    report = {"scope": "REAL_EXTERNAL_FS_FIXED_OFFLINE_SUBPROCESS",
-              "verdict": "PASS" if result.wasSuccessful() else "FAIL",
-              "tests": result.testsRun, "failures": len(result.failures),
-              "errors": len(result.errors), "skips": len(result.skipped),
-              "rc": 0 if result.wasSuccessful() else 2,
-              "elapsed_seconds": round(time.monotonic() - started, 3),
-              "sources": FROZEN,
-              "source_commit": command(["/usr/bin/git", "rev-parse", "HEAD"], ROOT).stdout.strip(),
-              "production_mutations": 0, "actual_secret_reads": 0, "details": failures}
-    report["input_after_tests"] = {
-        label: {"sha256": hashlib.sha256(Path(row["input_path"]).read_bytes()).hexdigest(),
-                "matches_frozen": hashlib.sha256(
-                    Path(row["input_path"]).read_bytes()).hexdigest() == row["sha256"]}
-        for label, row in FROZEN.items() if row["origin"] == "WORKTREE"}
-    dump(out / "report.json", report)
-    with (out / "execution.log").open("x") as log:
-        log.write(stream.getvalue())
-    print(f"RELEASE_SECURITY verdict={report['verdict']} tests={report['tests']} "
-          f"failures={report['failures']} errors={report['errors']} rc={report['rc']} out={out}")
-    for row in failures:
-        print("FAILED " + row["test"])
-    return report["rc"]
+    return write_summary(result, started, log=stream.getvalue())
 
 
 if __name__ == "__main__":
