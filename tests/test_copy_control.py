@@ -15,9 +15,12 @@ import sys
 import threading
 import time
 import unittest
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 EXTERNAL = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/authorized-s1-copy-control-20261011")
+DISCOVERY_EXTERNAL = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/authorized-s3-copy-discovery-fix-20261011")
+OUTPUT_ROOTS = (EXTERNAL, DISCOVERY_EXTERNAL)
 EVIDENCE = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/local-v8/numerics.json")
 SOURCES = ("tools/render_page.py", "web/app.js", "web/app.css", "tests/test_copy_control.py",
            "docs/testing/COPY_CONTROL.md", "solver.py", "server.py", "tools/browser_audit.mjs")
@@ -35,7 +38,8 @@ import { createHash } from "node:crypto";
 const [source, url, run, expectedFile, mode] = process.argv.slice(2);
 assert.equal(process.argv.slice(2).length, 5);
 assert(["copy", "tab-exclusion-red"].includes(mode));
-assert(run.startsWith("/hf3fs-jd/data/tmp/opensim-fluid-v1/authorized-s1-copy-control-20261011/")
+assert(["/hf3fs-jd/data/tmp/opensim-fluid-v1/authorized-s1-copy-control-20261011/",
+  "/hf3fs-jd/data/tmp/opensim-fluid-v1/authorized-s3-copy-discovery-fix-20261011/"].some(base => run.startsWith(base))
   && path.resolve(run) === run, "Fixed fresh output required");
 const { Browser } = await import(pathToFileURL(path.join(source, "tools/browser_audit.mjs")));
 const hash = value => createHash("sha256").update(value).digest("hex");
@@ -357,6 +361,36 @@ class CopyControlTests(unittest.TestCase):
     out = None
     children = []
 
+    @classmethod
+    def setUpClass(cls):
+        # Discovery does not call main; allocate the same real evidence lifecycle.
+        if cls.out is None:
+            cls.out = DISCOVERY_EXTERNAL / ("discover-" + uuid4().hex)
+            cls.out.mkdir(parents=True, exist_ok=False)
+        cls.children = []
+        try:
+            cls.source_before = inventory()
+            cls.evidence_sha256 = sha(EVIDENCE.read_bytes())
+        except Exception:
+            cls.out = None
+            raise
+        print(f"COPY_CONTROL_OUTPUT={cls.out}", flush=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            after = inventory()
+            write_new(cls.out / "lifecycle-readback.json", encode({
+                "schema": "opensim-copy-control-lifecycle-v1", "source_before": cls.source_before,
+                "source_after": after, "source_stable": cls.source_before == after,
+                "evidence_sha256": cls.evidence_sha256, "children": cls.children,
+                "finished_at": datetime.now(timezone.utc).isoformat(), "certified": False,
+            }))
+            if cls.source_before != after:
+                raise AssertionError("Copy test source changed during execution")
+        finally:
+            cls.out = None
+
     def test_existing_page_regression(self):
         suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern="test_page.py")
         stream = io.StringIO()
@@ -512,7 +546,7 @@ def main():
     parser.add_argument("--method", action="append", choices=unittest.defaultTestLoader.getTestCaseNames(CopyControlTests))
     args = parser.parse_args()
     out = args.out.absolute()
-    if ".." in args.out.parts or not out.is_relative_to(EXTERNAL) or out == EXTERNAL:
+    if ".." in args.out.parts or not any(out.is_relative_to(base) and out != base for base in OUTPUT_ROOTS):
         parser.error("Fresh output must be a child of the fixed external root")
     out.mkdir(parents=True, exist_ok=False)
     CopyControlTests.out = out
