@@ -1,7 +1,7 @@
 """Real CLI/FS negative controls for desired releases; never call production.
 
-The peer API is read-only. Its existing immutable test bundles are inspected,
-not installed or modified. All new test files and logs remain under seat-sync.
+The pinned peer API prepares only unique owned offline bundles, never installs.
+No shared historical bundles are selected or modified. Evidence stays external.
 """
 
 from __future__ import annotations
@@ -13,6 +13,8 @@ import hashlib
 import io
 import os
 from pathlib import Path
+import stat
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -26,6 +28,29 @@ sys.path.insert(0, str(ROOT / "tests"))
 import release_gate as gate
 import sync_release as sync
 from test_release_gate import Fixture, put, run_suite
+
+BUNDLE_MODE_ROOT = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/authorized-s4-sync-bundle-mode-fix-20261011")
+
+
+def bundle_file_snapshot(bundle: Path) -> dict:
+    paths = [bundle, *sorted(bundle.rglob("*"))]
+    return {"." if path == bundle else path.relative_to(bundle).as_posix():
+            {"mode": stat.S_IMODE(path.lstat().st_mode), "uid": path.lstat().st_uid,
+             "gid": path.lstat().st_gid, "inode": path.lstat().st_ino,
+             "sha256": gate.sha(path.read_bytes()) if path.is_file() else None}
+            for path in paths}
+
+
+def write_bundle_stream(path: Path, body: bytes) -> None:
+    """Retain actual child bytes, including empty stderr; never replace streams."""
+    gate.external(path, gate.OUTPUT_ROOT)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(body)
+        stream.flush()
+        os.fsync(stream.fileno())
+    if path.read_bytes() != body:
+        raise AssertionError("Bundle-mode child stream readback drift")
 
 
 class SyncTests(unittest.TestCase):
@@ -186,19 +211,73 @@ class SyncTests(unittest.TestCase):
             sync.validate_before(api, self.desired)
 
     def test_real_peer_bundle_validate_and_bad_pin(self):
-        peer_root = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/seat-release")
-        # Select only a bundle the peer explicitly produced as BUNDLE_PREPARED.
-        candidates = sorted(peer_root.glob("fixtures-*/bundle-v1/manifest.json"))
-        self.assertTrue(candidates, "No actual peer API bundle available; integration unverified")
-        manifest_path = candidates[-1]
+        api = sync.load_api(self.api, self.f.identity["tool_sha256"]["tools/release_app.py"])
+        api_before = self.api.read_bytes()
+        validations = []
+        original_validate = api.validate_bundle
+        def measured_validate(path, digest, commit):
+            event = {"bundle": str(path), "manifest_sha256": digest, "commit": commit}
+            validations.append(event)
+            try:
+                value = original_validate(path, digest, commit)
+            except Exception as first:
+                event.update(state="REFUSED", first_cause=str(first), error_type=type(first).__name__)
+                raise
+            event["state"] = "VALIDATED"
+            return value
+        api.validate_bundle = measured_validate
+        source_before = {name: gate.sha((self.f.repo / name).read_bytes()) for name in api.EXPORTS}
+        evidence = gate.ARTIFACT_ROOT / "local-v8/numerics.json"
+        evidence_before = evidence.read_bytes()
+        api.validate_evidence(evidence_before, source_before["solver.py"])
+        # The real API owns sealing; never repair a shared history mode in place.
+        bundle = sync.PREPARE_ROOT / ("s4-sync-bundle-mode-" + uuid4().hex) / "bundle"
+        self.assertFalse(bundle.exists())
+        prepared = api.prepare(self.f.repo, self.f.commit, evidence, bundle)
+        self.assertEqual(prepared["state"], "BUNDLE_PREPARED")
+        self.assertEqual(prepared["scope"], "SOURCE_AND_NUMERICS_ONLY")
+        manifest_path = bundle / "manifest.json"
         raw = manifest_path.read_bytes()
         manifest = gate.decode(raw)
-        api = sync.load_api(self.api, self.f.identity["tool_sha256"]["tools/release_app.py"])
-        value = api.validate_bundle(manifest_path.parent.resolve(), gate.sha(raw), manifest["commit"])
+        self.assertEqual(prepared["manifest_sha256"], gate.sha(raw))
+        before = bundle_file_snapshot(bundle)
+        self.assertTrue(all(row["mode"] == (0o444 if row["sha256"] is not None else 0o555)
+                            for row in before.values()))
+        value = api.validate_bundle(bundle.resolve(), prepared["manifest_sha256"], self.f.commit)
         self.assertEqual(value, manifest)
         self.assertEqual(manifest_path.read_bytes(), raw)
         with self.assertRaisesRegex(api.ReleaseError, "manifest SHA drift"):
-            api.validate_bundle(manifest_path.parent.resolve(), "0" * 64, manifest["commit"])
+            api.validate_bundle(bundle.resolve(), "0" * 64, self.f.commit)
+        self.assertEqual(bundle_file_snapshot(bundle), before)
+        mutable = self.f.directory / "mode-only-negative-bundle"
+        shutil.copytree(bundle, mutable)
+        target = mutable / "build/index-v1.html"
+        target_before = target.read_bytes()
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o444)
+        target.chmod(0o644)
+        self.assertEqual(target.read_bytes(), target_before)
+        self.assertEqual((mutable / "manifest.json").read_bytes(), raw)
+        with self.assertRaisesRegex(api.ReleaseError, "Release file is not read-only: build/index-v1.html"):
+            api.validate_bundle(mutable.resolve(), gate.sha(raw), self.f.commit)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+        self.assertEqual(bundle_file_snapshot(bundle), before)
+        self.assertEqual(self.api.read_bytes(), api_before)
+        source_after = {name: gate.sha((self.f.repo / name).read_bytes()) for name in api.EXPORTS}
+        self.assertEqual(source_after, source_before)
+        self.assertEqual(evidence.read_bytes(), evidence_before)
+        self.assertTrue(api.COMMANDS)
+        self.assertTrue(all(row["rc"] == 0 for row in api.COMMANDS))
+        put(self.f.directory / "owned-peer-bundle.json", gate.encode({
+            "scope": "REAL_PREPARE_VALIDATE_AND_MODE_NEGATIVE_NOT_CERTIFIED",
+            "prepared": prepared, "api_sha256": gate.sha(api_before),
+            "source_before": source_before, "source_after": source_after,
+            "numerics_sha256": gate.sha(evidence_before), "commands": api.COMMANDS,
+            "files_before": before, "files_after": bundle_file_snapshot(bundle),
+            "negative_bundle": str(mutable), "negative_mode": stat.S_IMODE(target.stat().st_mode),
+            "validation_calls": len(validations), "validations": validations,
+            "bad_pin_caught": "Bundle manifest SHA drift",
+            "mode_caught": "Release file is not read-only: build/index-v1.html",
+            "production_changes": False, "certified": False}))
 
     def test_unit_templates_have_no_publication_privilege(self):
         service = (ROOT / "deploy/opensim-sync.service").read_text()
@@ -762,6 +841,44 @@ class MainApiTests(unittest.TestCase):
         self.assertEqual(gate.git(root, "rev-parse", "HEAD").decode().strip(), commit)
 
 
+def run_bundle_mode(out: Path, selected: list[str]) -> int:
+    """Bounded nonroot child with actual streams and immutable source observation."""
+    if os.geteuid() == 0 or not out.is_absolute() or not out.resolve().is_relative_to(BUNDLE_MODE_ROOT.resolve()):
+        raise RuntimeError("Owned nonroot bundle-mode evidence root required")
+    out.mkdir(parents=True, exist_ok=False)
+    gate.OUTPUT_ROOT = out
+    names = ("tests/test_sync_release.py", "tests/test_release_gate.py", "tools/sync_release.py",
+             "tools/release_gate.py", "tools/release_app.py", "tools/render_page.py", "solver.py", "requirements.txt")
+    before = {name: gate.sha((ROOT / name).read_bytes()) for name in names}
+    argv = ["/usr/bin/python3", "-I", "-B", str(Path(__file__).resolve()), "--bundle-mode-child",
+            "--out", str(out / "tests")]
+    for name in selected:
+        if name not in SyncTests.__dict__ or not name.startswith("test_"):
+            raise ValueError("Unknown SyncTests method")
+        argv += ["--select", name]
+    child = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL,
+                           env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
+                                "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"})
+    write_bundle_stream(out / "launcher.stdout", child.stdout)
+    write_bundle_stream(out / "launcher.stderr", child.stderr)
+    after = {name: gate.sha((ROOT / name).read_bytes()) for name in names}
+    report = gate.decode((out / "tests/report.json").read_bytes())
+    passed = child.returncode == report["exit_code"] == 0 and report["tests"] == len(selected) and before == after
+    gate.write_new(out / "summary.json", gate.encode({
+        "scope": "NONROOT_REAL_BUNDLE_TESTS_NOT_CERTIFIED", "argv": argv, "actual_child_rc": child.returncode,
+        "tests": report["tests"], "failures": report["failures"], "errors": report["errors"],
+        "verdict": "PASS" if passed else "FAIL", "source_before": before, "source_after": after,
+        "source_stable": before == after, "production_changes": False,
+        "stdout_bytes": len(child.stdout), "stdout_sha256": gate.sha(child.stdout),
+        "stderr_bytes": len(child.stderr), "stderr_sha256": gate.sha(child.stderr),
+        "report_sha256": gate.sha((out / "tests/report.json").read_bytes()),
+        "collected_at": datetime.now(timezone.utc).isoformat()}))
+    verdict, count = "PASS" if passed else "FAIL", report["tests"]
+    print(f"OPENSIM_SYNC_BUNDLE_MODE verdict={verdict} tests={count} "
+          f"actual_child_rc={child.returncode} source_stable={before == after} out={out}")
+    return 0 if passed else 1
+
+
 def scan(out: Path) -> int:
     """Point-name review using existing credential in memory, never output it."""
     import re
@@ -798,6 +915,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--scan", action="store_true")
+    parser.add_argument("--bundle-mode-only", action="store_true")
+    parser.add_argument("--bundle-mode-child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--select", action="append")
     parser.add_argument("--persistence-only", action="store_true")
     parser.add_argument("--main-api-only", action="store_true")
     parser.add_argument("--prepare-pin-only", action="store_true")
@@ -816,6 +936,29 @@ if __name__ == "__main__":
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--bundle", type=Path)
     args = parser.parse_args()
+    if args.bundle_mode_only:
+        raise SystemExit(run_bundle_mode(args.out, args.select or ["test_real_peer_bundle_validate_and_bad_pin"]))
+    if args.bundle_mode_child:
+        if os.geteuid() == 0 or not args.out.resolve().is_relative_to(BUNDLE_MODE_ROOT.resolve()):
+            raise RuntimeError("Owned bundle-mode child required")
+        args.out.mkdir(parents=True, exist_ok=False)
+        names = ("tests/test_sync_release.py", "tests/test_release_gate.py", "tools/sync_release.py", "tools/release_gate.py", "tools/release_app.py")
+        before = {name: gate.sha((ROOT / name).read_bytes()) for name in names}
+        suite = unittest.TestSuite(SyncTests(name) for name in args.select)
+        with (args.out / "execution.log").open("x", encoding="utf-8") as stream:
+            result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)
+            stream.flush()
+            os.fsync(stream.fileno())
+        after = {name: gate.sha((ROOT / name).read_bytes()) for name in names}
+        rc = 0 if result.wasSuccessful() and result.testsRun and before == after else 1
+        gate.OUTPUT_ROOT = args.out.parent
+        gate.write_new(args.out / "report.json", gate.encode({
+            "scope": "NONROOT_BUNDLE_MODE_SELECTED_NOT_CERTIFIED", "exit_code": rc,
+            "tests": result.testsRun, "failures": len(result.failures), "errors": len(result.errors),
+            "source_before": before, "source_after": after, "source_stable": before == after,
+            "production_changes": False, "collected_at": datetime.now(timezone.utc).isoformat()}))
+        print(f"OPENSIM_SYNC_BUNDLE_MODE_CHILD rc={rc} tests={result.testsRun}")
+        raise SystemExit(rc)
     if args.prepare_api_child:
         raise SystemExit(prepare_api_child(args))
     if args.fault_child:
