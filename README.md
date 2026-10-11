@@ -5,8 +5,10 @@
 代码主仓为 [GitLab](https://gitlab.ai4everyone.top/infra/opensim)，
 [Gitee](https://gitee.com/sdfwefqaa/opensim) 已同步同一代码快照。
 获取代码请明确使用 `clone -b main`：Gitee 默认 HEAD 仍指向旧 fluid，
-不能把默认分支当作最新候选。GitHub 因凭据身份不匹配而 pending，
-未创建或推送；已核快照与外部同步入口见 [仓库与代码同步](docs/REPOSITORIES.md)。
+不能把默认分支当作最新候选。[GitHub](https://github.com/miaochunhui/opensim)
+已创建公开仓库，但尚未推送代码；三端同步因 TLS 预检失败
+（`NET_TLS_PRECHECK_FAILED`）停止，不能称三端已同步。
+已核快照与当前外部工具入口见 [仓库与代码同步](docs/REPOSITORIES.md)。
 公网尚未上线，代码备份不等于发布；未安装常驻自动仓库同步。
 
 首版实现直管充分发展层流的横截面问题，采用线性三角形有限元，
