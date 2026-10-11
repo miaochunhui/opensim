@@ -3,13 +3,15 @@
 中文、可自部署、可复现的流体有限元 Web 工作台。
 
 代码主仓为 [GitLab](https://gitlab.ai4everyone.top/infra/opensim)，
-[Gitee](https://gitee.com/sdfwefqaa/opensim) 已同步同一代码快照。
+[Gitee](https://gitee.com/sdfwefqaa/opensim) 与
+[GitHub](https://github.com/miaochunhui/opensim) 已于 2026-10-11 经实际推送
+及逐端回读同步代码快照 `4f20b5535fbef00a1aa61f8b6442380a82498d12`；
+历史 fluid ref 同为 `97477ba9255c1cdb9f8a15d9145a00e61a63188d`，GitHub 已有代码。
 获取代码请明确使用 `clone -b main`：Gitee 默认 HEAD 仍指向旧 fluid，
-不能把默认分支当作最新候选。[GitHub](https://github.com/miaochunhui/opensim)
-已创建公开仓库，但尚未推送代码；三端同步因 TLS 预检失败
-停止，实际首因为 `REMOTE_QUERY_FAILED_RC_128`。
-`NET_TLS_PRECHECK_FAILED` 仅为文档状态标签，不是工具实际报错；三端未同步。
+不能把默认分支当作最新候选。旧 GitHub TLS 预检失败保留为历史；
+新 HTTP-profile 条件下同步成功不证明 UA 因果或瞬时故障，也不允许自动重试。
 已核快照与当前外部工具入口见 [仓库与代码同步](docs/REPOSITORIES.md)。
+该已核快照不包含本次后续文档提交；新文档须另行授权推送并回读。
 公网尚未上线，代码备份不等于发布；未安装常驻自动仓库同步。
 
 首版实现直管充分发展层流的横截面问题，采用线性三角形有限元，
