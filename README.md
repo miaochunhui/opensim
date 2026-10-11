@@ -7,7 +7,8 @@
 获取代码请明确使用 `clone -b main`：Gitee 默认 HEAD 仍指向旧 fluid，
 不能把默认分支当作最新候选。[GitHub](https://github.com/miaochunhui/opensim)
 已创建公开仓库，但尚未推送代码；三端同步因 TLS 预检失败
-（`NET_TLS_PRECHECK_FAILED`）停止，不能称三端已同步。
+停止，实际首因为 `REMOTE_QUERY_FAILED_RC_128`。
+`NET_TLS_PRECHECK_FAILED` 仅为文档状态标签，不是工具实际报错；三端未同步。
 已核快照与当前外部工具入口见 [仓库与代码同步](docs/REPOSITORIES.md)。
 公网尚未上线，代码备份不等于发布；未安装常驻自动仓库同步。
 

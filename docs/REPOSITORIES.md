@@ -10,8 +10,10 @@
 
 2026-10-11 主席实收创建流程：账号核验成功，仓库 404 后创建 201，
 再次回读 200 / PRESENT_PUBLIC；这不是代码推送或三端同步证明。
-随后三端同步在 GitHub TLS 预检 GnuTLS-110 早断处停止：
-`NET_TLS_PRECHECK_FAILED`，未执行 push；不声称三端完成或自动重试。
+随后三端同步在 GitHub TLS 预检处停止，工具实际首因为
+`REMOTE_QUERY_FAILED_RC_128`；该次原 `27.stderr` 记录 GnuTLS-110 早断。
+`NET_TLS_PRECHECK_FAILED` 仅为本页状态标签，不是工具实际报错。
+未执行 push；不声称三端完成或自动重试。
 公网尚未上线；代码备份不等于公网发布、真人验收或发布门通过。
 常驻 mirror、timer、cron 未安装，目前没有自动仓库同步。
 本仓许可证仍未指定，不能据仓库可访问推断开源授权。
