@@ -11,6 +11,7 @@ import argparse
 import ast
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import ipaddress
 import json
 import math
@@ -63,10 +64,35 @@ REQUIRED_RULES = {
 VIEWPORTS = ((320, 568), (360, 800), (390, 844), (768, 1024),
              (1024, 768), (1064, 768), (1280, 800), (1440, 900))
 LIMIT = 16_000_000
+BRIDGE_IMPLEMENTATIONS = {
+    "release_obligations.py": {
+        "path": "/data/dev/opensim-authorized-obligations-20261010/tools/release_obligations.py",
+        "sha256": "9c1b0d9a464c958d6d32c760ba39173da6134ad771436ddc7a36466ab3a8b4bf",
+    },
+    "release_trust.py": {
+        "path": "/data/dev/opensim-authorized-trust-20261010/tools/release_trust.py",
+        "sha256": "ce085ad4062327c6d95b6d274f66897fbb2440ab2170404dd03b07986bd59639",
+    },
+}
+NATIVE_ASSESSMENT_SCHEMA = "opensim-release-native-assessment-request-v1"
+CLOSURE_TRUST_IMPLEMENTATION = {
+    "path": "/data/dev/opensim-production-trust-20261011/tools/release_trust.py",
+    "sha256": "1bc76e30b0a80a92efa555b014c70afb237a178b71f6311c55f1059f588358af",
+}
+NATIVE_ADAPTER = {
+    "path": "/data/dev/opensim-release-native-adapter-main-v1/tools/release_native_adapter.py",
+    "sha256": "4c998f3d0587a4d09064ced6a76171da37e95cb8bddd24c4d912416fe95b5b00",
+}
 
 
 class GateError(RuntimeError):
     pass
+
+
+class BridgeBlocked(GateError):
+    def __init__(self, reason: str, observation: dict):
+        super().__init__(reason)
+        self.observation = observation
 
 
 def require(condition: bool, reason: str) -> None:
@@ -172,35 +198,43 @@ def revoke_exact(path: Path, body: bytes, owned: dict) -> None:
 
 
 def finalize_result(report: dict, out: Path, *, status_key: str,
-                    failed_status: str, label: str) -> int:
+                    failed_status: str, label: str, verify=None, emit=None) -> int:
     """Action results are provisional until log/report readback and process rc."""
     from uuid import uuid4
 
     new_result_paths(out)
+    if emit is None:
+        def emit(line):
+            print(line, flush=True)
     original = dict(report)
     report = dict(report, invocation_id=uuid4().hex,
                   finalization="FINAL_PROCESS_RC_REQUIRED")
     owned: dict = {}
     log = out.with_suffix(".log")
+    cause = (original.get("failure", {}).get("reason") or
+             (original.get("first_cause") or {}).get("message", ""))
     log_body = (
         f"{label} action={report[status_key]} action_rc={report['exit_code']} "
         f"finalization=PROVISIONAL invocation_id={report['invocation_id']}\n" +
-        original.get("failure", {}).get("reason", "") + "\n"
+        cause + "\n"
     ).encode("utf-8")
     attempted_body = None
     failed_path = log
     try:
         write_new(log, log_body, owned=owned)
         report["execution_log"] = {"path": str(log), "sha256": sha(log_body)}
+        if verify is not None:
+            verify()
         failed_path = out
         attempted_body = encode(report)
         write_new(out, attempted_body, owned=owned)
         require(read_file(log) == log_body and read_file(out) == attempted_body,
                 "Final result/log drift before process completion")
-        print(f"{label} {status_key}={report[status_key]} rc={report['exit_code']} "
-              f"finalization=FINAL_PROCESS_RC_REQUIRED invocation_id={report['invocation_id']} "
-              f"report_sha256={sha(attempted_body)} collected_at={report['collected_at']} report={out}",
-              flush=True)
+        if verify is not None:
+            verify()
+        emit(f"{label} {status_key}={report[status_key]} rc={report['exit_code']} "
+             f"finalization=FINAL_PROCESS_RC_REQUIRED invocation_id={report['invocation_id']} "
+             f"report_sha256={sha(attempted_body)} collected_at={report['collected_at']} report={out}")
     except Exception as exc:
         evidence_failure = {"type": type(exc).__name__, "reason": str(exc),
                             "errno": getattr(exc, "errno", None), "path": str(failed_path)}
@@ -224,16 +258,16 @@ def finalize_result(report: dict, out: Path, *, status_key: str,
             except Exception as recovery:
                 print(f"Failure report persistence failed: {recovery}", file=sys.stderr)
         print(f"Evidence cause: {exc}", file=sys.stderr)
-        if report.get("failure"):
-            print("First cause: " + report["failure"]["reason"], file=sys.stderr)
+        if cause or report.get("failure"):
+            print("First cause: " + (cause or report["failure"]["reason"]), file=sys.stderr)
         try:
-            print(f"{label} {status_key}={failed_status} rc=1 finalization=FAILED "
-                  f"invocation_id={report['invocation_id']} report={out}", flush=True)
+            emit(f"{label} {status_key}={failed_status} rc=1 finalization=FAILED "
+                 f"invocation_id={report['invocation_id']} report={out}")
         except Exception as recovery:
             print(f"Failure marker output failed: {recovery}", file=sys.stderr)
         return 1
-    if report.get("failure"):
-        print("First cause: " + report["failure"]["reason"], file=sys.stderr)
+    if cause:
+        print("First cause: " + cause, file=sys.stderr)
     return report["exit_code"]
 
 
@@ -489,8 +523,8 @@ def selected_checks(report: dict, chosen: object, kind: str) -> list[dict]:
     return result
 
 
-def _audit_file(path: Path, links: int) -> tuple[bytes, tuple]:
-    external(path)
+def _audit_file(path: Path, links: int, *, base: Path = ARTIFACT_ROOT) -> tuple[bytes, tuple]:
+    external(path, base)
     with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
         before = os.fstat(stream.fileno())
         require(stat.S_ISREG(before.st_mode) and before.st_nlink == links,
@@ -930,16 +964,195 @@ def performance(report: dict) -> None:
             "G5 interaction aggregate differs")
 
 
+def bridge_implementation(pin: dict, name: str) -> tuple[bytes, Path]:
+    """Explicit candidate code pins, never an import search path or a fallback."""
+    require(isinstance(pin, dict) and set(pin) == {"path", "sha256"},
+            "Bridge dependency requires exact path/sha256")
+    require(name in BRIDGE_IMPLEMENTATIONS and
+            pin["path"] == BRIDGE_IMPLEMENTATIONS[name]["path"],
+            "Bridge dependency is not an approved implementation path")
+    path = Path(pin["path"])
+    base = Path("/data/dev")
+    require(path.is_absolute() and path.is_relative_to(base) and ".." not in path.parts and
+            path.name == name, "Bridge dependency outside approved source boundary")
+    cursor = base
+    for part in path.relative_to(base).parts:
+        cursor /= part
+        require(not cursor.is_symlink(), "Bridge dependency symlink rejected")
+    body, _ = _audit_file(path, 1, base=base)
+    require(sha(body) == pin["sha256"] == BRIDGE_IMPLEMENTATIONS[name]["sha256"],
+            "Bridge dependency source hash mismatch")
+    return body, path
+
+
+def bridge_algorithms(pins: dict, root: Path, expected: dict) -> tuple[types.ModuleType, types.ModuleType]:
+    """Load pinned pure algorithms only; no candidate top-level imports/actions."""
+    require(isinstance(pins, dict) and set(pins) == {"obligations", "trust"},
+            "Missing explicit closure/trust implementation pins")
+    native = types.ModuleType("opensim_bridge_native")
+    path = root / "tools/workbench_acceptance.py"
+    body = read_file(path)
+    require(sha(body) == expected["tool_sha256"]["tools/workbench_acceptance.py"],
+            "Bridge native reader source mismatch")
+    names = {"EvidenceError", "need", "now", "decode", "unique_object", "finite_tree",
+             "git", "bounded", "page_build"}
+    nodes = [node for node in ast.parse(body).body
+             if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
+    require({node.name for node in nodes} == names, "Bridge native pure API missing")
+    native.__dict__.update(json=json, math=math, Path=Path, subprocess=subprocess,
+                           datetime=datetime, timezone=timezone, EXTERNAL=ARTIFACT_ROOT,
+                           hashlib=hashlib, SOURCES=SOURCES)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), native.__dict__)
+    modules = []
+    import base64
+    import copy
+    import time
+    for role, filename in (("obligations", "release_obligations.py"), ("trust", "release_trust.py")):
+        source, location = bridge_implementation(pins[role], filename)
+        tree = ast.parse(source, filename=str(location))
+        selected = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name not in {
+                    "main", "persist", "evaluate_native"}:
+                selected.append(node)
+            elif isinstance(node, ast.Assign):
+                try:
+                    ast.literal_eval(node.value)
+                except (ValueError, TypeError):
+                    if not (isinstance(node.value, ast.BinOp) and
+                            isinstance(node.value.op, (ast.Mult, ast.Add, ast.Sub)) and
+                            isinstance(node.value.left, ast.Constant) and
+                            type(node.value.left.value) is int and
+                            isinstance(node.value.right, ast.Constant) and
+                            type(node.value.right.value) is int):
+                        continue
+                selected.append(node)
+        module = types.ModuleType("opensim_bridge_" + role)
+        module.__dict__.update(__file__=str(location), gate=sys.modules[__name__], native=native,
+                               hashlib=hashlib, json=json, os=os, Path=Path, stat=stat,
+                               subprocess=subprocess, sys=sys, re=re, base64=base64, copy=copy,
+                               time=time, EXTERNAL=ARTIFACT_ROOT.resolve(),
+                               TOOL_PATHS=tuple(dict.fromkeys((*TOOLS, "tools/ui_contract_test.mjs"))))
+        exec(compile(ast.Module(body=selected, type_ignores=[]), str(location), "exec"), module.__dict__)
+        require(read_file(location) == source, "Bridge implementation drift during load")
+        modules.append(module)
+    return modules[0], modules[1]
+
+
+def native_obligations(pin: dict, expected: dict, process_rc: int, root: Path,
+                       implementations: dict, now: datetime | None = None) -> dict:
+    """Native-only mapping, after the existing complete raw audit reader."""
+    scope = read_audit_scope(pin, expected, process_rc, now, source_root=root)
+    obligations, _ = bridge_algorithms(implementations, root, expected)
+    report, _ = audit_reference(pin)
+    if report["gates"]["G3-accessibility"]["status"] == "PARTIAL":
+        result = obligations.map_native_audit(report, pin, expected)
+    else:
+        result = {"verdict": "OPEN_OBLIGATIONS", "release_verdict": "NOT_CERTIFIED",
+                  "scope": "NATIVE_AUTOMATED_SCOPE_ADAPTER_NOT_IMPLEMENTED",
+                  "open": [], "closed": [], "object_inventory": {"complete": False},
+                  "first_cause": {"code": "NATIVE_G3_ADAPTER_UNSUPPORTED",
+                                  "status": report["gates"]["G3-accessibility"]["status"]},
+                  "original_statuses_not_promoted": True}
+    # Mapping returns an observation time, not a semantic dependency.
+    result.pop("collected_at", None)
+    require(read_audit_scope(pin, expected, process_rc, now, source_root=root) == scope,
+            "Bridge original audit drift")
+    result["automatic_scope"] = scope
+    return result
+
+
+def bridge_closure(config: dict, root: Path, expected: dict, audit_pin: dict,
+                   audit_rc: int, now: datetime) -> dict:
+    require(isinstance(config, dict) and set(config) ==
+            {"implementations", "native_closure", "canonical", "provenance"},
+            "Invalid release bridge fields")
+    mapped = native_obligations(audit_pin, expected, audit_rc, root, config["implementations"], now)
+    supplied, _ = reference(config["native_closure"])
+    require(supplied == mapped, "Native closure differs from original coordinates/source binding")
+    canonical = None
+    if config["canonical"] is not None:
+        require(isinstance(config["canonical"], dict) and set(config["canonical"]) == {"policy", "ledger"},
+                "Canonical closure requires policy/ledger pins")
+        obligations, _ = bridge_algorithms(config["implementations"], root, expected)
+        canonical = obligations.evaluate(config["canonical"]["policy"], config["canonical"]["ledger"],
+                                         root, expected["commit"])
+        canonical.pop("collected_at", None)
+        require(canonical["release_verdict"] == "NOT_CERTIFIED" and
+                canonical["execution_provenance"] == "SUPPLIED_PROTOCOL_CLAIMS_NOT_INDEPENDENTLY_ATTESTED",
+                "Canonical closure cannot certify native originals")
+    return {"native": mapped, "canonical": canonical,
+            "canonical_authority": "PROTOCOL_ONLY_NOT_NATIVE_CERTIFICATION",
+            "scope": "AUTOMATIC_OBSERVATION_AND_OPEN_OBLIGATIONS_NOT_RELEASE"}
+
+
+def bridge_provenance(config: dict, root: Path, expected: dict, materials: dict,
+                      registry: dict, used: list, now: datetime) -> dict:
+    """Material validity and trusted provenance are separate; no production root exists."""
+    _, trust = bridge_algorithms(config["implementations"], root, expected)
+    provenance = config["provenance"]
+    require(isinstance(provenance, dict) and set(provenance) == {"human", "exceptions"} and
+            isinstance(provenance["human"], dict) and isinstance(provenance["exceptions"], dict) and
+            set(provenance["human"]) <= set(materials) and
+            set(provenance["exceptions"]) <= set(used), "Unknown human/exception provenance")
+    findings, inputs = [], []
+    targets = [("human", rule, pin["sha256"]) for rule, pin in materials.items()]
+    targets += [("user-approval", item, sha(encode(registry[item]))) for item in used]
+    for role, identifier, material_sha in targets:
+        proofs = provenance["human" if role == "human" else "exceptions"]
+        proof = proofs.get(identifier)
+        if proof is None:
+            findings.append({"role": role, "id": identifier, "material_sha256": material_sha,
+                             "state": "MISSING_PROVENANCE"})
+            continue
+        require(isinstance(proof, dict) and set(proof) == {"envelope", "revocations"},
+                "Provenance requires pinned envelope/revocations, not editable trust state")
+        envelope, _ = artifact(proof["envelope"])
+        revocations, _ = artifact(proof["revocations"])
+        inputs.extend((proof["envelope"], proof["revocations"]))
+        try:
+            result = trust.verify(envelope, revocations, expected_candidate=expected["commit"],
+                                  expected_material=material_sha, expected_role=role,
+                                  now=int(now.timestamp()))
+        except trust.TrustError as exc:
+            findings.append({"role": role, "id": identifier, "material_sha256": material_sha,
+                             "state": exc.code, "coordinate": exc.coordinate})
+        else:
+            require(result.get("scope") != "TEST_ONLY", "TEST_ONLY trust cannot certify release")
+            raise GateError("Production trust result contract not enrolled")
+    # Invoke the actual production algorithm even when every provenance pin is missing.
+    try:
+        trust.verify(b"", b"", expected_candidate=expected["commit"],
+                     expected_material=sha(encode(expected)), expected_role="human",
+                     now=int(now.timestamp()))
+    except trust.TrustError as exc:
+        require(exc.code == "TRUST_UNAVAILABLE", "Unexpected production trust failure")
+        production = {"state": exc.code, "coordinate": exc.coordinate}
+    else:
+        raise GateError("Unexpected unenrolled production trust")
+    for pin in inputs:
+        artifact(pin)
+    return {"production": production, "materials": findings,
+            "test_roots_accepted": False, "release_verdict": "NOT_CERTIFIED"}
+
+
 def evaluate(root: Path, commit: str, ledger_path: Path,
-             approval_pin: dict | None = None, now: datetime | None = None) -> dict:
+             approval_pin: dict | None = None, now: datetime | None = None, *,
+             measured_context: bool = False) -> dict:
     now = now or datetime.now(timezone.utc)
     expected = identity(root, commit)
     raw = read_file(external(ledger_path))
     ledger = decode(raw)
-    require(set(ledger) == {"schema", "identity", "evidence", "executions", "gates", "manual", "exceptions"},
+    bridge = ledger.get("schema") == "opensim-release-evidence-v2"
+    fields = {"schema", "identity", "evidence", "executions", "gates", "manual", "exceptions"}
+    require(set(ledger) == fields | ({"bridge"} if bridge else set()),
             "Unknown/missing release ledger fields")
-    require(ledger["schema"] == "opensim-release-evidence-v1", "Unknown release evidence schema")
+    require(ledger["schema"] in {"opensim-release-evidence-v1", "opensim-release-evidence-v2"},
+            "Unknown release evidence schema")
     require(ledger["identity"] == expected, "Ledger does not bind clean commit/sources/build/tools")
+    if bridge:
+        require(sha(read_file(Path(__file__).resolve())) == expected["tool_sha256"]["tools/release_gate.py"],
+                "Bridge evaluator differs from candidate release_gate tool")
     registry = approvals(root, commit, approval_pin, now)
     used = ledger["exceptions"]
     require(isinstance(used, list) and all(isinstance(item, str) for item in used) and
@@ -947,7 +1160,8 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
             all(item in registry for item in used), "Unapproved/unknown exception")
     waived = {registry[item]["rule_id"] for item in used}
     require("G5-performance" not in waived, "Missing public G5 cannot be waived to PASS")
-    require(not used, "BLOCKED: no trusted user-approval verifier; editable JSON is not approval")
+    if not bridge:
+        require(not used, "BLOCKED: no trusted user-approval verifier; editable JSON is not approval")
     evidence = ledger["evidence"]
     require(isinstance(evidence, dict) and set(evidence) ==
             {"local", "numerics", "browser", "audit", "performance", "public", "page"},
@@ -965,6 +1179,8 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
                         for kind, tool in producer_tools.items()}
     audit_scope = read_audit_scope(evidence["audit"], expected, execution_values["audit"]["rc"], now,
                                   source_root=root)
+    closure = (bridge_closure(ledger["bridge"], root, expected, evidence["audit"],
+                             execution_values["audit"]["rc"], now) if bridge else None)
     page = reports["page"][0]
     require(set(page) == {"schema", "commit", "source_sha256", "page_build", "html",
                          "page_check", "timestamp_origin", "source_epoch"},
@@ -1084,23 +1300,31 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
                 f"Invalid gate record: {gate}")
         kind = record["evidence"]
         require(kind in evidence and type(record["rc"]) is int, "Unknown gate evidence/rc")
-        require(record["status"] in {"PASS", "PARTIAL", "NOT_TESTED", "FAIL"}, "Unknown gate status")
-        if gate in waived:
+        require(record["status"] in {"PASS", "PARTIAL", "NOT_TESTED", "FAIL"} |
+                ({"AUTOMATED_SCOPE_PASS"} if bridge else set()), "Unknown gate status")
+        if gate in waived and not bridge:
             continue
-        require(record["status"] == "PASS" and record["rc"] == 0, f"Required gate incomplete: {gate}")
+        native_observed = bridge and kind == "audit"
+        if native_observed:
+            require(record["rc"] == 0 and record["status"] ==
+                    reports["audit"][0]["gates"].get(gate, {}).get("status"),
+                    f"Bridge gate must retain original native status: {gate}")
+        else:
+            require(record["status"] == "PASS" and record["rc"] == 0, f"Required gate incomplete: {gate}")
         require(kind == {"G1-structure": "browser", "G2-layout": "browser",
                          "G3-accessibility": "audit", "G4-keyboard": "browser",
                          "G5-performance": "performance", "G6-content": "audit"}[gate],
                 "Gate attributed to wrong producer")
         report = reports[kind][0]
         selected = selected_checks(report, record["checks"], kind)
-        if kind == "audit":
+        if kind == "audit" and not bridge:
             require(report.get("gates", {}).get(gate, {}).get("status") == "PASS",
                     f"PARTIAL audit cannot certify {gate}")
         require(all((row.get("status") or row.get("verdict")) == "PASS" for row in selected),
                 f"NOT_TESTED checks cannot certify {gate}")
-        require(REQUIRED_RULES[gate] <= {row.get("rule") for row in selected},
-                f"Gate missing required rule coverage: {gate}")
+        if not native_observed:
+            require(REQUIRED_RULES[gate] <= {row.get("rule") for row in selected},
+                    f"Gate missing required rule coverage: {gate}")
         for row in selected:
             if kind == "audit":
                 audit_coordinates(row, report)
@@ -1115,7 +1339,7 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
             require(isinstance(url, str) and url and isinstance(reproduce, str) and reproduce and
                     isinstance(viewport, list) and len(viewport) == 2,
                     f"Gate checks missing URL/viewport/reproduction coordinates: {gate}")
-        if kind == "audit":
+        if kind == "audit" and not bridge:
             require(not any(row.get("status") == "NOT_TESTED" for row in report["checks"]),
                     f"Unclosed NOT_TESTED audit cannot certify {gate}")
     require(isinstance(ledger["manual"], dict) and set(ledger["manual"]) == set(MANUAL),
@@ -1152,15 +1376,405 @@ def evaluate(root: Path, commit: str, ledger_path: Path,
     for pin in manual_refs.values():
         reference(pin)
     require(read_file(ledger_path) == raw, "Ledger drift during gate")
+    if bridge:
+        if measured_context:
+            # Only the new wrapper consumes this non-certifying context. All
+            # original structural/producer checks above remain mandatory.
+            require(bridge_closure(ledger["bridge"], root, expected, evidence["audit"],
+                                   execution_values["audit"]["rc"], now) == closure,
+                    "Measured context original closure drift")
+            require(identity(root, commit) == expected and read_file(ledger_path) == raw,
+                    "Measured context candidate/ledger drift")
+            return {"candidate": expected, "closure": closure,
+                    "scope": "ORIGINAL_INPUTS_VALIDATED_NOT_CERTIFIED",
+                    "source_stable": True, "release_verdict": "NOT_CERTIFIED"}
+        trust_result = bridge_provenance(ledger["bridge"], root, expected, manual_refs, registry, used, now)
+        require(bridge_closure(ledger["bridge"], root, expected, evidence["audit"],
+                               execution_values["audit"]["rc"], now) == closure,
+                "Bridge closure drift during gate")
+        require(identity(root, commit) == expected and read_file(ledger_path) == raw,
+                "Bridge candidate/ledger changed during provenance verification")
+        for pin in manual_refs.values():
+            reference(pin)
+        for role, filename in (("obligations", "release_obligations.py"), ("trust", "release_trust.py")):
+            bridge_implementation(ledger["bridge"]["implementations"][role], filename)
+        observation = {"schema": "opensim-release-bridge-observation-v1",
+                       "closure": closure, "trust": trust_result,
+                       "original_statuses_not_promoted": True, "production_changes": False,
+                       "candidate": expected, "source_stable": True,
+                       "release_verdict": "NOT_CERTIFIED",
+                       "native_semantic_closure": "OPEN_ADAPTER_AND_INVENTORY_INCOMPLETE",
+                       "scope": "OBSERVATION_NOT_CERTIFICATION"}
+        raise BridgeBlocked("BLOCKED: TRUST_UNAVAILABLE; native semantic obligations remain OPEN; "
+                            "raw PARTIAL/NOT_TESTED retained", observation)
     raise GateError("BLOCKED: trusted human-acceptance verifier unavailable; "
                     "editable REAL_DEVICE_HUMAN/PASS records cannot self-certify")
+
+
+def assess_native(root: Path, commit: str, request_path: Path, *,
+                  publication_guards: list | None = None,
+                  read_counter: list[int] | None = None) -> dict:
+    """Passive V1 assessment; no v2 ledger, producer, signer or release path."""
+    request_path = external(request_path)
+    request_bytes, request_stamp = _audit_file(request_path, 1)
+    request = decode(request_bytes)
+    require(set(request) == {"schema", "adapter", "observation"} and
+            request["schema"] == NATIVE_ASSESSMENT_SCHEMA,
+            "Invalid versioned native assessment request")
+    require(request["adapter"] == NATIVE_ADAPTER, "Unapproved native adapter source pin")
+    location = Path(NATIVE_ADAPTER["path"])
+    body, source_stamp = _audit_file(location, 1, base=Path("/data/dev"))
+    require(sha(body) == NATIVE_ADAPTER["sha256"], "Native adapter source drift")
+    spec = importlib.util.spec_from_file_location("opensim_assessment_native", location)
+    adapter = importlib.util.module_from_spec(spec)
+    exec(compile(body, str(location), "exec"), adapter.__dict__)
+    pin = request["observation"]
+    require(isinstance(pin, dict) and set(pin) == {"path", "sha256"} and
+            isinstance(pin["sha256"], str) and re.fullmatch(r"[a-f0-9]{64}", pin["sha256"]),
+            "Native observation requires exact path/SHA256")
+    observation_path = external(Path(pin["path"]))
+    require(observation_path.name == "adapter.json", "Native observation filename differs")
+    observation_bytes, observation_stamp = _audit_file(observation_path, 1)
+    require(sha(observation_bytes) == pin["sha256"], "Native observation SHA differs")
+    diagnostic = decode(observation_bytes)
+    calls = 0
+
+    def read():
+        nonlocal calls
+        calls += 1
+        if read_counter is not None:
+            read_counter[0] = calls
+        try:
+            return adapter.read_observation(observation_path.parent)
+        except Exception as exc:
+            exc.native_observation_diagnostic = {
+                "validation": "REJECTED_UNVALIDATED_DIAGNOSTIC_NOT_AUTHORITY",
+                "first_cause": diagnostic.get("first_cause")}
+            raise
+
+    value = read()
+    require(value == diagnostic, "Native observation bytes differ")
+    require(root.is_absolute() and not root.is_symlink() and
+            value["source_root"] == str(root) and value["candidate"]["commit"] == commit,
+            "Native assessment candidate/root mismatch")
+    reader, _ = adapter.load_reader()
+    require(reader.inventory(root) == value["candidate"], "Native assessment candidate drift")
+    source_hashes = reader.source_map(value["candidate"])
+    build = reader.page_build(root)
+    require(all(value["candidate"]["tracked_sha256"][name] == source_hashes[name]
+                for name in SOURCES), "Native source identity differs")
+    coverage = value["coverage"]
+    require(coverage["state"] == "OPEN" and coverage["closed_obligations"] == [] and
+            value["release_verdict"] == "NOT_CERTIFIED" and
+            value["state"] in {"OPEN_OBLIGATIONS", "ORIGINAL_PRODUCER_FAILURE_VETO"},
+            "Native observation cannot claim certification or semantic closure")
+    require(type(value["exit_code"]) is int and value["exit_code"] ==
+            (1 if value["state"] == "ORIGINAL_PRODUCER_FAILURE_VETO" else 3),
+            "Native observation terminal rc/state mismatch")
+    result = {"schema": "opensim-release-native-assessment-v1",
+              "scope": "NATIVE_OBSERVATION_ASSESSMENT_NOT_RELEASE",
+              "state": value["state"], "exit_code": value["exit_code"],
+              "release_verdict": "NOT_CERTIFIED", "production_changes": False,
+              "collected_at": datetime.now(timezone.utc).isoformat(),
+              "first_cause": value.get("first_cause"),
+              "native_observation": pin, "candidate": value["candidate"],
+              "assessment": {"adapter": dict(NATIVE_ADAPTER), "source_sha256": source_hashes,
+                  "page_build": build, "original": value["original"],
+                  "native_g3_status": value.get("native_audit", {}).get("gates", {}).get(
+                      "G3-accessibility", {}).get("status"),
+                  "coverage": coverage, "closed_obligations": [],
+                  "human": [{"id": name, "status": "NOT_TESTED"} for name in MANUAL],
+                  "public_g5": {"status": "NOT_TESTED", "waivable": False},
+                  "trust": {"state": "TRUST_UNAVAILABLE", "enrollment": "NOT_IMPLEMENTED"},
+                  "launcher_scope": value["launcher"]["scope"],
+                  "authentication": value["launcher"]["authentication"]}}
+
+    def verify():
+        require(not list(observation_path.parent.glob("adapter-failure*.json")),
+                "Adapter failure sidecar present before assessment publication")
+        adapter.verify_observation(value, reader)
+        require(_audit_file(request_path, 1) == (request_bytes, request_stamp) and
+                _audit_file(observation_path, 1) == (observation_bytes, observation_stamp) and
+                _audit_file(location, 1, base=Path("/data/dev")) == (body, source_stamp),
+                "Late native assessment input/source drift")
+
+    try:
+        require(read() == value and reader.inventory(root) == value["candidate"],
+                "Late native observation/candidate drift")
+        verify()
+    except Exception as exc:
+        result.update(state="INVALID_NATIVE_ASSESSMENT", exit_code=2,
+                      failure={"type": type(exc).__name__, "reason": str(exc),
+                               "coordinate": getattr(exc, "coordinate", "assessment")})
+    result["assessment"]["read_observation_calls"] = calls
+    if publication_guards is not None and "failure" not in result:
+        publication_guards.append(verify)
+    return result
+
+
+def native_assessment_stdout(line: str) -> None:
+    """No buffered failed bytes remain to alter the promised process rc at exit."""
+    body = (line + "\n").encode("utf-8")
+    offset = 0
+    while offset < len(body):
+        count = os.write(sys.stdout.fileno(), body[offset:])
+        require(count > 0, "Zero-byte native assessment stdout write")
+        offset += count
+
+
+def native_assessment_main(args) -> int:
+    guards = []
+    read_counter = [0]
+    report = {"schema": "opensim-release-native-assessment-v1",
+              "scope": "NATIVE_OBSERVATION_ASSESSMENT_NOT_RELEASE",
+              "state": "INVALID_NATIVE_ASSESSMENT", "exit_code": 2,
+              "release_verdict": "NOT_CERTIFIED", "production_changes": False,
+              "collected_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        require(os.geteuid() != 0, "Native assessment must not run as root")
+        require(not args.approval_path and not args.approval_sha256,
+                "Native assessment forbids approval/human bypass inputs")
+        report = assess_native(args.source_root, args.commit, args.native_assessment,
+                               publication_guards=guards, read_counter=read_counter)
+    except Exception as exc:
+        report["failure"] = {"type": type(exc).__name__, "reason": str(exc),
+                             "coordinate": getattr(exc, "coordinate", "assessment")}
+        report["read_observation_calls"] = read_counter[0]
+        if hasattr(exc, "native_observation_diagnostic"):
+            report["native_observation_diagnostic"] = exc.native_observation_diagnostic
+    def verify():
+        for guard in guards:
+            guard()
+
+    return finalize_result(report, args.out, status_key="state",
+                           failed_status="INVALID_NATIVE_ASSESSMENT", label="OPENSIM_NATIVE_ASSESSMENT",
+                           verify=verify, emit=native_assessment_stdout)
+
+
+def closure_trust():
+    """New closure-only pinned S4 module; old native bridge stays unchanged."""
+    path = Path(CLOSURE_TRUST_IMPLEMENTATION["path"])
+    cursor = Path("/data/dev")
+    require(path.is_relative_to(cursor), "Closure trust outside source boundary")
+    for part in path.relative_to(cursor).parts:
+        cursor /= part
+        require(not cursor.is_symlink(), "Closure trust source symlink")
+    body, stamp = _audit_file(path, 1, base=Path("/data/dev"))
+    require(sha(body) == CLOSURE_TRUST_IMPLEMENTATION["sha256"], "Closure trust source pin mismatch")
+    module = types.ModuleType("opensim_closure_trust")
+    module.__dict__.update(__file__=str(path))
+    exec(compile(body, str(path), "exec"), module.__dict__)
+    require(_audit_file(path, 1, base=Path("/data/dev")) == (body, stamp), "Closure trust load drift")
+    return module, (path, body, stamp)
+
+
+def verify_closure_provenance(trust, provenance: dict, targets: list, commit: str,
+                              *, fixture_channel: Path | None = None):
+    """Verify actual signed files. Fixture injection is never available on gate CLI."""
+    require(isinstance(provenance, dict) and set(provenance) <= {
+        role + ":" + identifier for role, identifier, _ in targets}, "Unknown closure provenance material")
+    proofs, records, unavailable = [], [], []
+    for role, identifier, material_sha in targets:
+        key = role + ":" + identifier
+        proof = provenance.get(key)
+        if proof is None:
+            unavailable.append({"material": key, "code": "MISSING_PROVENANCE"})
+            continue
+        require(isinstance(proof, dict) and set(proof) == {"envelope", "revocations"},
+                "Closure provenance requires exact pins, not trust literals")
+        frames = []
+        for name in ("envelope", "revocations"):
+            frame, location = artifact(proof[name])
+            readback, stamp = _audit_file(location, 1)
+            require(readback == frame, "Closure provenance changed while reading")
+            records.append((location, frame, stamp))
+            frames.append(frame)
+        payload = trust.parse(frames[0])["payload"]
+        require(payload.get("record_id") == key and payload.get("source") == {
+            "record_id": key, "sha256": material_sha}, "Closure signed source/record mismatch")
+        try:
+            if fixture_channel is None:
+                result = trust.verify(*frames, expected_candidate=commit,
+                                      expected_material=material_sha, expected_role=role)
+            else:
+                result = trust.verify(*frames, expected_candidate=commit,
+                                      expected_material=material_sha, expected_role=role,
+                                      test_only=True, test_channel=fixture_channel)
+        except trust.TrustError as exc:
+            require(exc.code in {"TRUST_UNAVAILABLE", "CRYPTO_UNAVAILABLE"},
+                    "Closure trust rejected: " + exc.code + ":" + exc.coordinate)
+            unavailable.append({"material": key, "code": exc.code, "coordinate": exc.coordinate})
+            continue
+        fields = {"schema", "state", "exit_code", "scope", "release_verdict", "domain", "policy", "role",
+                  "candidate", "material_sha256", "envelope_sha256", "revocations_sha256", "revocation_sequence",
+                  "checked_at", "expires_at", "record_id", "channel", "channel_files", "authority_key_id",
+                  "authorization", "enrollment_sequence"}
+        require(isinstance(result, dict) and set(result) == fields and
+                result["schema"] == "opensim-release-trust-result-v1" and result["release_verdict"] == "NOT_CERTIFIED" and
+                result["domain"] == "opensim.ai4everyone.top" and result["policy"] == "opensim-release-trust-policy-v1" and
+                result["state"] == ("PROVENANCE_VERIFIED" if fixture_channel is None else "TEST_ALGORITHM_VERIFIED") and
+                result["scope"] == ("PRODUCTION_PROVENANCE_ONLY" if fixture_channel is None else "TEST_ONLY") and
+                result["channel"] == ("ROOT_MANAGED_OUT_OF_BAND_AUTHORIZATION_V1" if fixture_channel is None else "FILE_FIXTURE_TEST_ONLY") and
+                result["candidate"] == commit and result["material_sha256"] == material_sha and result["role"] == role and
+                type(result["exit_code"]) is int and result["exit_code"] == 0 and result["record_id"] == key and
+                result["envelope_sha256"] == sha(frames[0]) and result["revocations_sha256"] == sha(frames[1]) and
+                type(result["checked_at"]) is int and type(result["expires_at"]) is int and
+                result["checked_at"] <= int(datetime.now(timezone.utc).timestamp()) < result["expires_at"] and
+                isinstance(result["channel_files"], dict) and set(result["channel_files"]) == {
+                    "authority.json", "authorization.json", "enrollment.json", "directory_chain"},
+                "Closure unenrolled production trust contract")
+        require(trust.parse(frames[1])["payload"]["source"] == result["authorization"],
+                "Closure revocation source differs from approved authority")
+        proofs.append({"role": role, "id": identifier, "candidate": commit,
+                       "material_sha256": material_sha, "state": result["state"],
+                       "scope": result["scope"], "verification": result})
+    for location, frame, stamp in records:
+        require(_audit_file(location, 1) == (frame, stamp), "Closure late provenance drift")
+    return {"production": "UNAVAILABLE" if unavailable else (
+                "PRODUCTION_VERIFIED" if fixture_channel is None else "TEST_ONLY_VERIFIED"),
+            "materials": proofs}, records, unavailable
+
+
+def certified_terminal(identity_value: dict, ledger: dict, ledger_pin: dict,
+                       closure: dict, trust_result: dict, approval_pin: dict | None,
+                       *, test_only: bool = False, now: datetime | None = None) -> dict:
+    """Pure terminal contract; caller must supply independently verified inputs.
+
+    Not an authentication API and never called with editable request trust.
+    Test-only positives cannot become a sync admission receipt.
+    """
+    now = now or datetime.now(timezone.utc)
+    require(type(test_only) is bool, "Invalid terminal scope")
+    require(ledger.get("schema") == "opensim-release-evidence-v2" and
+            ledger.get("identity") == identity_value, "Terminal original ledger identity differs")
+    require(isinstance(ledger.get("manual"), dict) and set(ledger["manual"]) == set(MANUAL),
+            "Terminal human obligations missing")
+    require(closure.get("schema") == "opensim-measured-obligations-v1" and
+            closure.get("candidate") == identity_value and
+            closure.get("verdict") == "MEASURED_PREDICATES_CLOSED" and
+            closure.get("release_verdict") == "NOT_CERTIFIED" and
+            type(closure.get("required")) is int and closure["required"] > 0 and
+            closure.get("open") == [] and len(closure.get("closed", [])) == closure["required"],
+            "Terminal measured obligations remain OPEN")
+    require(isinstance(trust_result, dict) and set(trust_result) == {"production", "materials"},
+            "Terminal verified trust contract missing")
+    require(trust_result["production"] == ("TEST_ONLY_VERIFIED" if test_only else "PRODUCTION_VERIFIED"),
+            "Terminal production trust unavailable")
+    required_materials = [("human", rule, ledger["manual"][rule]["sha256"])
+                          for rule in MANUAL if ledger["manual"][rule] != {"status": "EXCEPTION"}]
+    required_materials.extend(("deployment", str(i), pin["sha256"])
+                              for i, pin in enumerate([ledger_pin, *closure["materials"]]))
+    # The approval register itself is bound, not just an editable APPROVED word.
+    if ledger["exceptions"]:
+        require(isinstance(approval_pin, dict) and set(approval_pin) == {"path", "sha256"},
+                "Terminal exception approval pin missing")
+        required_materials.append(("user-approval", "register", approval_pin["sha256"]))
+    proofs = trust_result["materials"]
+    require(isinstance(proofs, list) and len(proofs) == len(required_materials),
+            "Terminal missing/duplicate material provenance")
+    observed = []
+    for proof in proofs:
+        require(isinstance(proof, dict) and set(proof) == {"role", "id", "candidate", "material_sha256", "state", "scope", "verification"},
+                "Terminal unknown provenance fields")
+        require(proof["candidate"] == identity_value["commit"] and
+                proof["state"] == ("TEST_ALGORITHM_VERIFIED" if test_only else "PROVENANCE_VERIFIED") and
+                proof["scope"] == ("TEST_ONLY" if test_only else "PRODUCTION_PROVENANCE_ONLY") and
+                proof["verification"].get("state") == proof["state"] and
+                proof["verification"].get("candidate") == proof["candidate"] and
+                proof["verification"].get("material_sha256") == proof["material_sha256"],
+                "Terminal candidate/role/trust scope differs")
+        observed.append((proof["role"], proof["id"], proof["material_sha256"]))
+    require(sorted(observed) == sorted(required_materials), "Terminal provenance material/role differs")
+    return {"schema": "opensim-release-gate-v1", "verdict": "PASS", "exit_code": 0,
+            "release_verdict": "NOT_CERTIFIED" if test_only else (
+                "APPROVED_EXCEPTION" if ledger["exceptions"] else "CERTIFIED"),
+            "scope": "TEST_ONLY_TERMINAL_CONTRACT" if test_only else "EVIDENCE_VALIDATED_NOT_DEPLOYED",
+            "identity": identity_value, "ledger_sha256": ledger_pin["sha256"],
+            "approval_pin": approval_pin, "exceptions": ledger["exceptions"],
+            "gates": ledger["gates"], "evidence": ledger["evidence"],
+            "closure": closure, "trust": trust_result, "production_changes": False,
+            "collected_at": now.isoformat()}
+
+
+def evaluate_closure(root: Path, commit: str, request_path: Path,
+                     approval_pin: dict | None = None, *, publication_guards: list | None = None) -> dict:
+    """New fixed ledger wrapper; earlier original failures are never supplemented."""
+    raw, request_stamp = _audit_file(external(request_path), 1)
+    request = decode(raw)
+    require(set(request) == {"schema", "original_ledger", "policy", "measurements", "provenance"} and
+            request["schema"] == "opensim-release-closure-request-v1", "Invalid closure request fields/version")
+    original, ledger_path = reference(request["original_ledger"])
+    require(original.get("schema") == "opensim-release-evidence-v2", "Closure requires original V2 ledger")
+    original_bytes, original_stamp = _audit_file(ledger_path, 1)
+    require(sha(original_bytes) == request["original_ledger"]["sha256"],
+            "Closure original ledger changed while reading")
+    now = datetime.now(timezone.utc)
+    observed = evaluate(root, commit, ledger_path, approval_pin, now, measured_context=True)
+    expected = observed["candidate"]
+    executing_gate = read_file(Path(__file__))
+    require(executing_gate == committed(root, commit, "tools/release_gate.py"),
+            "Executing closure gate differs from candidate")
+    path = root / "tools/release_obligations.py"
+    body = committed(root, commit, "tools/release_obligations.py")
+    local = Path(__file__).resolve().with_name("release_obligations.py")
+    require(read_file(local) == body, "Executing measured module differs from candidate")
+    spec = importlib.util.spec_from_file_location("opensim_measured_closure", path)
+    module = importlib.util.module_from_spec(spec)
+    exec(compile(body, str(path), "exec"), module.__dict__)
+    closure, records = module.evaluate(request["policy"], request["measurements"], expected, sha(body))
+    require(closure["open"] == [], "Measured obligations remain OPEN")
+    targets = [("human", rule, pin["sha256"]) for rule, pin in original["manual"].items()
+               if pin != {"status": "EXCEPTION"}]
+    targets.extend(("deployment", str(i), pin["sha256"]) for i, pin in
+                   enumerate([request["original_ledger"], *closure["materials"]]))
+    if original["exceptions"]:
+        targets.append(("user-approval", "register", approval_pin["sha256"]))
+    trust, trust_source = closure_trust()
+    trust_result, trust_records, unavailable = verify_closure_provenance(
+        trust, request["provenance"], targets, commit)
+    def verify():
+        module.verify_records(records)
+        for location, frame, stamp in trust_records:
+            require(_audit_file(location, 1) == (frame, stamp), "Closure late provenance drift")
+        require(identity(root, commit) == expected and committed(root, commit, "tools/release_obligations.py") == body and
+                read_file(Path(__file__)) == executing_gate and
+                _audit_file(request_path, 1) == (raw, request_stamp) and
+                _audit_file(ledger_path, 1) == (original_bytes, original_stamp), "Closure late candidate/ledger drift")
+        require(evaluate(root, commit, ledger_path, approval_pin,
+                         measured_context=True)["candidate"] == expected,
+                "Closure original final readback changed")
+        for role, filename in (("obligations", "release_obligations.py"), ("trust", "release_trust.py")):
+            bridge_implementation(original["bridge"]["implementations"][role], filename)
+        require(_audit_file(trust_source[0], 1, base=Path("/data/dev")) == trust_source[1:],
+                "Closure trust source late drift")
+        late, _, late_unavailable = verify_closure_provenance(trust, request["provenance"], targets, commit)
+        def stable_proofs(value):
+            return [dict(p, verification={k: v for k, v in p["verification"].items()
+                                          if k != "checked_at"}) for p in value["materials"]]
+        require(late_unavailable == unavailable and late["production"] == trust_result["production"] and
+                stable_proofs(late) == stable_proofs(trust_result),
+                "Closure trust final verification differs")
+
+    verify()
+    if publication_guards is not None:
+        publication_guards.append(verify)
+    if unavailable:
+        observation = {"candidate": expected, "closure": closure, "scope": "MEASURED_CLOSURE_NOT_TRUSTED_RELEASE",
+                       "trust": unavailable, "trust_implementation": CLOSURE_TRUST_IMPLEMENTATION, "source_stable": True,
+                       "original_statuses_not_promoted": True, "release_verdict": "NOT_CERTIFIED"}
+        raise BridgeBlocked("BLOCKED: complete measured predicates do not replace trusted human/producer provenance", observation)
+    return certified_terminal(expected, original, request["original_ledger"], closure,
+                              trust_result, approval_pin, now=now)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=ROOT)
     parser.add_argument("--commit", required=True)
-    parser.add_argument("--ledger", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--ledger", type=Path)
+    mode.add_argument("--native-assessment", type=Path)
+    mode.add_argument("--closure-request", type=Path)
     parser.add_argument("--approval-path")
     parser.add_argument("--approval-sha256")
     parser.add_argument("--out", type=Path, required=True)
@@ -1170,23 +1784,32 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"Output admission refused: {exc}", file=sys.stderr)
         return 1
+    if args.native_assessment is not None:
+        return native_assessment_main(args)
     report = {"schema": "opensim-release-gate-v1", "verdict": "BLOCKED",
               "release_verdict": "NOT_CERTIFIED", "production_changes": False,
               "collected_at": datetime.now(timezone.utc).isoformat()}
+    guards = []
     try:
         require(os.geteuid() != 0, "Release evidence gate must not run as root")
         require(bool(args.approval_path) == bool(args.approval_sha256),
                 "Approval path and SHA must be supplied together")
         pin = ({"path": args.approval_path, "sha256": args.approval_sha256}
                if args.approval_path else None)
-        report = evaluate(args.source_root, args.commit, args.ledger, pin)
+        report = (evaluate_closure(args.source_root, args.commit, args.closure_request, pin,
+                                  publication_guards=guards) if args.closure_request is not None else
+                  evaluate(args.source_root, args.commit, args.ledger, pin))
     except Exception as exc:
         report["failure"] = {"type": type(exc).__name__, "reason": str(exc)}
+        if isinstance(exc, BridgeBlocked):
+            report["bridge"] = exc.observation
     rc = 0 if report["verdict"] == "PASS" else 1
     report["exit_code"] = rc
     try:
         return finalize_result(report, args.out, status_key="verdict",
-                               failed_status="BLOCKED", label="OPENSIM_RELEASE_GATE")
+                               failed_status="BLOCKED", label="OPENSIM_RELEASE_GATE",
+                               verify=(lambda: [guard() for guard in guards]) if args.closure_request is not None else None,
+                               emit=native_assessment_stdout if args.closure_request is not None else None)
     except Exception as exc:
         print(f"Finalization refused: {exc}; first result={report}", file=sys.stderr)
         return 1

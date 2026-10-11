@@ -7,6 +7,7 @@ No shared historical bundles are selected or modified. Evidence stays external.
 from __future__ import annotations
 
 import argparse
+import copy
 from datetime import datetime, timezone
 import errno
 import hashlib
@@ -17,6 +18,7 @@ import stat
 import shutil
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -28,8 +30,274 @@ sys.path.insert(0, str(ROOT / "tests"))
 import release_gate as gate
 import sync_release as sync
 from test_release_gate import Fixture, put, run_suite
+from test_release_closure import ClosureTests
 
 BUNDLE_MODE_ROOT = Path("/hf3fs-jd/data/tmp/opensim-fluid-v1/authorized-s4-sync-bundle-mode-fix-20261011")
+CLOSURE_OUT = None
+CLOSURE_CHILDREN = []
+
+
+def closure_store(path, body):
+    """Write only new own test evidence; never change gate.OUTPUT_ROOT."""
+    gate.external(path)
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                           0o644), "wb") as stream:
+        stream.write(body)
+        stream.flush()
+        os.fsync(stream.fileno())
+    with path.open("rb") as stream:
+        gate.require(stream.read() == body, "Closure test evidence readback drift")
+    gate.sync_directory(path.parent)
+
+
+class SyncClosureTests(unittest.TestCase):
+    """Real gate CLI refusal after complete file-only inputs, never trust bypass."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.support = ClosureTests()
+        cls.support.files = gate.OUTPUT_ROOT / ("s4-sync-closure-files-" + uuid4().hex)
+        cls.support.files.mkdir(parents=True, exist_ok=False)
+
+    def setUp(self):
+        self.f = self.support.fixture()
+        self.directory, _, self.policy, self.baseline, self.measurements, self.measurement_pin = \
+            self.support.ledger(self.f)
+        self.closure_path = self.directory / "closure-request.json"
+        self.desired_path = self.directory / "desired-v2.json"
+        self.closure = {"schema": "opensim-release-closure-request-v1",
+                        "original_ledger": {"path": str(self.f.ledger_path),
+                                            "sha256": gate.sha(self.f.ledger_path.read_bytes())},
+                        "policy": self.policy, "measurements": self.measurement_pin,
+                        "provenance": {}}
+        epoch = int(gate.git(self.f.repo, "show", "-s", "--format=%ct", self.f.commit).strip())
+        manifest_digest = "a" * 64
+        self.desired = {"schema": "opensim-desired-release-v2", "request_id": "FILE_ONLY_NOT_PRODUCT",
+                        "action": "INSTALL_FIXED_RELEASE", "commit": self.f.commit,
+                        "closure_request": {}, "approval_pin": None,
+                        "bundle": str(sync.PREPARE_ROOT / ("s4-not-prepared-" + uuid4().hex) / "bundle"),
+                        "manifest_sha256": "a" * 64, "source_epoch": epoch,
+                        "release": f"/opt/opensim/releases/{self.f.commit}-{manifest_digest}",
+                        "before_receipt": None}
+        self.save()
+
+    def save(self):
+        put(self.closure_path, gate.encode(self.closure))
+        self.desired["closure_request"] = {"path": str(self.closure_path),
+                                           "sha256": gate.sha(self.closure_path.read_bytes())}
+        put(self.desired_path, gate.encode(self.desired))
+
+    def cli(self, *, apply=False, boundary=None):
+        out = self.directory / ("sync-" + uuid4().hex + ".json")
+        argv = [sys.executable, "-B", str(ROOT / "tools/sync_release.py"),
+                "--source-root", str(self.f.repo), "--desired", str(self.desired_path),
+                "--desired-sha256", gate.sha(self.desired_path.read_bytes()), "--out", str(out)]
+        if apply:
+            argv.append("--apply")
+        if boundary is not None:
+            argv = [sys.executable, "-B", str(Path(__file__).resolve()),
+                    "--closure-boundary-child", boundary, *argv[3:]]
+        child = subprocess.run(argv, cwd=ROOT, capture_output=True)
+        record = CLOSURE_OUT / ("sync-cli-" + uuid4().hex)
+        record.mkdir()
+        streams = {}
+        for name, body in (("stdout", child.stdout), ("stderr", child.stderr)):
+            path = record / (name + ".bin")
+            closure_store(path, body)
+            streams[name] = {"path": str(path), "sha256": gate.sha(body), "bytes": len(body)}
+        row = {"argv": list(child.args), "actual_rc": child.returncode, "report": str(out), **streams}
+        closure_store(record / "invocation.json", gate.encode(row))
+        CLOSURE_CHILDREN.append(row)
+        self.assertEqual(child.returncode, 1, child.stderr)
+        report = gate.decode(out.read_bytes())
+        self.assertFalse(report["production_changes"])
+        self.assertFalse(Path(self.desired["bundle"]).exists())
+        return report
+
+    def test_complete_closure_reaches_real_gate_missing_trust(self):
+        original_audit = (self.f.directory / "audit/report.json").read_bytes()
+        report = self.cli()
+        self.assertEqual(report["state"], "BLOCKED")
+        self.assertEqual(report["release_verdict"], "NOT_CERTIFIED")
+        self.assertIn("trusted human/producer provenance", report["failure"]["reason"])
+        execution = report["closure_execution"]
+        self.assertEqual(execution["actual_child_rc"], 1)
+        self.assertIn("--closure-request", execution["argv"])
+        self.assertNotIn("--ledger", execution["argv"])
+        self.assertEqual(execution["report"]["bridge"]["closure"]["verdict"],
+                         "MEASURED_PREDICATES_CLOSED")
+        self.assertTrue(execution["final_source_stable"])
+        self.assertEqual((self.f.directory / "audit/report.json").read_bytes(), original_audit)
+        for name in ("stdout", "stderr"):
+            self.assertEqual(gate.sha(Path(execution["observation"][name]["path"]).read_bytes()),
+                             execution["observation"][name]["sha256"])
+        self.assertEqual(execution["argv"][execution["argv"].index("--commit") + 1], self.f.commit)
+
+    def test_closure_missing_human_and_measured_failure_keep_first_cause(self):
+        original = copy.deepcopy(self.f.ledger)
+        for case in ("human", "measurements"):
+            with self.subTest(case=case):
+                self.f.ledger = copy.deepcopy(original)
+                self.closure["measurements"] = self.measurement_pin
+                if case == "human":
+                    self.f.ledger["manual"].pop("SCREEN-READER-DESKTOP")
+                    expected = "Missing real device/manual"
+                else:
+                    baseline = copy.deepcopy(self.baseline)
+                    baseline["checks"][0]["status"] = "FAIL"
+                    failed = self.support.put(self.directory, "failed-baseline.json", baseline)
+                    self.closure["measurements"] = self.support.put(
+                        self.directory, "failed-measurements.json",
+                        {**self.measurements, "baseline": failed})
+                    expected = "Measured producer failure veto"
+                self.f.save()
+                self.closure["original_ledger"]["sha256"] = gate.sha(self.f.ledger_path.read_bytes())
+                self.save()
+                report = self.cli()
+                self.assertEqual(report["state"], "BLOCKED")
+                self.assertIn(expected, report["failure"]["reason"])
+                self.assertEqual(report["failure"]["reason"],
+                                 report["closure_execution"]["report"]["failure"]["reason"])
+
+    def test_v2_apply_guard_refuses_before_gate_or_bundle(self):
+        report = self.cli(apply=True)
+        self.assertEqual(report["state"], "REFUSED")
+        self.assertIn("controller", report["failure"]["reason"].lower())
+        self.assertNotIn("closure_execution", report)
+        self.assertEqual(list(self.directory.glob("closure-gate-*")), [])
+
+    def test_v2_rejects_ledger_fallback_and_wrong_closure_pin(self):
+        self.desired["ledger"] = self.closure["original_ledger"]
+        put(self.desired_path, gate.encode(self.desired))
+        report = self.cli()
+        self.assertIn("Unknown desired-release", report["failure"]["reason"])
+        self.assertNotIn("closure_execution", report)
+        self.desired.pop("ledger")
+        self.desired["closure_request"]["sha256"] = "0" * 64
+        put(self.desired_path, gate.encode(self.desired))
+        report = self.cli()
+        self.assertIn("Evidence hash drift", report["failure"]["reason"])
+        self.assertEqual(list(self.directory.glob("closure-gate-*")), [])
+
+    def test_closure_original_failure_and_failure_evidence_cannot_fallback(self):
+        self.f.ledger["gates"]["G1-structure"]["status"] = "FAIL"
+        self.f.save()
+        self.closure["original_ledger"]["sha256"] = gate.sha(self.f.ledger_path.read_bytes())
+        self.save()
+        report = self.cli()
+        self.assertEqual(report["state"], "BLOCKED")
+        self.assertIn("Required gate incomplete", report["failure"]["reason"])
+        self.f.ledger["gates"]["G1-structure"]["status"] = "PASS"
+        self.f.save()
+        self.closure["original_ledger"]["sha256"] = gate.sha(self.f.ledger_path.read_bytes())
+        put(self.f.directory / "audit/report.failure.json", b"FILE_ONLY_FAILURE_EVIDENCE\n")
+        self.save()
+        report = self.cli()
+        self.assertIn("Audit failure sidecar", report["failure"]["reason"])
+        self.assertEqual(report["state"], "BLOCKED")
+
+    def test_v2_candidate_tool_and_commit_negative_no_gate_dispatch(self):
+        self.desired["commit"] = "0" * 40
+        put(self.desired_path, gate.encode(self.desired))
+        report = self.cli()
+        self.assertIn("HEAD/commit mismatch", report["failure"]["reason"])
+        self.assertNotIn("closure_execution", report)
+        self.desired["commit"] = self.f.commit
+        put(self.desired_path, gate.encode(self.desired))
+        put(self.f.repo / "tools/sync_release.py", b"FILE_ONLY_WRONG_TOOL\n")
+        report = self.cli()
+        self.assertIn("Dirty checkout", report["failure"]["reason"])
+        self.assertNotIn("closure_execution", report)
+        self.assertEqual(list(self.directory.glob("closure-gate-*")), [])
+
+    def test_closure_late_stdout_and_report_inode_reject_real_child(self):
+        # Earlier genuine missing-human refusal keeps these identity cases cheap.
+        self.f.ledger["manual"].pop("SCREEN-READER-DESKTOP")
+        self.f.save()
+        self.closure["original_ledger"]["sha256"] = gate.sha(self.f.ledger_path.read_bytes())
+        self.save()
+        for boundary, reason in (
+                ("stdout-marker", "Blocked closure final marker/report mismatch"),
+                ("late-report-inode", "Closure final report/log/stream identity drift")):
+            with self.subTest(boundary=boundary):
+                report = self.cli(boundary=boundary)
+                self.assertEqual(report["state"], "REFUSED")
+                self.assertIn(reason, report["failure"]["reason"])
+                execution = report["closure_execution"]
+                self.assertEqual(execution["actual_child_rc"], 1)
+                self.assertIn("Missing real device/manual", execution["report"]["failure"]["reason"])
+                self.assertNotIn("--ledger", execution["argv"])
+
+
+def closure_boundary_child(args):
+    """Original gate process with only own test stream/file output perturbation."""
+    actual = subprocess.run
+    closure_store_path = None
+    def run(argv, *values, **options):
+        nonlocal closure_store_path
+        child = actual(argv, *values, **options)
+        if isinstance(argv, list) and "--closure-request" in argv and \
+                str(Path(gate.__file__).resolve()) in argv:
+            gate.require(child.returncode == 1, "Boundary requires actual BLOCKED gate")
+            report = Path(argv[argv.index("--out") + 1])
+            if args.closure_boundary_child == "stdout-marker":
+                return subprocess.CompletedProcess(child.args, child.returncode,
+                                                   child.stdout + b"UNBOUND_LATE_STDOUT\n", child.stderr)
+            closure_store_path = report
+        return child
+    original_reader = gate._audit_file
+    reads = {}
+    def read(path, links, **kwargs):
+        if closure_store_path is not None and path == closure_store_path:
+            reads[path] = reads.get(path, 0) + 1
+            if reads[path] == 2:
+                replacement = path.with_name("test-owned-replacement-" + uuid4().hex)
+                closure_store(replacement, path.read_bytes())
+                os.replace(replacement, path)
+        return original_reader(path, links, **kwargs)
+    with patch.object(subprocess, "run", side_effect=run), \
+            patch.object(gate, "_audit_file", side_effect=read):
+        return sync.main(["--source-root", str(args.source_root), "--desired", str(args.desired),
+                          "--desired-sha256", args.desired_sha256, "--out", str(args.out)])
+
+
+def run_sync_closure(out, names):
+    """Own external runner; actual gate artifacts retain the fixed seat-sync root."""
+    global CLOSURE_OUT
+    gate.external(out)
+    out.mkdir(parents=True, exist_ok=False)
+    CLOSURE_OUT = out
+    sources = {ROOT / path for path in (
+        "tools/sync_release.py", "tools/release_gate.py", "tools/release_obligations.py",
+        "tests/test_sync_release.py", "tests/test_release_gate.py",
+        "tests/test_release_closure.py", "docs/deploy/SYNC_RELEASE.md",
+        "docs/deploy/RELEASE_CLOSURE.md")}
+    sources.update(Path(pin["path"]) for pin in gate.BRIDGE_IMPLEMENTATIONS.values())
+    sources.add(Path(gate.CLOSURE_TRUST_IMPLEMENTATION["path"]))
+    before = {str(path): gate.sha(gate.read_file(path)) for path in sorted(sources)}
+    closure_store(out / "START.json", gate.encode({"state": "RUNNING_NOT_FINAL", "source_before": before}))
+    suite = unittest.TestSuite()
+    for name in names:
+        cls = SyncClosureTests if name.startswith("test_v2") or name.startswith("test_closure") or \
+            name.startswith("test_complete_closure") else SyncTests
+        suite.addTest(cls(name))
+    started = time.monotonic()
+    with (out / "execution.log").open("x") as log:
+        result = unittest.TextTestRunner(stream=log, verbosity=2).run(suite)
+        after = {str(path): gate.sha(gate.read_file(path)) for path in sorted(sources)}
+        rc = 0 if result.wasSuccessful() and result.testsRun > 0 and before == after else 1
+        log.write(f"\nCOMMAND_EXIT_CODE={rc}\n")
+        log.flush()
+        os.fsync(log.fileno())
+    closure_store(out / "summary.json", gate.encode({
+        "verdict": "PASS" if rc == 0 else "FAIL", "actual_runner_rc": rc,
+        "tests": result.testsRun, "failures": len(result.failures), "errors": len(result.errors),
+        "seconds": time.monotonic() - started, "source_before": before,
+        "source_after": after, "source_stable": before == after, "children": CLOSURE_CHILDREN,
+        "scope": "FILE_ONLY_NOT_PRODUCT_NOT_RELEASE", "production_changes": False,
+        "finished_at": datetime.now(timezone.utc).isoformat()}))
+    print(f"SYNC_CLOSURE_TESTS rc={rc} tests={result.testsRun} out={out}", flush=True)
+    return rc
 
 
 def bundle_file_snapshot(bundle: Path) -> dict:
@@ -914,6 +1182,13 @@ def scan(out: Path) -> int:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--closure-only", action="store_true")
+    parser.add_argument("--closure-boundary-child", choices=("stdout-marker", "late-report-inode"),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--desired", type=Path)
+    parser.add_argument("--desired-sha256")
+    parser.add_argument("--closure-select", action="append", choices=[
+        name for cls in (SyncClosureTests, SyncTests) for name in dir(cls) if name.startswith("test_")])
     parser.add_argument("--scan", action="store_true")
     parser.add_argument("--bundle-mode-only", action="store_true")
     parser.add_argument("--bundle-mode-child", action="store_true", help=argparse.SUPPRESS)
@@ -936,6 +1211,14 @@ if __name__ == "__main__":
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--bundle", type=Path)
     args = parser.parse_args()
+    if args.closure_boundary_child:
+        raise SystemExit(closure_boundary_child(args))
+    if args.closure_only or args.closure_select:
+        names = args.closure_select or [
+            name for name in dir(SyncClosureTests) if name.startswith("test_")] + [
+                "test_unknown_desired_field", "test_missing_controller_refused",
+                "test_forged_certified_receipt_cannot_authorize_sync"]
+        raise SystemExit(run_sync_closure(args.out, names))
     if args.bundle_mode_only:
         raise SystemExit(run_bundle_mode(args.out, args.select or ["test_real_peer_bundle_validate_and_bad_pin"]))
     if args.bundle_mode_child:

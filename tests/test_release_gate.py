@@ -10,6 +10,7 @@ import argparse
 import copy
 from datetime import datetime, timedelta, timezone
 import hashlib
+import importlib.util
 import io
 import os
 from pathlib import Path
@@ -29,6 +30,302 @@ PEERS = {
     "tools/browser_audit.mjs": Path("/data/dev/opensim-audit-v1/tools/browser_audit.mjs"),
     "tools/browser_performance.mjs": Path("/data/dev/opensim-perf-v1/tools/browser_performance.mjs"),
 }
+BRIDGE_DEPENDENCIES = {
+    "obligations": {
+        "path": "/data/dev/opensim-authorized-obligations-20261010/tools/release_obligations.py",
+        "sha256": "9c1b0d9a464c958d6d32c760ba39173da6134ad771436ddc7a36466ab3a8b4bf",
+    },
+    "trust": {
+        "path": "/data/dev/opensim-authorized-trust-20261010/tools/release_trust.py",
+        "sha256": "ce085ad4062327c6d95b6d274f66897fbb2440ab2170404dd03b07986bd59639",
+    },
+}
+
+NATIVE_ADAPTER_TREE = Path("/data/dev/opensim-release-native-adapter-main-v1")
+NATIVE_ASSESSMENT_DEPENDENCIES = {
+    NATIVE_ADAPTER_TREE / "tools/release_native_adapter.py":
+        "4c998f3d0587a4d09064ced6a76171da37e95cb8bddd24c4d912416fe95b5b00",
+    NATIVE_ADAPTER_TREE / "tests/test_release_native_adapter.py":
+        "1cd8296076cd2ed2198a4d8fa41f653039ec3c4ebb23e9385ea52a132eaa085c",
+    NATIVE_ADAPTER_TREE / "tools/workbench_acceptance.py":
+        "633a3b2296a9bf5531c2c311fdd39b83b36a95a5713be3f655865bfaed7552d9",
+    NATIVE_ADAPTER_TREE / "tests/test_workbench_acceptance.py":
+        "fad6811eafb9573cc954d62d481623e17ba48d63d2ba4199db1b809c505cc316",
+    NATIVE_ADAPTER_TREE / "docs/deploy/RELEASE_NATIVE_ADAPTER.md":
+        "e210d116920e011d4f9028f4920010faa4d834a8869471f69dc517eed65322dc",
+}
+
+
+class NativeAssessmentTests(unittest.TestCase):
+    out = None
+
+    @classmethod
+    def setUpClass(cls):
+        if cls.out is None:
+            cls.out = gate.OUTPUT_ROOT / ("native-assessment-discovery-" + uuid4().hex)
+            cls.out.mkdir(parents=True, exist_ok=False)
+        for path, pin in NATIVE_ASSESSMENT_DEPENDENCIES.items():
+            gate.require(gate.sha(gate.read_file(path)) == pin,
+                         "Native assessment fixture dependency drift")
+        location = NATIVE_ADAPTER_TREE / "tests/test_release_native_adapter.py"
+        spec = importlib.util.spec_from_file_location("assessment_original_fixture", location)
+        cls.original = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.original)
+        cls.original.AdapterTests.out = cls.out.resolve()
+        cls.original.AdapterTests.children = []
+        cls.original.AdapterTests.setUpClass()
+        cls.support = cls.original.AdapterTests(
+            "test_partial_actual_cli_preserves_open_and_original_rc")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.original.AdapterTests.tearDownClass()
+
+    def observation(self, *, as_pass=False, failure=False):
+        path = self.support.terminal(as_pass=as_pass, failure=failure,
+                                     audit_links=None if failure else "pair")
+        process = self.support.collected(path)
+        output = self.support.cli(path, process, 1 if failure else 3)
+        adapter = self.support.adapter
+        request = {"schema": "opensim-release-native-assessment-request-v1",
+                   "adapter": {"path": str(NATIVE_ADAPTER_TREE / "tools/release_native_adapter.py"),
+                               "sha256": NATIVE_ASSESSMENT_DEPENDENCIES[
+                                   NATIVE_ADAPTER_TREE / "tools/release_native_adapter.py"]},
+                   "observation": {"path": str(output / "adapter.json"),
+                                   "sha256": adapter.sha((output / "adapter.json").read_bytes())}}
+        directory = self.support.directory("assessment-input")
+        manifest = directory / "request.json"
+        put(manifest, gate.encode(request))
+        return path, process, output, manifest
+
+    def cli(self, manifest, *, extra=(), output=None, stdout=None, late=None):
+        directory = self.support.directory("assessment-cli")
+        output = output or directory / "assessment.json"
+        tool = Path(__file__) if late else ROOT / "tools/release_gate.py"
+        argv = [sys.executable, "-B", str(tool),
+                "--source-root", str(self.support.root), "--commit", self.support.commit,
+                "--native-assessment", str(manifest), "--out", str(output), *extra]
+        if late:
+            argv += ["--assessment-publication-negative", str(late)]
+        child = subprocess.run(argv, cwd=ROOT,
+                               stdout=subprocess.PIPE if stdout is None else stdout,
+                               stderr=subprocess.PIPE)
+        put(directory / "stdout.log", child.stdout if stdout is None else b"")
+        put(directory / "stderr.log", child.stderr)
+        Fixture.child_records.append({"argv": child.args, "rc": child.returncode,
+                                      "stdout": {"path": str(directory / "stdout.log"),
+                                                 "captured": stdout is None,
+                                                 "bytes": len(child.stdout or b""),
+                                                 "sha256": gate.sha(child.stdout or b"")},
+                                      "stderr": {"path": str(directory / "stderr.log"),
+                                                 "bytes": len(child.stderr), "sha256": gate.sha(child.stderr)},
+                                      "report_path": str(output)})
+        return child, output
+
+    def test_partial_pair_reaches_real_assessment_without_human_claim(self):
+        path, process, output, manifest = self.observation()
+        originals = {item: (item.read_bytes(), self.support.adapter.stamp(item.stat()))
+                     for item in (path, path.parent / "audit/report.json",
+                                  path.parent / "audit/report.candidate.json", process)}
+        child, report_path = self.cli(manifest)
+        self.assertEqual(child.returncode, 3, child.stderr.decode())
+        report = gate.decode(report_path.read_bytes())
+        self.assertEqual(report["state"], "OPEN_OBLIGATIONS")
+        self.assertEqual(report["release_verdict"], "NOT_CERTIFIED")
+        self.assertEqual(report["assessment"]["read_observation_calls"], 2)
+        self.assertEqual(report["assessment"]["native_g3_status"], "PARTIAL")
+        self.assertEqual(report["assessment"]["closed_obligations"], [])
+        self.assertTrue(all(row["status"] == "NOT_TESTED"
+                            for row in report["assessment"]["human"]))
+        self.assertEqual(report["assessment"]["trust"]["state"], "TRUST_UNAVAILABLE")
+        for item, original in originals.items():
+            self.assertEqual((item.read_bytes(), self.support.adapter.stamp(item.stat())), original)
+        self.assertFalse(report["production_changes"])
+        self.assertEqual(report["assessment"]["launcher_scope"], self.support.adapter.FIXTURE_SCOPE)
+        log = report_path.with_suffix(".log").read_bytes()
+        self.assertEqual(report["execution_log"]["sha256"], gate.sha(log))
+        self.assertEqual(report["execution_log"]["path"], str(report_path.with_suffix(".log")))
+        self.assertIn(report["invocation_id"].encode(), log)
+        self.assertIn(b"finalization=PROVISIONAL", log)
+        self.assertIn(("report_sha256=" + gate.sha(report_path.read_bytes())).encode(), child.stdout)
+        self.assertIn(("invocation_id=" + report["invocation_id"]).encode(), child.stdout)
+        self.assertIn(b"state=OPEN_OBLIGATIONS rc=3 ", child.stdout)
+        self.assertEqual(report["finalization"], "FINAL_PROCESS_RC_REQUIRED")
+
+    def reject(self, manifest, reason, *, expected=2, **kwargs):
+        child, output = self.cli(manifest, **kwargs)
+        self.assertEqual(child.returncode, expected, child.stderr.decode())
+        report = gate.decode(output.read_bytes())
+        self.assertEqual(report["release_verdict"], "NOT_CERTIFIED")
+        self.assertIn(reason, report["failure"]["reason"])
+        self.assertIn(reason.encode(), child.stderr)
+        return report
+
+    def test_as_pass_pair_is_observed_without_semantic_or_human_closure(self):
+        path, _, _, manifest = self.observation(as_pass=True)
+        original = path.read_bytes()
+        child, output = self.cli(manifest)
+        self.assertEqual(child.returncode, 3, child.stderr.decode())
+        report = gate.decode(output.read_bytes())
+        self.assertEqual(report["assessment"]["native_g3_status"], "AUTOMATED_SCOPE_PASS")
+        self.assertEqual(report["assessment"]["read_observation_calls"], 2)
+        self.assertEqual(report["assessment"]["coverage"]["state"], "OPEN")
+        self.assertEqual(report["release_verdict"], "NOT_CERTIFIED")
+        self.assertTrue(all(row["status"] == "NOT_TESTED" for row in report["assessment"]["human"]))
+        self.assertEqual(report["assessment"]["public_g5"], {"status": "NOT_TESTED", "waivable": False})
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_original_fail_keeps_rc_and_first_cause_in_report_and_log(self):
+        _, _, _, manifest = self.observation(failure=True)
+        child, output = self.cli(manifest)
+        self.assertEqual(child.returncode, 1, child.stderr.decode())
+        report = gate.decode(output.read_bytes())
+        self.assertEqual(report["state"], "ORIGINAL_PRODUCER_FAILURE_VETO")
+        self.assertEqual(report["first_cause"]["message"], "FILE_FIXTURE_FAILURE")
+        self.assertEqual(report["assessment"]["read_observation_calls"], 2)
+        self.assertIn(b"FILE_FIXTURE_FAILURE", output.with_suffix(".log").read_bytes())
+        self.assertIn(b"FILE_FIXTURE_FAILURE", child.stderr)
+
+    def test_failure_sidecars_veto_actual_read_observation(self):
+        for original in (False, True):
+            with self.subTest(original=original):
+                path, _, output, manifest = self.observation(failure=original)
+                marker = (path.parent / "persistence-failure-fixture.json" if original else
+                          output / "adapter-failure-fixture.json")
+                put(marker, b'{"scope":"FILE_ONLY_FAILURE_MARKER"}\n')
+                report = self.reject(manifest, "failure")
+                self.assertEqual(report["read_observation_calls"], 1)
+                if original:
+                    self.assertEqual(report["native_observation_diagnostic"]["first_cause"]["message"],
+                                     "FILE_FIXTURE_FAILURE")
+
+    def test_wrong_launcher_argv_and_rc_are_rejected_not_report_literals(self):
+        for key, value in (("argv", ["not-the-waited-cli"]), ("actual_rc", True)):
+            with self.subTest(key=key):
+                _, process, output, manifest = self.observation(failure=True)
+                body = gate.decode(process.read_bytes())
+                body[key] = value
+                put(process, gate.encode(body))
+                observation = gate.decode((output / "adapter.json").read_bytes())
+                observation["process_rc_source"] = self.support.adapter.regular(process)[1]
+                observation["launcher"] = body
+                put(output / "adapter.json", gate.encode(observation))
+                request = gate.decode(manifest.read_bytes())
+                request["observation"]["sha256"] = gate.sha((output / "adapter.json").read_bytes())
+                put(manifest, gate.encode(request))
+                report = self.reject(manifest, "Launcher candidate/report/argv/rc binding differs")
+                self.assertEqual(report["read_observation_calls"], 1)
+
+    def test_unknown_third_audit_link_rejected_and_preserved(self):
+        path, _, _, manifest = self.observation()
+        final = path.parent / "audit/report.json"
+        unknown = final.with_name("unknown-third-link.json")
+        os.link(final, unknown)
+        body = unknown.read_bytes()
+        self.reject(manifest, "Workbench producer completion dependency changed")
+        self.assertEqual(unknown.read_bytes(), body)
+        self.assertEqual(final.stat().st_nlink, 3)
+
+    def test_source_pin_request_version_and_observation_hash_are_strict(self):
+        _, _, _, manifest = self.observation(failure=True)
+        original = gate.decode(manifest.read_bytes())
+        variants = (
+            ("schema", "opensim-release-evidence-v2", "Invalid versioned"),
+            ("adapter", {**original["adapter"], "sha256": "0" * 64}, "Unapproved native"),
+            ("observation", {**original["observation"], "sha256": "0" * 64}, "SHA differs"))
+        for key, value, cause in variants:
+            with self.subTest(key=key):
+                put(manifest, gate.encode({**original, key: value}))
+                self.reject(manifest, cause)
+
+    def test_wrong_candidate_and_approval_do_not_open_a_release_path(self):
+        _, _, _, manifest = self.observation(failure=True)
+        report = self.reject(manifest, "candidate/root mismatch", extra=("--commit", "0" * 40))
+        self.assertEqual(report["read_observation_calls"], 1)
+        report = self.reject(manifest, "forbids approval", extra=("--approval-path", "/no/approval",
+                                                                "--approval-sha256", "0" * 64))
+        self.assertEqual(report["read_observation_calls"], 0)
+
+    def test_output_conflict_protects_unknown_bytes_and_inode(self):
+        _, _, _, manifest = self.observation(failure=True)
+        output = self.support.directory("conflict") / "assessment.json"
+        put(output, b"UNKNOWN_PREEXISTING_REPORT\n")
+        before = (output.read_bytes(), self.support.adapter.stamp(output.stat()))
+        child, _ = self.cli(manifest, output=output)
+        self.assertEqual(child.returncode, 1)
+        self.assertIn(b"Existing output protected", child.stderr)
+        self.assertEqual((output.read_bytes(), self.support.adapter.stamp(output.stat())), before)
+        self.assertFalse(output.with_suffix(".log").exists())
+
+    def test_late_raw_stream_and_sidecar_drift_revokes_exact_owned_report(self):
+        causes = {"raw": "Invalid JSON report", "stream": "Launcher stream inode/bytes/hash differs",
+                  "sidecar": "Adapter failure sidecar present before assessment publication"}
+        for kind in ("raw", "stream", "sidecar"):
+            with self.subTest(kind=kind):
+                path, process, adapter_out, manifest = self.observation(failure=True)
+                target = (path if kind == "raw" else
+                          Path(gate.decode(process.read_bytes())["stdout"]["path"]) if kind == "stream"
+                          else adapter_out / "adapter-failure-late.json")
+                child, output = self.cli(manifest, late=target)
+                self.assertEqual(child.returncode, 1, child.stderr.decode())
+                report = gate.decode(output.read_bytes())
+                self.assertEqual(report["finalization"], "FAILED")
+                self.assertEqual(report["action_result"]["assessment"]["read_observation_calls"], 2)
+                self.assertEqual(report["first_cause"]["message"], "FILE_FIXTURE_FAILURE")
+                self.assertIn(b"FILE_FIXTURE_FAILURE", child.stderr)
+                self.assertEqual(report["release_verdict"], "NOT_CERTIFIED")
+                self.assertIn(causes[kind], report["evidence_failure"]["reason"])
+                self.assertEqual(target.read_bytes(), b"LATE_FILE_ONLY_DRIFT\n")
+
+    def test_z_late_dirty_candidate_is_rejected_without_cleaning_unknown_file(self):
+        _, _, _, manifest = self.observation(failure=True)
+        target = self.support.root / "unknown-late-candidate.txt"
+        before = self.support.reader.inventory(self.support.root)
+        child, output = self.cli(manifest, late=target)
+        self.assertEqual(child.returncode, 1, child.stderr.decode())
+        report = gate.decode(output.read_bytes())
+        self.assertEqual(report["finalization"], "FAILED")
+        self.assertIn("Publication native/source dependency drift", report["evidence_failure"]["reason"])
+        self.assertEqual(report["first_cause"]["message"], "FILE_FIXTURE_FAILURE")
+        self.assertEqual(target.read_bytes(), b"LATE_FILE_ONLY_DRIFT\n")
+        self.assertNotEqual(self.support.reader.inventory(self.support.root), before)
+        self.assertEqual(report["action_result"]["assessment"]["read_observation_calls"], 2)
+
+    def test_actual_stdout_enospc_preserves_original_failure_and_nonzero(self):
+        _, _, _, manifest = self.observation(failure=True)
+        with open("/dev/full", "wb", buffering=0) as full:
+            child, output = self.cli(manifest, stdout=full)
+        self.assertEqual(child.returncode, 1, child.stderr.decode())
+        report = gate.decode(output.read_bytes())
+        self.assertEqual(report["finalization"], "FAILED")
+        self.assertEqual(report["evidence_failure"]["errno"], 28)
+        self.assertEqual(report["first_cause"]["message"], "FILE_FIXTURE_FAILURE")
+        self.assertIn(b"FILE_FIXTURE_FAILURE", child.stderr)
+
+
+def assessment_publication_negative(args):
+    """Real API caller: mutate file after report write, before terminal publication."""
+    guards = []
+    result = gate.assess_native(args.source_root, args.commit, args.native_assessment,
+                                publication_guards=guards)
+    gate.require(result["assessment"]["read_observation_calls"] == 2 and len(guards) == 1,
+                 "Publication negative did not reach real validated assessment")
+    target = gate.external(args.assessment_publication_negative)
+    calls = 0
+
+    def verify():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            gate.require(args.out.is_file(), "Late negative did not reach written candidate report")
+            put(target, b"LATE_FILE_ONLY_DRIFT\n")
+        guards[0]()
+
+    return gate.finalize_result(result, args.out, status_key="state",
+                                failed_status="INVALID_NATIVE_ASSESSMENT",
+                                label="OPENSIM_NATIVE_ASSESSMENT", verify=verify,
+                                emit=gate.native_assessment_stdout)
+
 
 
 def png(width: int = 1, height: int = 1) -> bytes:
@@ -98,13 +395,18 @@ def native_assets(directory: Path, report: dict, expected: dict, collected: str)
 
 
 class Fixture:
-    def __init__(self, approval: dict | None = None):
-        self.directory = gate.OUTPUT_ROOT / ("fixture-" + uuid4().hex)
+    base = gate.OUTPUT_ROOT
+    child_records = []
+
+    def __init__(self, approval: dict | None = None, *, bridge: bool = False):
+        self.directory = self.base / ("fixture-" + uuid4().hex)
         self.repo = self.directory / "repo"
         self.repo.mkdir(parents=True)
         self.now = datetime.now(timezone.utc)
         self.time = self.now.isoformat()
-        for name in set((*gate.SOURCES, *gate.TOOLS, "requirements.txt")):
+        fixture_files = set((*gate.SOURCES, *gate.TOOLS, "requirements.txt",
+                             *(("tools/ui_contract_test.mjs",) if bridge else ())))
+        for name in fixture_files:
             if name == "tools/workbench_acceptance.py":
                 put(self.repo / name, gate.git(Path("/data/dev/opensim"), "show",
                     "75beb17b230f86c016621234c3b9df96809ec04f:" + name))
@@ -117,7 +419,7 @@ class Fixture:
             put(self.repo / "docs/approvals.json", gate.encode({
                 "schema": "opensim-user-approvals-v1", "records": [approval]}))
         command(["git", "init", "--initial-branch=fixture"], self.repo)
-        command(["git", "add", "--", *sorted(set((*gate.SOURCES, *gate.TOOLS, "requirements.txt"))),
+        command(["git", "add", "--", *sorted(fixture_files),
                  *(["docs/approvals.json"] if approval else [])], self.repo)
         command(["git", "-c", "user.name=Gate Test Fixture", "-c", "user.email=fixture@example.invalid",
                  "-c", "core.hooksPath=/dev/null", "commit", "-m", "FIXTURE_NOT_RELEASE"], self.repo)
@@ -362,8 +664,19 @@ class Fixture:
         if self.approval_pin:
             argv += ["--approval-path", self.approval_pin["path"],
                      "--approval-sha256", self.approval_pin["sha256"]]
-        result = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True,
+        actual = subprocess.run(argv, cwd=ROOT, capture_output=True,
                                 env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+        streams = {}
+        for label, body in (("stdout", actual.stdout), ("stderr", actual.stderr)):
+            path = out.with_suffix("." + label)
+            put(path, body)
+            streams[label] = {"path": str(path), "bytes": len(body), "sha256": gate.sha(body)}
+        self.child_records.append({"argv": argv, "actual_rc": actual.returncode,
+                                   "report": {"path": str(out), "sha256": gate.sha(out.read_bytes())},
+                                   **streams, "fixture": str(self.directory),
+                                   "scope": "ACTUAL_GATE_CLI_FILE_ONLY_NOT_PRODUCT"})
+        result = subprocess.CompletedProcess(argv, actual.returncode,
+                                             actual.stdout.decode(), actual.stderr.decode())
         put(out.with_suffix(".subprocess.log"),
             (f"rc={result.returncode}\n" + result.stdout + result.stderr).encode())
         return result, gate.decode(out.read_bytes())
@@ -376,6 +689,333 @@ def approval(rule: str = "PHYSICAL-TOUCH", expired: bool = False) -> dict:
             "reason": "FIXTURE_NOT_USER_APPROVAL", "scope": gate.PUBLIC_URL,
             "removal_condition": "fixture condition", "status": "APPROVED", "approved_by": "user",
             "approved_at": (now - timedelta(days=2)).isoformat(), "approval_record_id": "fixture-record"}
+
+
+class BridgeTests(unittest.TestCase):
+    def prepare(self, status="PARTIAL", approval_record=None):
+        fixture = Fixture(approval_record, bridge=True)
+        fixture.reports["audit"].update(
+            findings={"failure_count": 0, "failure_rules": []},
+            focus_samples=[], page_capabilities={"dialogs": 0, "mobile_menus": 0})
+        fixture.reports["audit"]["gates"]["G3-accessibility"]["status"] = status
+        fixture.change("audit")
+        fixture.ledger["schema"] = "opensim-release-evidence-v2"
+        fixture.ledger["gates"]["G3-accessibility"]["status"] = status
+        mapped = gate.native_obligations(fixture.pin("audit"), fixture.identity, 0, fixture.repo,
+                                        BRIDGE_DEPENDENCIES, fixture.now)
+        fixture.store("native-closure", copy.deepcopy(mapped))
+        fixture.ledger["bridge"] = {
+            "implementations": copy.deepcopy(BRIDGE_DEPENDENCIES),
+            "native_closure": fixture.pin("native-closure"), "canonical": None,
+            "provenance": {"human": {}, "exceptions": {}}}
+        fixture.save()
+        return fixture
+
+    def blocked(self, fixture, needle):
+        before = gate.encode(fixture.reports["audit"])
+        identity = gate.identity(fixture.repo, fixture.commit)
+        child, report = fixture.cli()
+        self.assertEqual(child.returncode, 1, child.stderr)
+        self.assertIn(needle, report["failure"]["reason"])
+        self.assertEqual(report["release_verdict"], "NOT_CERTIFIED")
+        self.assertFalse(report["production_changes"])
+        self.assertEqual(gate.identity(fixture.repo, fixture.commit), identity)
+        self.assertEqual((fixture.directory / "audit/report.json").read_bytes(), before)
+        return report
+
+    def test_native_partial_advances_past_raw_pass_contradiction(self):
+        fixture = self.prepare()
+        report = self.blocked(fixture, "TRUST_UNAVAILABLE")
+        self.assertTrue(report["bridge"]["closure"]["native"]["open"])
+        self.assertEqual(report["bridge"]["trust"]["production"]["state"], "TRUST_UNAVAILABLE")
+        self.assertEqual({row["state"] for row in report["bridge"]["trust"]["materials"]},
+                         {"MISSING_PROVENANCE"})
+        self.assertEqual(fixture.reports["audit"]["gates"]["G3-accessibility"]["status"], "PARTIAL")
+
+    def test_native_automated_scope_advances_past_raw_pass_contradiction(self):
+        fixture = self.prepare("AUTOMATED_SCOPE_PASS")
+        report = self.blocked(fixture, "TRUST_UNAVAILABLE")
+        self.assertEqual(report["bridge"]["closure"]["native"]["first_cause"]["code"],
+                         "NATIVE_G3_ADAPTER_UNSUPPORTED")
+        self.assertEqual(fixture.reports["audit"]["gates"]["G3-accessibility"]["status"],
+                         "AUTOMATED_SCOPE_PASS")
+
+    def test_raw_pass_is_still_rejected_by_original_reader(self):
+        fixture = self.prepare()
+        fixture.reports["audit"]["gates"]["G3-accessibility"]["status"] = "PASS"
+        fixture.change("audit")
+        self.blocked(fixture, "Native audit G3 cannot claim full PASS")
+
+    def test_native_failure_cannot_be_covered_by_claimed_canonical_closed(self):
+        fixture = self.prepare()
+        fixture.ledger["bridge"]["canonical"] = {"verdict": "AUTOMATION_SCOPE_CLOSED"}
+        fixture.reports["audit"]["checks"][0]["status"] = "FAIL"
+        fixture.change("audit")
+        self.blocked(fixture, "Audit failed/unknown checks")
+
+    def test_native_coordinate_closure_must_equal_actual_mapping(self):
+        fixture = self.prepare()
+        fixture.reports["native-closure"]["open"][0]["coordinate"]["viewport"] = [321, 568]
+        fixture.store("native-closure", fixture.reports["native-closure"])
+        fixture.ledger["bridge"]["native_closure"] = fixture.pin("native-closure")
+        fixture.save()
+        self.blocked(fixture, "Native closure differs from original coordinates/source binding")
+
+    def test_native_closure_source_binding_cannot_change(self):
+        fixture = self.prepare()
+        fixture.reports["native-closure"]["candidate"]["commit"] = "0" * 40
+        fixture.store("native-closure", fixture.reports["native-closure"])
+        fixture.ledger["bridge"]["native_closure"] = fixture.pin("native-closure")
+        fixture.save()
+        self.blocked(fixture, "Native closure differs from original coordinates/source binding")
+
+    def test_missing_closure_material_is_fail_loud(self):
+        fixture = self.prepare()
+        fixture.ledger["bridge"]["native_closure"]["path"] = str(fixture.directory / "missing.json")
+        fixture.save()
+        self.blocked(fixture, "No such file")
+
+    def test_dependency_hash_mismatch_no_fallback(self):
+        fixture = self.prepare()
+        fixture.ledger["bridge"]["implementations"]["obligations"]["sha256"] = "0" * 64
+        fixture.save()
+        self.blocked(fixture, "Bridge dependency source hash mismatch")
+
+    def test_manual_missing_and_stale_still_refuse(self):
+        fixture = self.prepare()
+        fixture.ledger["manual"] = {}
+        fixture.save()
+        self.blocked(fixture, "Missing real device/manual gate records")
+        fixture = self.prepare()
+        rule = gate.MANUAL[0]
+        fixture.store(rule, {**fixture.reports[rule],
+                            "collected_at": (fixture.now - timedelta(days=2)).isoformat()})
+        fixture.ledger["manual"][rule] = fixture.pin(rule)
+        fixture.save()
+        self.blocked(fixture, "Stale/future evidence")
+
+    def test_editable_proof_never_creates_production_enrollment(self):
+        fixture = self.prepare()
+        fixture.store("envelope", {"test_fixture": "FILE_ONLY_NOT_HUMAN_PROVENANCE"})
+        fixture.store("revocations", {"test_fixture": "FILE_ONLY_NOT_TRUST"})
+        fixture.ledger["bridge"]["provenance"]["human"][gate.MANUAL[0]] = {
+            "envelope": fixture.pin("envelope"), "revocations": fixture.pin("revocations")}
+        fixture.save()
+        report = self.blocked(fixture, "TRUST_UNAVAILABLE")
+        material = next(row for row in report["bridge"]["trust"]["materials"]
+                        if row["id"] == gate.MANUAL[0] and row["role"] == "human")
+        self.assertEqual(material["state"], "TRUST_UNAVAILABLE")
+
+    def test_fabricated_trusted_state_rejected(self):
+        fixture = self.prepare()
+        fixture.ledger["bridge"]["provenance"]["human"][gate.MANUAL[0]] = {"state": "TRUSTED"}
+        fixture.save()
+        self.blocked(fixture, "Provenance requires pinned envelope/revocations")
+
+    def test_exact_exception_requires_separate_user_provenance(self):
+        fixture = self.prepare(approval_record=approval())
+        fixture.ledger["exceptions"] = ["EXPLICIT-FIXTURE-APPROVAL"]
+        fixture.ledger["manual"]["PHYSICAL-TOUCH"] = {"status": "EXCEPTION"}
+        fixture.save()
+        report = self.blocked(fixture, "TRUST_UNAVAILABLE")
+        self.assertIn({"role": "user-approval", "id": "EXPLICIT-FIXTURE-APPROVAL",
+                       "material_sha256": gate.sha(gate.encode(approval_record := gate.approvals(
+                           fixture.repo, fixture.commit, fixture.approval_pin, fixture.now)[
+                               "EXPLICIT-FIXTURE-APPROVAL"])),
+                       "state": "MISSING_PROVENANCE"}, report["bridge"]["trust"]["materials"])
+        self.assertEqual(approval_record["rule_id"], "PHYSICAL-TOUCH")
+
+    def test_expired_exception_and_public_g5_nonwaivable(self):
+        fixture = Fixture(approval(expired=True), bridge=True)
+        fixture.ledger["schema"] = "opensim-release-evidence-v2"
+        fixture.ledger["bridge"] = {}
+        fixture.save()
+        self.blocked(fixture, "Expired/future exception")
+        fixture = self.prepare(approval_record=approval("G5-performance"))
+        fixture.ledger["exceptions"] = ["EXPLICIT-FIXTURE-APPROVAL"]
+        fixture.save()
+        self.blocked(fixture, "Missing public G5 cannot be waived")
+
+    def test_local_public_budget_cannot_be_waived_by_bridge(self):
+        fixture = self.prepare()
+        fixture.change("performance", scope="LOCAL_PREFLIGHT")
+        self.blocked(fixture, "G5 requires PUBLIC_LAB")
+
+    def test_gate_record_cannot_upgrade_native_partial(self):
+        fixture = self.prepare()
+        fixture.ledger["gates"]["G3-accessibility"]["status"] = "PASS"
+        fixture.save()
+        self.blocked(fixture, "Bridge gate must retain original native status")
+
+    def canonical(self, fixture, *, untested=False):
+        obligations, _ = gate.bridge_algorithms(BRIDGE_DEPENDENCIES, fixture.repo, fixture.identity)
+        identity = obligations.candidate(fixture.repo, fixture.commit)
+        policy = obligations.build_policy(identity, [{"url": gate.PUBLIC_URL,
+            "objects": [{"id": "FILE_ONLY_" + kind, "kind": kind} for kind in obligations.KINDS]}])
+        coordinates, unsupported = obligations.coordinates(policy)
+        self.assertFalse(unsupported)
+        report = {"schema": obligations.OBSERVATION, "mode": "AUTOMATED_PROTOCOL_OBSERVATION",
+                  "candidate": identity, "tool": {"path": "tools/browser_audit.mjs",
+                      "sha256": fixture.identity["tool_sha256"]["tools/browser_audit.mjs"]},
+                  "exit_code": 0, "execution_source": "FILE_ONLY_NOT_PRODUCT_EXECUTION",
+                  "release_verdict": "NOT_CERTIFIED", "scans": obligations.scans_expected(policy),
+                  "checks": [{"coordinate": row, "status": "PASS",
+                              "detail": {"scope": "FILE_PROTOCOL_ONLY_NOT_REAL_BROWSER"}}
+                             for row in coordinates], "failure": None}
+        if untested:
+            report["checks"][0]["status"] = "NOT_TESTED"
+        fixture.store("canonical-policy", policy)
+        fixture.store("canonical-original", report)
+        supplements = []
+        if untested:
+            supplement = copy.deepcopy(report)
+            supplement["checks"] = [{**report["checks"][0], "status": "PASS"}]
+            fixture.store("canonical-supplement", supplement)
+            supplements.append(fixture.pin("canonical-supplement"))
+        fixture.store("canonical-ledger", {"schema": obligations.SCHEMA,
+                      "policy_sha256": fixture.pin("canonical-policy")["sha256"],
+                      "baseline": fixture.pin("canonical-original"), "supplements": supplements})
+        fixture.ledger["bridge"]["canonical"] = {
+            "policy": fixture.pin("canonical-policy"), "ledger": fixture.pin("canonical-ledger")}
+        fixture.save()
+        return report
+
+    def test_canonical_closed_does_not_close_native_or_human(self):
+        fixture = self.prepare()
+        self.canonical(fixture, untested=True)
+        report = self.blocked(fixture, "TRUST_UNAVAILABLE")
+        closure = report["bridge"]["closure"]
+        self.assertEqual(closure["canonical"]["verdict"], "AUTOMATION_SCOPE_CLOSED")
+        self.assertEqual(closure["canonical"]["open"], [])
+        self.assertEqual(closure["canonical"]["original_observations"][0]["checks"][0]["status"],
+                         "NOT_TESTED")
+        self.assertTrue(closure["native"]["open"])
+        self.assertEqual(closure["native"]["original_observations"][0]["gates"]
+                         ["G3-accessibility"]["status"], "PARTIAL")
+        self.assertEqual(closure["canonical_authority"], "PROTOCOL_ONLY_NOT_NATIVE_CERTIFICATION")
+
+    def test_canonical_wrong_original_status_source_and_marker_rejected(self):
+        fixture = self.prepare()
+        original = self.canonical(fixture)
+        for variant, reason in (("status", "Nonzero rc or explicit producer failure"),
+                                ("source", "Candidate/tool/build differs"),
+                                ("marker", "Producer failure sidecar present")):
+            with self.subTest(variant=variant):
+                changed = copy.deepcopy(original)
+                if variant == "status":
+                    changed["exit_code"] = 1
+                elif variant == "source":
+                    changed["candidate"]["source_sha256"]["solver.py"] = "0" * 64
+                fixture.store("canonical-original", changed)
+                fixture.reports["canonical-ledger"]["baseline"] = fixture.pin("canonical-original")
+                fixture.store("canonical-ledger", fixture.reports["canonical-ledger"])
+                fixture.ledger["bridge"]["canonical"]["ledger"] = fixture.pin("canonical-ledger")
+                if variant == "marker":
+                    put(fixture.directory / "canonical-original/report.failure.json",
+                        gate.encode({"test_fixture": "ORIGINAL_FAILURE_NOT_COVERABLE"}))
+                fixture.save()
+                self.blocked(fixture, reason)
+
+    def test_real_crypto_rejects_wrong_role_material_and_expired_without_certifying(self):
+        fixture = self.prepare()
+        _, trust = gate.bridge_algorithms(BRIDGE_DEPENDENCIES, fixture.repo, fixture.identity)
+        import base64
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        current = int(fixture.now.timestamp())
+        source = {"record_id": "FILE_ONLY_SYNTHETIC_SOURCE", "sha256": trust.sha(b"FILE_ONLY")}
+        keys, private = [], {}
+        for role, kind in trust.ROLES.items():
+            secret = Ed25519PrivateKey.generate()
+            public = secret.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+            private[role] = secret
+            keys.append({"key_id": trust.sha(public), "public_key": base64.b64encode(public).decode(),
+                         "role": role, "actor_kind": kind, "principal_id": "FILE_ONLY_" + role,
+                         "not_before": current - 1000, "expires_at": current + 7200, "source": source})
+        root = {"schema": trust.TEST_ROOT, "mode": "TEST_ONLY", "domain": trust.DOMAIN,
+                "policy": trust.POLICY, "source": source, "keys": keys,
+                "minimum_revocation_sequence": 1, "revocation_not_before": current - 60}
+        material = fixture.pin(gate.MANUAL[0])["sha256"]
+        payload = {"domain": trust.DOMAIN, "policy": trust.POLICY, "role": "human",
+                   "record_id": "FILE_ONLY_RECORD", "candidate": fixture.commit,
+                   "material_sha256": material, "issuer_id": "FILE_ONLY_human", "source": source,
+                   "issued_at": current - 10, "not_before": current - 10, "expires_at": current + 600}
+        snapshot = {"domain": trust.DOMAIN, "policy": trust.POLICY, "source": source,
+                    "sequence": 1, "issued_at": current - 10, "expires_at": current + 120,
+                    "revoked_keys": [], "revoked_records": []}
+
+        def signed(schema, value, role):
+            frame = {"schema": schema, "algorithm": "Ed25519",
+                     "key_id": next(key["key_id"] for key in keys if key["role"] == role),
+                     "payload": value}
+            frame["signature"] = base64.b64encode(
+                private[role].sign(trust.signing_bytes(frame, schema))).decode()
+            return trust.canonical(frame)
+
+        revoked = signed(trust.REVOCATIONS, snapshot, "revocation")
+        args = {"expected_candidate": fixture.commit, "expected_material": material,
+                "expected_role": "human", "root": trust.canonical(root), "now": current,
+                "test_only": True}
+        positive = trust.verify(signed(trust.ENVELOPE, payload, "human"), revoked, **args)
+        self.assertEqual(positive["scope"], "TEST_ONLY")
+        self.assertEqual(positive["release_verdict"], "NOT_CERTIFIED")
+        for variant, code in (({**payload, "material_sha256": "0" * 64},
+                               "CANDIDATE_OR_MATERIAL_MISMATCH"),
+                              ({**payload, "expires_at": current}, "EXPIRED_OR_FUTURE"),
+                              ({**payload, "role": "deployment"}, "ROLE_MISMATCH")):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(trust.TrustError, code):
+                    trust.verify(signed(trust.ENVELOPE, variant, "human"), revoked, **args)
+        with self.assertRaisesRegex(trust.TrustError, "TRUST_UNAVAILABLE"):
+            trust.verify(signed(trust.ENVELOPE, payload, "human"), revoked,
+                         **{key: value for key, value in args.items() if key != "test_only"})
+        put(fixture.directory / "signed-envelope.json", signed(trust.ENVELOPE, payload, "human"))
+        put(fixture.directory / "signed-revocations.json", revoked)
+        proof = {label: {"path": str(fixture.directory / ("signed-" + filename + ".json")),
+                         "sha256": gate.sha((fixture.directory / ("signed-" + filename + ".json")).read_bytes())}
+                 for label, filename in (("envelope", "envelope"), ("revocations", "revocations"))}
+        fixture.ledger["bridge"]["provenance"]["human"][gate.MANUAL[0]] = proof
+        fixture.save()
+        self.blocked(fixture, "TRUST_UNAVAILABLE")
+
+    def test_real_v4_original_mapping_read_only(self):
+        path = gate.ARTIFACT_ROOT / "workbench-integrated-v4/workbench.json"
+        body = gate.read_file(path)
+        self.assertEqual(gate.sha(body),
+                         "1d9abf07f544d56e8751db480f82daaa29356a33478eba93956033d433526f64")
+        workbench = gate.decode(body)
+        self.assertEqual(workbench["exit_code"], 3)
+        self.assertEqual(workbench["verdict"], "LOCAL_AUTOMATION_PARTIAL_NOT_RELEASE")
+        directory = gate.OUTPUT_ROOT / ("v4-bridge-readback-" + uuid4().hex)
+        directory.mkdir()
+        root = directory / "candidate"
+        command(["git", "clone", "--no-hardlinks", "--no-checkout", "/data/dev/opensim", str(root)],
+                directory)
+        command(["git", "checkout", "--detach", "97477ba9255c1cdb9f8a15d9145a00e61a63188d"], root)
+        expected = gate.identity(root, "97477ba9255c1cdb9f8a15d9145a00e61a63188d")
+        original = workbench["producers"]["audit"]["report"]
+        pin = {key: original[key] for key in ("path", "sha256")}
+        mapped = gate.native_obligations(pin, expected, 0, root, BRIDGE_DEPENDENCIES,
+                                        datetime.fromisoformat(workbench["finished_at"]))
+        self.assertTrue(mapped["open"])
+        self.assertTrue(mapped["closed"])
+        self.assertFalse(mapped["object_inventory"]["complete"])
+        audit, _ = gate.audit_reference(pin)
+        obligations, _ = gate.bridge_algorithms(BRIDGE_DEPENDENCIES, root, expected)
+        for closure in mapped["closed"]:
+            for evidence in closure["evidence"]:
+                row = audit[evidence["section"]][evidence["index"]]
+                self.assertEqual(evidence["row_sha256"], obligations.digest(row))
+                self.assertEqual(evidence["sha256"], pin["sha256"])
+        self.assertEqual(gate.read_file(path), body)
+        self.assertEqual(gate.identity(root, expected["commit"]), expected)
+        put(directory / "readback.json", gate.encode({
+            "scope": "HISTORICAL_V4_NATIVE_AUDIT_READBACK_NOT_NEW_CANDIDATE_RELEASE",
+            "workbench": {"path": str(path), "sha256": gate.sha(body), "exit_code": 3},
+            "candidate": expected, "audit": pin, "source_stable": True,
+            "counts": {"closed": len(mapped["closed"]), "open": len(mapped["open"]),
+                       "required": mapped["required_automated_coordinates"]},
+            "original_statuses_not_promoted": True, "release_verdict": "NOT_CERTIFIED"}))
 
 
 class ReleaseGateTests(unittest.TestCase):
@@ -1022,7 +1662,17 @@ def audit_readback(args) -> int:
 def run_suite(suite: unittest.TestSuite, out: Path, label: str) -> int:
     gate.external(out, gate.OUTPUT_ROOT)
     out.mkdir(parents=True, exist_ok=False)
-    paths = {Path(__file__).resolve(), Path(gate.__file__).resolve()}
+    Fixture.base = out / "fixtures"
+    Fixture.child_records = []
+    paths = {Path(__file__).resolve(), Path(gate.__file__).resolve(),
+             ROOT / "docs/deploy/SYNC_RELEASE.md",
+             *(Path(pin["path"]) for pin in BRIDGE_DEPENDENCIES.values())}
+    if label.startswith("OPENSIM_NATIVE_ASSESSMENT"):
+        paths.update(NATIVE_ASSESSMENT_DEPENDENCIES)
+        NativeAssessmentTests.out = out
+    for pin in BRIDGE_DEPENDENCIES.values():
+        gate.require(gate.sha(gate.read_file(Path(pin["path"]))) == pin["sha256"],
+                     "Frozen bridge dependency drift")
     for name in ("sync_release", "__main__"):
         module = sys.modules.get(name)
         filename = getattr(module, "__file__", None)
@@ -1052,6 +1702,10 @@ def run_suite(suite: unittest.TestSuite, out: Path, label: str) -> int:
         "failures": len(result.failures), "errors": len(result.errors),
         "started_at": started_at, "source_before": before, "source_after": after,
         "source_stable": stable,
+        "child_invocations": Fixture.child_records,
+        "original_fixture_child_invocations": (
+            NativeAssessmentTests.original.AdapterTests.children
+            if label.startswith("OPENSIM_NATIVE_ASSESSMENT") else []),
         "scope": "FIXTURE_NOT_RELEASE", "production_changes": False,
         "line": line, "finished_at": datetime.now(timezone.utc).isoformat()}))
     print(line)
@@ -1066,6 +1720,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--native-audit", action="store_true")
+    parser.add_argument("--bridge-red", action="store_true")
+    parser.add_argument("--bridge", action="store_true")
+    parser.add_argument("--bridge-core", action="store_true")
+    parser.add_argument("--native-assessment-tests", action="store_true")
+    parser.add_argument("--native-assessment", type=Path)
+    parser.add_argument("--assessment-publication-negative", type=Path)
+    parser.add_argument("--native-assessment-only", nargs="+")
+    parser.add_argument("--native-assessment-module", action="store_true")
     parser.add_argument("--s1-negatives", action="store_true")
     parser.add_argument("--audit-child", action="store_true")
     parser.add_argument("--audit-report", type=Path)
@@ -1083,6 +1745,33 @@ if __name__ == "__main__":
         raise SystemExit(audit_readback(args))
     if args.out is None:
         parser.error("--out required")
+    if args.assessment_publication_negative:
+        raise SystemExit(assessment_publication_negative(args))
+    if args.native_assessment_only:
+        suite = unittest.TestSuite(NativeAssessmentTests(name) for name in args.native_assessment_only)
+        raise SystemExit(run_suite(suite, args.out, "OPENSIM_NATIVE_ASSESSMENT_FOCUSED"))
+    if args.native_assessment_module:
+        suite = unittest.TestSuite((
+            unittest.defaultTestLoader.loadTestsFromTestCase(NativeAssessmentTests),
+            unittest.TestSuite(BridgeTests(name) for name in (
+                "test_native_partial_advances_past_raw_pass_contradiction",
+                "test_native_automated_scope_advances_past_raw_pass_contradiction",
+                "test_fabricated_trusted_state_rejected",
+                "test_raw_pass_is_still_rejected_by_original_reader"))))
+        raise SystemExit(run_suite(suite, args.out, "OPENSIM_NATIVE_ASSESSMENT_MODULE"))
+    if args.native_assessment_tests:
+        raise SystemExit(run_suite(unittest.defaultTestLoader.loadTestsFromTestCase(NativeAssessmentTests),
+                                   args.out, "OPENSIM_NATIVE_ASSESSMENT_TEST"))
+    if args.bridge_core:
+        suite = unittest.TestSuite(BridgeTests(name) for name in (
+            "test_native_partial_advances_past_raw_pass_contradiction",
+            "test_canonical_closed_does_not_close_native_or_human",
+            "test_canonical_wrong_original_status_source_and_marker_rejected",
+            "test_real_crypto_rejects_wrong_role_material_and_expired_without_certifying"))
+        raise SystemExit(run_suite(suite, args.out, "OPENSIM_RELEASE_BRIDGE_CORE_TEST"))
+    if args.bridge or args.bridge_red:
+        raise SystemExit(run_suite(unittest.defaultTestLoader.loadTestsFromTestCase(BridgeTests),
+                                   args.out, "OPENSIM_RELEASE_BRIDGE_TEST"))
     if args.s1_negatives:
         suite = unittest.TestSuite(NativeAuditTests(name) for name in (
             "test_native_dependencies_require_pinned_same_checkout_validator",
@@ -1092,7 +1781,7 @@ if __name__ == "__main__":
             "test_native_png_dimensions_state_and_tile_set_rejected",
             "test_native_tile_gap_and_injections_rejected"))
         raise SystemExit(run_suite(suite, args.out, "OPENSIM_RELEASE_GATE_S1_NEGATIVES"))
-    classes = [NativeAuditTests] if args.native_audit else [ReleaseGateTests, NativeAuditTests]
+    classes = [NativeAuditTests] if args.native_audit else [ReleaseGateTests, NativeAuditTests, BridgeTests]
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(cls) for cls in classes)
     if args.native_audit:
         suite.addTests(ReleaseGateTests(name) for name in (
