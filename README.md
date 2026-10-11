@@ -2,6 +2,13 @@
 
 中文、可自部署、可复现的流体有限元 Web 工作台。
 
+代码主仓为 [GitLab](https://gitlab.ai4everyone.top/infra/opensim)，
+[Gitee](https://gitee.com/sdfwefqaa/opensim) 已同步同一代码快照。
+获取代码请明确使用 `clone -b main`：Gitee 默认 HEAD 仍指向旧 fluid，
+不能把默认分支当作最新候选。GitHub 因凭据身份不匹配而 pending，
+未创建或推送；已核快照与外部同步入口见 [仓库与代码同步](docs/REPOSITORIES.md)。
+公网尚未上线，代码备份不等于发布；未安装常驻自动仓库同步。
+
 首版实现直管充分发展层流的横截面问题，采用线性三角形有限元，
 计算轴向速度而不是一般三维流动。圆管及矩形管为首批算例。
 已实现真实有限元求解、中文参数与结果页、网格切换、错误恢复和 JSON
